@@ -591,6 +591,18 @@ print('\n'.join(names))"; }
 if [ "$HAS_SYSTEMD" = "1" ]; then
   log "Installing systemd services (vaultwarden, autossh-tunnel, forti-vpn, soc-wall, soc-firstboot, soc-tarpit)"
   cp "$SOC_ROOT/systemd/autossh-tunnel.service" /etc/systemd/system/
+  # The VPN supervisor unit ships under TWO names so the operator's
+  # `systemctl status …` never has to guess:
+  #   * soc-vpn.service / soc-vpn@<name>.service — canonical, clearly
+  #     not driver-specific (the supervisor runs Fortinet, OpenVPN,
+  #     WireGuard, iNode based on vpn.type).
+  #   * forti-vpn.service / forti-vpn@<name>.service — legacy alias
+  #     kept so existing `systemctl enable forti-vpn@hq` invocations
+  #     still resolve. New installs should prefer the soc-vpn@ name;
+  #     `forti-vpn` in the unit name was a historical artefact from
+  #     when openfortivpn was the only backend.
+  cp "$SOC_ROOT/systemd/soc-vpn.service" /etc/systemd/system/
+  cp "$SOC_ROOT/systemd/soc-vpn@.service" /etc/systemd/system/
   cp "$SOC_ROOT/systemd/forti-vpn.service" /etc/systemd/system/
   cp "$SOC_ROOT/systemd/forti-vpn@.service" /etc/systemd/system/
   # Scanner-deception tarpit on port 80. Installed but NEVER auto-enabled —
@@ -640,9 +652,12 @@ if [ "$HAS_SYSTEMD" = "1" ]; then
     if [ -n "$enabled_names" ]; then
       while IFS= read -r vpn_name; do
         [ -z "$vpn_name" ] && continue
-        systemctl enable "forti-vpn@${vpn_name}.service" 2>&1 \
+        # Prefer the new soc-vpn@ name. The forti-vpn@ alias stays
+        # available for operators with muscle memory; enabling soc-vpn@
+        # is enough — the alias maps to the same unit file content.
+        systemctl enable "soc-vpn@${vpn_name}.service" 2>&1 \
           | grep -vE "^$" || true
-        log "  VPN supervisor enabled: forti-vpn@${vpn_name}"
+        log "  VPN supervisor enabled: soc-vpn@${vpn_name}"
       done <<EOF
 $enabled_names
 EOF

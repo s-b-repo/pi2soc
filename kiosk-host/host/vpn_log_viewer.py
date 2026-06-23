@@ -66,8 +66,8 @@ class _VpnTab:
 
     def __init__(self, name: str, *, on_reconnect, sudo: bool):
         self.name = name or "default"
-        self.unit = (f"forti-vpn@{name}.service"
-                     if name else "forti-vpn.service")
+        self.unit = (f"soc-vpn@{name}.service"
+                     if name else "soc-vpn.service")
         self._on_reconnect = on_reconnect
         self._sudo = sudo
         self._proc: Optional[subprocess.Popen] = None

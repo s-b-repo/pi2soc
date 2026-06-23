@@ -113,11 +113,11 @@ def wait_for_vpn(vpn: dict, timeout: float):
     """Best-effort gate: if a VPN is enabled with a `ready_probe`
     (host:port reachable only once the VPN is up), wait for it before
     opening VPN-side panels. The VPN itself is brought up by either
-    forti-vpn.service (legacy single-VPN) or forti-vpn@<name>.service
-    (templated, multi-VPN). The unit name is HISTORICAL — the same
-    supervisor runs Fortinet, OpenVPN, WireGuard, and iNode backends
-    based on `vpn.type`; "forti-vpn" in the unit name doesn't mean
-    "Fortinet only".
+    soc-vpn.service (legacy single-VPN) or soc-vpn@<name>.service
+    (templated, multi-VPN). The supervisor runs Fortinet / OpenVPN /
+    WireGuard / iNode interchangeably — the backend is picked by
+    `vpn.type`. (The older `forti-vpn(@*)` unit name is still
+    accepted as an alias for back-compat with existing installs.)
 
     UX contract: this is a SHORT wait (15 s default). The panel views
     have their own retry loops, so a slow-to-establish VPN doesn't
@@ -155,7 +155,7 @@ def wait_for_vpn(vpn: dict, timeout: float):
         port = int(port)
         name = (vpn.get("name") or "").strip()
         kind = (vpn.get("type") or "fortinet").strip().lower()
-        unit = f"forti-vpn@{name}" if name else "forti-vpn"
+        unit = f"soc-vpn@{name}" if name else "soc-vpn"
         log(f"[vpn] waiting up to {int(timeout)}s for VPN "
             f"'{name or 'default'}' (type={kind}) at {host}:{port} "
             f"... (Ctrl+C skips)")
@@ -524,7 +524,7 @@ class KioskHost:
             self.open_vpn_log_viewer(focus_name=name)
         except Exception as e:                          # noqa: BLE001
             log(f"could not open VPN log viewer: {e}")
-        target_unit = f"forti-vpn@{name}" if name else "forti-vpn"
+        target_unit = f"soc-vpn@{name}" if name else "soc-vpn"
         if self.wall is not None:
             self.wall.set_vpn_status("checking", f"{name or 'VPN'}: checking…",
                                      name=name)
@@ -1003,13 +1003,13 @@ class KioskHost:
                 # whether the edit went live or queued.
                 applied = result.setdefault("applied_live", [])
                 applied.extend(
-                    f"forti-vpn@{v.get('name') or 'default'}"
+                    f"soc-vpn@{v.get('name') or 'default'}"
                     for v in vpns_ch)
             else:
                 for v in vpns_ch:
                     name = v.get("name") or ""
                     result["pending_restarts"].append(
-                        f"forti-vpn@{name}" if name else "forti-vpn")
+                        f"soc-vpn@{name}" if name else "soc-vpn")
         elif vpn_ch is not None:
             self.conf.vpn = vpn_ch
             if can_restart:
@@ -1135,7 +1135,7 @@ class KioskHost:
         present so the operator knows the edit was saved + needs a
         manual restart."""
         import threading
-        unit = f"forti-vpn@{name}" if name else "forti-vpn"
+        unit = f"soc-vpn@{name}" if name else "soc-vpn"
 
         def work():
             ok, info = self._privileged_systemctl("restart", unit)
@@ -1152,7 +1152,7 @@ class KioskHost:
         Uses the same NOPASSWD sudo path as restart; raises (propagates
         the systemctl error) so the caller can surface it. Does NOT
         catch — the configwin caller wraps + alerts on failure."""
-        unit = f"forti-vpn@{name}.service"
+        unit = f"soc-vpn@{name}.service"
         ok1, msg1 = self._privileged_systemctl("stop", unit)
         ok2, msg2 = self._privileged_systemctl("disable", unit)
         if not ok1 and "could not be found" not in (msg1 or "").lower():

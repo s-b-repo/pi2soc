@@ -1746,7 +1746,7 @@ class ConfigWindow(Gtk.Window):
                             f"the supervisor is still running. Stop it "
                             f"manually with:\n"
                             f"    sudo systemctl disable --now "
-                            f"forti-vpn@{name}.service",
+                            f"soc-vpn@{name}.service",
                             error=True, title="VPN supervisor still running")
         # Remove the dict entry; we leave self._vpn_ws[idx] in place but
         # marked dead so apply_overrides skips it (lighter than re-indexing
@@ -2053,7 +2053,7 @@ class ConfigWindow(Gtk.Window):
         inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         inner.set_border_width(8)
         w = {}
-        w["enabled"] = Gtk.CheckButton(label=f"enabled  (systemd unit: forti-vpn@{default_name})")
+        w["enabled"] = Gtk.CheckButton(label=f"enabled  (systemd unit: soc-vpn@{default_name})")
         w["enabled"].set_active(bool(v.get("enabled")))
         inner.pack_start(w["enabled"], False, False, 0)
 
