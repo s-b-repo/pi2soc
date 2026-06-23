@@ -453,6 +453,7 @@ class KioskHost:
                                tunnel=self.conf.tunnel,
                                proxy_vault_item=self.conf.proxy.vault_item,
                                login_stats=self.login_stats,
+                               vault=self.vault,
                                actions={
                                    "restart_wall": self.restart_wall,
                                    "reload_panels": self.reload_all_panels,

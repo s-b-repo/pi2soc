@@ -149,6 +149,25 @@ def require_pin() -> bool:
     return os.environ.get("SOC_CONFIG_REQUIRE_PIN", "0") == "1"
 
 
+def _reauth_verify(code: str) -> bool:
+    """Pure verifier shared by every destructive surface in the GUI: PIN
+    OR TOTP. Falls back to True (no auth required) ONLY when neither a
+    PIN nor a TOTP is enrolled AND the Settings gate is also unconfigured
+    (a brand-new install). Phase 6 contract: a destructive action without
+    *any* auth path returns False from _require_reauth — operators must
+    enrol a PIN / TOTP first."""
+    if not code or not code.strip():
+        return False
+    return verify_pin_or_totp(code)
+
+
+def _reauth_required() -> bool:
+    """True when at least one auth method is enrolled. When False, the
+    GUI tells the operator to enrol a PIN/TOTP before destructive
+    operations rather than letting deletes happen unauthenticated."""
+    return pin_is_set() or totp_is_set()
+
+
 def gate_unlocked(require_pin_: bool, pin_set: bool) -> bool:
     """Decide whether the config form opens WITHOUT entering a PIN. Pure, so it
     is unit-testable without a display.
@@ -392,7 +411,7 @@ class ConfigWindow(Gtk.Window):
 
     def __init__(self, panels, on_apply, on_close=None, display=None, vpn=None,
                  proxy=None, tunnel=None, proxy_vault_item="",
-                 login_stats=None, vpns=None, actions=None):
+                 login_stats=None, vpns=None, actions=None, vault=None):
         super().__init__(title="SOC wall — settings")
         style.apply_css()
         self.panels = panels
@@ -419,6 +438,10 @@ class ConfigWindow(Gtk.Window):
         self._tunnel = tunnel           # conf.tunnel dict | None (Tunnel tab)
         self._login_stats = login_stats # callable() -> {pid: {attempts, stale}}
         self._actions = actions or {}   # {restart_wall, reload_panels, ...}
+        # Vault handle (rbw / Fake backend) so the Credentials tab can
+        # list_by_folder + delete items. Optional — Phase 6 inventory
+        # degrades to "panels.yaml-derived only" when absent.
+        self._vault = vault
         # Back-compat: callers that still pass only proxy_vault_item get a
         # Credentials-tab row but no Proxy tab.
         self._proxy_vault_item = (getattr(proxy, "vault_item", None)
@@ -717,13 +740,34 @@ class ConfigWindow(Gtk.Window):
     def _tab_credentials(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         box.set_border_width(12)
-        note = Gtk.Label(label="Store a login's username + password directly in "
-                               "Vaultwarden (the wall reads them via rbw). Skip a "
-                               "row to leave it for the web vault.")
+        note = Gtk.Label(label="Top: inventory of vault items the wall "
+                               "touches (names only — values are never "
+                               "shown here). Delete requires PIN/TOTP "
+                               "re-auth. Bottom: write a fresh login into "
+                               "Vaultwarden for a panel/VPN/proxy that "
+                               "needs one.")
         note.get_style_context().add_class("soc-config-sub")
         note.set_xalign(0.0)
         note.set_line_wrap(True)
         box.pack_start(note, False, False, 0)
+
+        # --- Inventory + delete (Phase 6 central manager). Listed by source:
+        #     panels' vault_items, VPNs' vault_items, proxy, tunnel, plus
+        #     items in the 'SOC Wall Auth' folder (system TOTPs / future
+        #     panel-lock PIN). Deduplicated by item name.
+        inv_frame = Gtk.Frame(label="  Vault items in use  ")
+        inv_outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        inv_outer.set_border_width(8)
+        self._inv_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        inv_outer.pack_start(self._inv_list, False, False, 0)
+        refresh_btn = Gtk.Button(label="Refresh from vault")
+        refresh_btn.set_tooltip_text("Re-scan panels.yaml + vault folder "
+                                     "'SOC Wall Auth' for items.")
+        refresh_btn.connect("clicked", lambda *_: self._refresh_cred_inventory())
+        inv_outer.pack_start(refresh_btn, False, False, 0)
+        inv_frame.add(inv_outer)
+        box.pack_start(inv_frame, False, False, 0)
+        self._refresh_cred_inventory()
 
         grid = Gtk.Grid()
         grid.set_column_spacing(8)
@@ -787,6 +831,114 @@ class ConfigWindow(Gtk.Window):
         self._cred_msg.set_xalign(0.0)
         box.pack_start(self._cred_msg, False, False, 0)
         return box
+
+    def _collect_inventory(self) -> list:
+        """Pure helper: every vault item name the wall touches, deduped,
+        each as a dict {name, origin}. Unit-testable without GTK.
+
+        Sources (in priority order; first wins for the 'origin' label):
+          1. Panels: panel.vault_item.
+          2. VPNs: vpns[i].vault_item.
+          3. Proxy.vault_item.
+          4. Tunnel.vault_item (if present).
+          5. 'SOC Wall Auth' folder items (Phase 5 TOTP secure notes).
+
+        Items found ONLY via #5 are tagged origin='SOC Wall Auth folder'
+        — implicitly known to the wall, not pinned by a panels.yaml field.
+        """
+        seen = {}                                # name -> origin
+        for p in (self.panels or []):
+            n = (getattr(p, "vault_item", None) or "").strip()
+            if n and n not in seen:
+                seen[n] = f"panel:{p.id}"
+        for v in (self._vpns or []):
+            if not v:                            # nullified entry from remove
+                continue
+            n = (v.get("vault_item") or "").strip()
+            if n and n not in seen:
+                seen[n] = f"vpn:{v.get('name','?')}"
+        prx = (self._proxy_vault_item or "").strip()
+        if prx and prx not in seen:
+            seen[prx] = "proxy"
+        if self._tunnel and isinstance(self._tunnel, dict):
+            tn = (self._tunnel.get("vault_item") or "").strip()
+            if tn and tn not in seen:
+                seen[tn] = "tunnel"
+        # Pull folder items via the vault (only when one is attached to
+        # this ConfigWindow). Skip silently if not present — the tab still
+        # renders the panels/VPN-derived entries.
+        v_handle = getattr(self, "_vault", None)
+        if v_handle is not None and hasattr(v_handle, "list_by_folder"):
+            try:
+                folder_items = v_handle.list_by_folder("SOC Wall Auth")
+            except Exception:                    # noqa: BLE001
+                folder_items = []
+            for n in folder_items:
+                n = (n or "").strip()
+                if n and n not in seen:
+                    seen[n] = "SOC Wall Auth folder"
+        return [{"name": n, "origin": o} for n, o in seen.items()]
+
+    def _refresh_cred_inventory(self):
+        """Rebuild the inventory rows. Idempotent: clears + re-adds."""
+        if not hasattr(self, "_inv_list") or self._inv_list is None:
+            return
+        for child in list(self._inv_list.get_children()):
+            self._inv_list.remove(child)
+        items = self._collect_inventory()
+        if not items:
+            empty = Gtk.Label(label="(no vault items pinned yet — give a "
+                                    "panel/VPN/proxy a vault item first)")
+            empty.set_xalign(0.0)
+            empty.get_style_context().add_class("soc-config-sub")
+            self._inv_list.pack_start(empty, False, False, 0)
+            self._inv_list.show_all()
+            return
+        for it in items:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            name = Gtk.Label(label=it["name"])
+            name.set_xalign(0.0)
+            name.get_style_context().add_class("soc-config-tag")
+            origin = Gtk.Label(label=f"({it['origin']})")
+            origin.set_xalign(0.0)
+            origin.get_style_context().add_class("soc-config-sub")
+            delete = Gtk.Button(label="Delete")
+            delete.get_style_context().add_class("destructive-action")
+            delete.set_tooltip_text("Permanent. PIN/TOTP required.")
+            delete.connect("clicked",
+                           lambda _b, n=it["name"]: self._on_cred_delete(n))
+            row.pack_start(name, True, True, 0)
+            row.pack_start(origin, False, False, 0)
+            row.pack_start(delete, False, False, 0)
+            self._inv_list.pack_start(row, False, False, 0)
+        self._inv_list.show_all()
+
+    def _on_cred_delete(self, name: str):
+        """Delete a vault item from the inventory list.
+        Two-step: re-auth, then confirm, then vault.delete + refresh."""
+        if not self._require_reauth(f"delete of vault item '{name}'"):
+            return
+        d = Gtk.MessageDialog(transient_for=self, modal=True,
+                              message_type=Gtk.MessageType.QUESTION,
+                              buttons=Gtk.ButtonsType.OK_CANCEL,
+                              text=f"Delete vault item '{name}'?")
+        d.format_secondary_text(
+            "This is permanent. Any panel / VPN / proxy referencing this "
+            "item will fail to auto-login until the item is recreated or "
+            "the field is re-pointed at a different vault item.")
+        rc = d.run(); d.destroy()
+        if rc != Gtk.ResponseType.OK:
+            return
+        v_handle = getattr(self, "_vault", None)
+        if v_handle is None or not hasattr(v_handle, "delete"):
+            self._toast(f"vault handle missing — cannot delete '{name}'")
+            return
+        ok = v_handle.delete(name)
+        if ok:
+            self._toast(f"deleted '{name}' ✓")
+            self._refresh_cred_inventory()
+        else:
+            self._toast(f"delete failed for '{name}' (see journal)")
 
     def _save_cred(self, name, user_e, pass_e, uri):
         user = user_e.get_text().strip()
@@ -1074,17 +1226,18 @@ class ConfigWindow(Gtk.Window):
         exp.show_all()
 
     def _on_remove_vpn(self, idx: int, expander):
-        """Remove this VPN — dialog confirm, then drop from _vpns + UI.
-        Phase 6 gates this with _require_reauth; for now it's a simple
-        confirmation (no destructive action ships unguarded — Apply
-        pushing to vault is still gated by the Settings PIN)."""
+        """Remove this VPN — re-auth, then dialog confirm, then drop from
+        _vpns + UI. The vault credential item is intentionally NOT
+        auto-deleted (Credentials tab handles that with its own re-auth)."""
+        name = (self._vpns[idx].get("name") if idx < len(self._vpns)
+                and self._vpns[idx] else "") or f"vpn-{idx+1}"
+        if not self._require_reauth(f"removal of VPN '{name}'"):
+            return
         d = Gtk.MessageDialog(transient_for=self,
                               modal=True,
                               message_type=Gtk.MessageType.QUESTION,
                               buttons=Gtk.ButtonsType.OK_CANCEL,
-                              text="Remove this VPN entry?")
-        name = (self._vpns[idx].get("name") if idx < len(self._vpns)
-                else "") or f"vpn-{idx+1}"
+                              text=f"Remove VPN '{name}'?")
         d.format_secondary_text(
             f"VPN '{name}' will be removed from the config on next Apply. "
             "The vault credential item is NOT deleted by this action — "
@@ -1146,6 +1299,82 @@ class ConfigWindow(Gtk.Window):
             lbl.set_text(msg)
         except Exception:  # noqa: BLE001
             pass
+
+    def _require_reauth(self, what: str = "this action") -> bool:
+        """Modal PIN/TOTP prompt before a destructive action. Returns True
+        only after the operator types a code that matches the Settings PIN
+        OR the Settings TOTP. Fail-closed when no auth is enrolled — the
+        Settings tab needs a credential before anything destructive can
+        happen at the glass.
+
+        Used to gate Clear PIN / Clear TOTP / Remove VPN / Delete
+        credential. Re-auth failure is NOT counted toward the existing
+        locker.py back-off — that one is for the wall-lock surface; this
+        one has its own counter `_reauth_fails`."""
+        if not _reauth_required():
+            d = Gtk.MessageDialog(transient_for=self, modal=True,
+                                   message_type=Gtk.MessageType.WARNING,
+                                   buttons=Gtk.ButtonsType.OK,
+                                   text="No PIN or TOTP enrolled")
+            d.format_secondary_text(
+                "Destructive actions need a credential. Enrol a PIN or "
+                "TOTP under the Security tab first, then retry "
+                f"{what}.")
+            d.run(); d.destroy()
+            return False
+        # Back-off after repeated wrong codes: 3+ fails → 5 s, capped at 60 s.
+        # Mirrors the locker.py back-off so behaviour is consistent.
+        import time as _time
+        fails = getattr(self, "_reauth_fails", 0)
+        wait_until = getattr(self, "_reauth_blocked_until", 0)
+        if _time.monotonic() < wait_until:
+            remaining = int(wait_until - _time.monotonic()) + 1
+            d = Gtk.MessageDialog(transient_for=self, modal=True,
+                                   message_type=Gtk.MessageType.INFO,
+                                   buttons=Gtk.ButtonsType.OK,
+                                   text="Too many wrong attempts")
+            d.format_secondary_text(
+                f"Wait {remaining} s before trying again.")
+            d.run(); d.destroy()
+            return False
+
+        d = Gtk.Dialog(transient_for=self, modal=True,
+                        title=f"Confirm {what} — enter PIN or TOTP")
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                       "Confirm", Gtk.ResponseType.OK)
+        d.set_default_response(Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        lbl = Gtk.Label(label=f"Enter PIN or TOTP code to confirm {what}.")
+        lbl.set_xalign(0.0); lbl.set_margin_top(6); lbl.set_margin_start(12)
+        lbl.set_margin_end(12)
+        entry = Gtk.Entry()
+        entry.set_visibility(False)
+        entry.set_activates_default(True)
+        entry.set_margin_top(6); entry.set_margin_start(12)
+        entry.set_margin_end(12); entry.set_margin_bottom(6)
+        box.pack_start(lbl, False, False, 0)
+        box.pack_start(entry, False, False, 0)
+        d.show_all()
+        rc = d.run()
+        code = entry.get_text()
+        d.destroy()
+        if rc != Gtk.ResponseType.OK:
+            return False
+        ok = _reauth_verify(code)
+        if not ok:
+            fails += 1
+            self._reauth_fails = fails
+            if fails >= 3:
+                cooldown = min(60, 5 * (2 ** (fails - 3)))
+                self._reauth_blocked_until = _time.monotonic() + cooldown
+                self._toast(f"wrong code ({fails} consecutive) — "
+                            f"cooling down for {cooldown}s")
+            else:
+                self._toast("wrong code")
+        else:
+            self._reauth_fails = 0
+            self._reauth_blocked_until = 0
+        return ok
 
     def _vpn_section(self, v: dict, idx: int):
         """Build the collapsible per-VPN section. Returns a `Gtk.Expander`
@@ -1365,6 +1594,9 @@ class ConfigWindow(Gtk.Window):
                     status.set_text(f"could not set PIN: {e}")
 
             def _clr(_w):
+                if has_pin() and not self._require_reauth(
+                        f"removal of the {title} PIN"):
+                    return
                 try:
                     on_clr_pin()
                     _refresh()
@@ -1405,6 +1637,9 @@ class ConfigWindow(Gtk.Window):
                     status.set_text(f"could not enroll TOTP: {e}")
 
             def _unenroll(_w):
+                if has_totp() and not self._require_reauth(
+                        f"removal of the {title} TOTP"):
+                    return
                 try:
                     on_clr_totp()
                     uri_e.set_text("")
