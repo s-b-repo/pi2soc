@@ -107,6 +107,58 @@ The wall can be repointed at the glass — convenient, but a surface to control:
 > secured, and give each panel a **unique, least-privilege** vault login so one
 > XSS-vulnerable dashboard cannot yield a reusable credential.
 
+## Kiosk lock + TOTP unlock
+
+The wall has an in-session **lock** that intercepts every keyboard, mouse,
+scroll, and touch event but does **not** hide the rendered panels — operators
+on the floor still see the dashboards while the wall itself becomes input-inert.
+
+**Trigger paths:**
+
+- toolbar **🔒 Lock** button
+- **`Ctrl+Alt+L`** from any focused panel (window-wide accelerator)
+- tray menu **"Lock panel"** (when running windowed with a system tray)
+- ⚙ Settings → Actions tab → **"🔒 Lock the wall now"**
+
+**Unlock:**
+
+- a **PIN** (numeric, complexity-policy enforced via `host/complexity.py`); OR
+- a **TOTP code** from an authenticator app (RFC 6238, ±30 s window)
+
+Wrong codes trigger an exponential back-off (5 s after the 3rd wrong, capped at
+60 s) using constant-time comparison (`hmac.compare_digest`). Both candidates
+are tried in order: TOTP first if enrolled, else PIN — either passes.
+
+**Storage today (file-backed):** `state_dir/panellock.pin` (salt + SHA-256) and
+`state_dir/panellock.totp` (base32 secret). A future phase moves both into a
+Vaultwarden secure note so a roaming wall reads its lock policy from the same
+source of truth that holds its panel credentials.
+
+The lock overlay is a top-level `Gtk.Window` (NOT a `GtkOverlay` — WebKit
+native windows would paint over an overlay sibling). It is fullscreen,
+transparent-RGBA when a compositor is present, `keep_above`, decorations off,
+swallows `delete-event`, `button-press-event`, `scroll-event`, `key-press-event`
+(including `Esc`), and only releases on a verified PIN or TOTP.
+
+## Per-panel blocked-URL list
+
+Each panel may declare a `blocked_url_patterns: [...]` list of fnmatch-style
+patterns. The renderer refuses to navigate to any URL that matches.
+
+**Enforcement:**
+
+- WebKit: the `decide-policy` handler returns `decision.ignore()` on match,
+  for both `NAVIGATION_ACTION` and `NEW_WINDOW_ACTION` decision types.
+- Chromium: the existing CDP `Fetch.requestPaused` handler runs the same
+  `fnmatch` and calls `Fetch.failRequest(errorReason="BlockedByClient")`.
+  `Fetch.enable` is held on for the panel's lifetime when the list is
+  non-empty (it was already turned on briefly for proxy-auth).
+
+**Why it matters:** a hostile actor (or a stray mouse click) cannot steer the
+wall into a panel's *account-settings*, *change-password*, or *sign-out* page.
+The wall's auto-login is per-panel — surfacing account settings would let a
+floor visitor change the credential under the operator's nose.
+
 ## Network hardening (`HARDEN=1`)
 
 Installs:
@@ -179,6 +231,43 @@ CAP_NET_BIND_SERVICE` (for port 80) and nothing else, `ProtectSystem=strict`,
 `MemoryDenyWriteExecute=yes`, `SystemCallFilter=@system-service` minus
 `@privileged @resources`. The `Server:` header is stripped from every response
 so the tarpit doesn't itself fingerprint Python/BaseHTTPServer.
+
+### Prod-hardening knobs (added in the kiosk-lock-wiring pass)
+
+- **`SOC_TARPIT_MAX_WORKERS`** (default 64): per-request `BoundedSemaphore`
+  reservation with `try/finally` release. Requests beyond the cap get a
+  silent TCP close — saying `503` would tell a slowloris that its
+  strategy is working; saying nothing wastes their wait on TCP close.
+  Pairs with the unit's `TasksMax=128` and `LimitNOFILE=4096`.
+- **`SOC_TARPIT_CONN_TIMEOUT`** (default 5 s): per-connection header-read
+  timeout via `socket.settimeout()` plus `rbufsize=0` so a half-open
+  scanner's worker drops promptly. The drip (0.5–2 s) is bounded
+  separately by `DRIP_MAX` + body-write time.
+- **`http.client._MAXLINE=4096` / `_MAXHEADERS=64`** pinned at module
+  import — caps URL + header smear *before* `BaseHTTPRequestHandler`
+  reads the first byte. A giant request line costs ≤4 KiB to reject.
+- **`/etc/soc-display/tarpit-paths.list`** — one path per line; `/foo/*`
+  syntax for prefix; `#` comments. Reloaded on **`SIGHUP`**. Built-in
+  defaults are additive + the fallback when the file is missing /
+  unreadable / empty (defense in depth: bad file ≠ open tarpit).
+- **`SIGUSR1`** dumps `top-20` source IPs by hit count + busy-worker
+  count as a single `metrics_dump` JSON line. Bounded LRU counter (cap
+  4096) — exact counts under heavy load don't matter, identifying the
+  offenders does.
+- **Structured logging** — every event is a single JSON line on stderr
+  → journald (`served`, `rate_limited`, `dropped_at_cap`,
+  `paths_reloaded`, `paths_reload_failed`, `metrics_dump`,
+  `listening`). Drop-in for `journalctl -u soc-tarpit -o json`.
+- **HEAD method** returns headers (with the correct `Content-Length`)
+  but no body per RFC 9110. Scanners that HEAD-probe before GET get
+  plausible metadata without spending the drip budget.
+- **Plausibility headers** — `ETag` (weak validator deterministic per
+  `path+ip+hour-bucket` so replay can't fingerprint "all responses
+  identical"), `Last-Modified` (random within 30 days),
+  `Cache-Control: no-store`. Real apps emit these; absence is a tell.
+- **IPv6** — `_address_family()` returns `AF_INET6` when
+  `SOC_TARPIT_HOST` parses as v6. The unit already declares
+  `RestrictAddressFamilies=AF_INET AF_INET6` for both families.
 
 The tarpit doesn't add a real listening surface — port 80 was otherwise closed
 on the kiosk by the nftables policy. The trade-off is one extra ~32 MB process

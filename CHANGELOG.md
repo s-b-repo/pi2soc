@@ -9,6 +9,70 @@ Production-hardening pass on top of the initial single-engine wall: multi-distro
 + multi-display-server install, a supervised multi-protocol VPN, an outbound
 proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
+### Kiosk-lock wiring · tarpit prod hardening · secrets-scrub hook (2026-06-23 later)
+
+Roadmap phases 1, 2 and 10 from the PROMPT.txt handoff. Closes the gap
+where shipped modules (`locker.py`, `tray.py`) had no runtime callers,
+takes the tarpit from "works" to "survives", and automates the
+secrets-cleanup-before-push that was done by hand for commit 4c328ad.
+
+- **Tray + kiosk-lock wired into the wall runtime.** `WallWindow` gains
+  `🔒 Lock` toolbar button next to `⚙ Settings`, a window-wide
+  `Ctrl+Alt+L` accelerator (works even when a webview has the keyboard
+  focus), and a `delete-event` handler that hides to tray instead of
+  shutting down when a tray icon is active. `KioskHost.__init__` builds
+  a `KioskLocker` pointed at `state_dir()` unconditionally; tray icon
+  installs only in windowed mode (`SOC_WINDOWED=1` or
+  `display.fullscreen: false`) AND when a backend
+  (AyatanaAppIndicator3 / AppIndicator3 / `Gtk.StatusIcon`) responds.
+  Tray menu: **Show wall · Lock panel · Open Settings · Restart wall ·
+  Reboot machine · Quit**. Pure-kiosk-on-tty1 path unchanged.
+- **⚙ Settings → Actions** gains a single-click `🔒 Lock the wall now`
+  button — same effect as the toolbar / hotkey, for operators who
+  prefer the menu surface.
+
+- **Tarpit (`scripts/tarpit.py`) prod hardening:**
+  - **Per-worker `BoundedSemaphore`** (`SOC_TARPIT_MAX_WORKERS`,
+    default 64) with `try/finally` release. Over-cap requests are
+    TCP-closed silently — slowloris flood can't exhaust the thread
+    pool, and the scanner gets no signal that its strategy worked.
+  - **Per-connection `socket.settimeout(5s)`** plus `rbufsize=0` so
+    the timeout actually fires on a half-open scanner.
+  - **`http.client._MAXLINE = 4096` / `_MAXHEADERS = 64`** pinned at
+    module import — caps URL + header smear before the first byte.
+  - **`SIGHUP` reloads `/etc/soc-display/tarpit-paths.list`** (one
+    path per line, `/foo/*` for prefix). Built-in defaults survive +
+    are the fallback on missing / unreadable / empty file.
+  - **`SIGUSR1` dumps top-20 source IPs** by hit count + busy-worker
+    count (bounded LRU counter, cap 4096) as a JSON line — drop-in
+    journal triage during a spike.
+  - **Structured JSON log line per response**
+    (`ts/event/ip/method/path/status/bytes/drip_s`). Replaces the
+    freeform stderr string.
+  - **HEAD returns correct Content-Length, no body** per RFC 9110.
+  - **Plausibility headers** — `ETag` (deterministic per
+    path+ip+hour-bucket so replay can't say "all responses identical"),
+    `Last-Modified` (random within 30 days), `Cache-Control: no-store`.
+  - **IPv6** via `_address_family()`; `_Server.address_family` set in
+    `main()`. `RestrictAddressFamilies=AF_INET AF_INET6` already in
+    the unit.
+  - `systemd/soc-tarpit.service` adds `LimitNOFILE=4096`.
+
+- **Pre-commit secrets-scrub.** Native POSIX-sh hook at
+  `.githooks/pre-commit` blocks staged content matching the operator's
+  canary password / PEM private keys / `sk-…` / `ghp_…` / `ghs_…`
+  tokens, AND staged paths matching `.env(.*)`, `secret/`, `PROMPT.txt`,
+  `.claude/`, `MEMORY.md`, `*.key`, `*_ed25519`. `.env.example` is
+  exempted to mirror `.gitignore`. Self-reference avoided by writing
+  pattern literals with character-classes + skipping `.githooks/` +
+  `.pre-commit-config.yaml` + `CONTRIBUTING.md` from the content scan.
+  An `EXAMPLE-OK` per-line escape lets documented fixtures pass.
+  Operators activate with `git config core.hooksPath .githooks`;
+  `pre-commit`-framework users get the same via
+  `.pre-commit-config.yaml`. `make secrets-scan` runs the hook on the
+  staged set as a pre-push sanity check. `CONTRIBUTING.md` documents
+  both activation paths.
+
 ### Setup auto-fix · vault-stored VPN cfg · scanner deception · windowed wall · multi-VPN (2026-06-23)
 
 End-to-end pass after a real-install dogfooding session caught half a dozen

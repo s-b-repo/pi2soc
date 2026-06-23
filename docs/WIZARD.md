@@ -174,9 +174,58 @@ isn’t up yet) or you answered “n”:
 
 | Prompt | What to type |
 |---|---|
-| `keep-alive strategy` | **`reload`** for most dashboards; `xhr`/`click` for apps with a heartbeat or idle timer; `none` if it never times out |
+| `keep-alive strategy` | **`reload`** for most dashboards; `xhr`/`click` for apps with a heartbeat or idle timer; `mouse` to dispatch an invisible synthetic mousemove inside the page (good for dashboards that idle-time-out on inactivity but don't expose a heartbeat URL); `none` if it never times out |
 | `interval (seconds)` | how often, e.g. `600` |
 | `heartbeat URL` / `selector to click` | only for `xhr` / `click` |
+
+#### `keepalive: mouse`
+
+When the dashboard doesn't have a heartbeat URL to ping or a "refresh"
+button to click, but does idle-time-out after N minutes of inactivity,
+pick `mouse`. The wall dispatches a synthetic `MouseEvent("mousemove",
+{...})` to the page on the interval — the page's idle timer resets, but
+the real OS cursor doesn't move (so it's safe on a shared desk where a
+real cursor jump would interrupt a human operator).
+
+```yaml
+keepalive:
+  strategy: mouse
+  intervalSec: 60
+```
+
+### `relogin_url` (jump to the dashboard after auto-login)
+
+When the panel's login URL is `https://wazuh.example/app/login` but the
+useful screen is `https://wazuh.example/app/dashboards`, set:
+
+```yaml
+relogin_url: https://wazuh.example/app/dashboards
+```
+
+After auto-login succeeds (the `login_marker` selector goes away, the
+text-pattern login detection clears, or the panel posts the `loggedin`
+message), the wall navigates to this URL once per load. Guarded against
+loops if the relogin URL itself bounces back to a login page.
+
+### `blocked_url_patterns` (keep the wall away from settings pages)
+
+A list of fnmatch-style patterns the panel may NOT navigate to:
+
+```yaml
+blocked_url_patterns:
+  - "*account/settings*"
+  - "*/admin/users*"
+  - "*/logout*"
+```
+
+WebKit enforces this via the `decide-policy` signal returning
+`decision.ignore()`; Chromium does it via the CDP
+`Fetch.failRequest(BlockedByClient)`. The list is exposed in
+⚙ Settings → Panels → Advanced → "blocked URLs (one per line)".
+
+Stops a stray click on the wall (or a hostile actor with keyboard
+access) from steering the panel into its account-settings,
+change-password or sign-out flow.
 
 ### Worked example — a Zabbix panel
 
@@ -361,12 +410,35 @@ bar, or press **Ctrl+Shift+C**. Its tabs:
 | **VPN** | type + gateway + vault item + cert pin; Apply pushes it to the vault config note and restarts the VPN |
 | **Proxy** | outbound HTTP(S)/SOCKS proxy for the panel browsers: **enabled**, **URL**, **vault login** (proxy creds), **ignore hosts**. Applies on the next restart |
 | **Tunnel** | the SSH **jump host** used by panels in *tunnel* mode: jump host, identity (private-key path), `known_hosts` file, host-key-checking mode, and **extra forwards** (one `bindaddr:port:host:port` per line). Apply restarts `autossh-tunnel` |
+| **Actions** | one-click **Reload panels** (no restart) · **Restart wall** (soft, ~3 s via systemd respawn — applies layout/grid/resolution changes without a reboot) · **🔒 Lock the wall now** (same as the toolbar lock and Ctrl+Alt+L; panels stay visible, input is inert until PIN/TOTP) · **Reboot machine** · **Repair install** (runs `setup.py repair`) |
+| **Security** | enrol / clear / change the PIN that gates this Settings window AND the panel-lock PIN. Optionally enrol a TOTP (RFC 6238) — the unlock prompt accepts either. Live complexity validation for both (min length, character classes, common-bad rejection). The panel-lock secret is separate from the Settings secret — typically operators choose one PIN for both, but they can be different |
 | **Status** | live health of the panels and VPN |
 
 So the entire loop — point a tile at a tool, configure the VPN / proxy / tunnel
 it sits behind, **and** store the logins — happens at the glass. An optional
 **PIN lock** (under Security) gates the window so a kiosk in a public space
 can’t be reconfigured by a passer-by.
+
+### Tray mode for desk deploys
+
+When the wall is run **windowed** (`SOC_WINDOWED=1` env or
+`display.fullscreen: false`) AND a tray backend is available (any of
+AyatanaAppIndicator3, AppIndicator3, or `Gtk.StatusIcon`), closing the
+wall window hides it to the system tray instead of quitting the host.
+
+Tray menu:
+
+| Item | Action |
+|---|---|
+| Show wall | bring the hidden window back |
+| Lock panel | same as Ctrl+Alt+L / the toolbar 🔒 button |
+| Open Settings | open the ⚙ window |
+| Restart wall | soft restart (systemd respawn ~3 s) |
+| Reboot machine | `systemctl reboot` (needs root) |
+| Quit | clean shutdown of the host |
+
+Pure-kiosk mode on tty1 has no tray surface, so the tray is silently
+skipped in that path — close-button behaviour is unchanged there.
 
 **Two prerequisites for storing credentials at the glass:** Vaultwarden must be
 running with the kiosk account created, and the vault must be unlockable — either
