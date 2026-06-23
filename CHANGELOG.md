@@ -9,7 +9,144 @@ Production-hardening pass on top of the initial single-engine wall: multi-distro
 + multi-display-server install, a supervised multi-protocol VPN, an outbound
 proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
-### Kiosk-lock wiring · tarpit prod hardening · secrets-scrub hook (2026-06-23 later)
+### Reinstall tool · click-zone calibrate runtime · drift detail modal (2026-06-23 evening)
+
+The post-batch wiring pass. Closes the placeholders left after the
+10-phase roadmap shipped: the `inject/calibrate.js.tmpl` ship in commit
+`7593bfe` couldn't be invoked from the GUI, the Phase 9 drift warning
+banner just dismissed on click, and there was no clean way to redeploy
+the wall without leaving stale `/opt/soc-display` files around. Plus a
+fresh tool the operator asked for: a one-shot uninstall + reinstall.
+
+#### Added
+
+- **`scripts/reinstall.py`** — stdlib CLI (no venv needed) that stops +
+  disables + removes every `soc-*` systemd unit, restores
+  `default.target` to `graphical.target`, deletes `/opt/soc-display`,
+  cleans `/etc/soc-display` (**keeping `secret/` by default — the
+  sealed master survives + no PIN prompt on next boot**), leaves the
+  Vaultwarden Docker container + data volume alone, then re-runs
+  `install.sh` and (optionally) `setup.py first-run`. Destructive
+  overrides are explicit opt-in: `--purge` (wipe `secret/`),
+  `--purge-vault` (remove the container), `--purge-vault-data` (wipe
+  the volume — all credentials lost). Hard safety gates refuse to run
+  as non-root and refuse to run if the script's own source lives
+  under `/opt/soc-display` (would delete its own checkout
+  mid-execution). Discovers dynamic `forti-vpn@<name>` instances at
+  runtime so per-VPN units are caught even when the script doesn't
+  know the names at compile time. Workflow flags: `--uninstall-only`
+  / `--no-firstrun` / `--dry-run` / `--yes` / `--verbose` /
+  `--keep-units`. 11 tests cover the safety gates, the parser
+  defaults, the Runner dry-run + remove-path no-ops, and the full
+  end-to-end walk under `--dry-run --yes --no-firstrun` (asserts zero
+  subprocess spawns + every section header printed).
+
+- **Click-zone calibrate runtime** — the schema + template + injection
+  fallback shipped in `7593bfe`; this commit adds the runtime entry
+  point on both renderers and surfaces it in ⚙ Settings.
+  - `webkit_panel.calibrate(on_done)` injects
+    `inject/calibrate.js.tmpl` via the existing UserContentManager,
+    polls `window.__SOC_CALIBRATE_RESULT` on a `GLib.timeout` 500 ms
+    tick with a 5-minute budget. `_evaluate_for_string` handles BOTH
+    WebKit2 4.0 (`run_javascript_finish` → `JavascriptResult` →
+    `get_js_value`) AND 4.1 (`evaluate_javascript_finish` →
+    `JSCValue`) so the same code works across kali / debian / raspios
+    `webkit2gtk` packages.
+  - `chromium_panel.calibrate(on_done)` injects via CDP
+    `Runtime.evaluate`, polls the global from a daemon thread (CDP
+    socket is thread-safe via `Cdp.rpc`'s lock). Clears the global
+    after read so the next calibration starts clean.
+  - `main.KioskHost.calibrate_panel(panel_id, on_done)` routes to the
+    matching `panels_view` entry. On success it persists the captured
+    zones into `overrides.json` (merges into existing per-panel
+    overrides — never clobbers url / title / selectors) AND updates
+    the live `Panel.login_zones` so the new fallback applies WITHOUT
+    a restart. Engines without a `calibrate()` method fail closed.
+  - `configwin.py` Advanced expander per panel: new "Calibrate login
+    zones" button + a "Clear zones" button gated by `_require_reauth`.
+    Status label above the buttons updates live: "calibrated ✓ (user,
+    pass, submit)" or "none — selectors + heuristics only".
+
+- **File-drift detail modal** — `wall.show_top_bar_warning` gained an
+  optional `detail` arg (the dict returned by
+  `manifest.check_drift`). When set, the top-bar banner is
+  click-to-open instead of click-to-dismiss; clicking opens a modal
+  listing every changed / missing / extra file in three scrollable
+  monospace panes (only the non-empty sections are shown) with a
+  `Gtk.LinkButton` to the deployed commit on GitHub
+  (`https://github.com/s-b-repo/pi2soc/tree/<commit>`). "Dismiss
+  banner" button + the OS close button both clear the warning for the
+  session. `main._check_deploy_drift` passes the full drift dict
+  through.
+
+#### Earlier in this release cycle (phases 4 – 9 from the roadmap)
+
+Phases shipped in commits `f5e3884` (4) · `b2761c2` (5) · `256b514`
+(6) · `dc45e68` (7) · `7593bfe` (8) · `c5fd33b` (9). Highlights:
+
+- **Multi-VPN sections become collapsible + dynamic** (Phase 4): VPN
+  tab is one `GtkExpander` per VPN with a "+ Add VPN" header button
+  (no longer capped at 2). Inline write-only username + password
+  entries per section with a "Save inline creds to vault" button —
+  auto-names the vault item `SOC VPN <name>` when blank, scrubs the
+  password entry on save. Per-section "Remove this VPN" button gated
+  by `_require_reauth` (Phase 6). `vault.delete(item)` +
+  `vault.list_by_folder(folder)` + `vaultseed.delete_item` +
+  `vaultseed.upsert_secure_note` are the underlying API additions; a
+  `FakeBackend.delete` + `.list_by_folder` mirrors them in tests.
+- **TOTP secrets move to Vaultwarden + optional libsecret backend for
+  the sealed master** (Phase 5): `totp.vault_item_for` /
+  `load_vault` / `save_vault` / `clear_vault` store the TOTP secret
+  as a Vaultwarden `secureNote` so a roaming wall reads its lock
+  policy from one source of truth. `locker.verify_any_vault_first`
+  prefers vault over local file when set — a stale on-disk PIN does
+  NOT outlive a vault rotation. `secretstore` gained an opt-in
+  libsecret (KWallet / GNOME-Keyring / Secret-Service) backend; flip
+  with `SOC_SECRET_BACKEND=libsecret` after a `libsecret_store(...)`
+  to skip the sealed-file path entirely. Default behaviour is
+  unchanged.
+- **Credentials tab becomes a central inventory** (Phase 6): new
+  "Vault items in use" section at the top lists every item the wall
+  touches (panels' `vault_item`, VPNs' `vault_item`, proxy, tunnel,
+  plus items in the `SOC Wall Auth` folder), deduped, names only —
+  values are never displayed. Delete per row, gated by
+  `_require_reauth`. The same `_require_reauth` helper now gates
+  every existing destructive surface: Security → Remove PIN / Remove
+  TOTP (per scope), VPN expander → Remove this VPN. Own back-off
+  counter (3+ wrong codes → 5 s, cap 60 s) separate from the
+  locker's wall-lock counter.
+- **Style modernise** (Phase 7): hex literals consolidated into a
+  named `TOKENS` dict; `_css()` composes via f-string. New CSS
+  classes for the surfaces the earlier phases referenced but didn't
+  style: `.soc-toolbar-action` (Phase 1 🔒 button), `.destructive-
+  action` (Phase 4 + 6 Remove / Delete / Clear buttons),
+  `.soc-warn-bar` (Phase 9 drift banner). Toolbar pill states now
+  resolve to the same tokens as status cards — colours can't drift
+  by accident.
+- **Click-zone schema + injection** (Phase 8): `Panel.login_zones`
+  added — dict[user|pass|submit, {x_pct, y_pct}], 0.0..1.0 ratios so
+  a window resize keeps the calibration accurate. Validator rejects
+  unknown keys, out-of-range axes, and missing `y_pct` / `x_pct`.
+  `inject/login.js.tmpl` gained a `zoneInput(which)` helper that
+  hit-tests `document.elementFromPoint` at the recorded ratio as the
+  FINAL fallback in `passField` / `userField` / submit-button
+  selection — never overrides a working CSS selector, but catches
+  every "selector missed, text-pattern missed too" case.
+  `inject/calibrate.js.tmpl` ships a translucent crosshair overlay
+  that walks the operator through the three clicks. `inject.py`
+  defensively filters malformed `login_zones` entries at render time.
+- **Deploy-time file-hash manifest + boot-time drift detection**
+  (Phase 9): `kiosk-host/host/manifest.py` hashes every shipped file
+  + records the source commit's HEAD sha at install time, writes to
+  `/etc/soc-display/manifest.json`. At boot, the wall hashes its
+  on-disk files (under `/opt/soc-display`) and surfaces a
+  `format_drift_summary(...)` warning in the top bar if anything
+  drifted. `install.sh` invokes `manifest.write_manifest` from
+  `SRC_DIR` (which has the `.git` for `rev-parse`) after the tar-pipe
+  copy.
+
+#### Net test growth
+- 247 → 367 tests (+120 over the cycle).
 
 Roadmap phases 1, 2 and 10 from the PROMPT.txt handoff. Closes the gap
 where shipped modules (`locker.py`, `tray.py`) had no runtime callers,
