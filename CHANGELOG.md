@@ -9,6 +9,41 @@ Production-hardening pass on top of the initial single-engine wall: multi-distro
 + multi-display-server install, a supervised multi-protocol VPN, an outbound
 proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
+### Security & reliability audit pass (2026-06-23)
+
+Four-domain read-only audit (secrets/crypto, kiosk runtime, VPN/RFC, installer/OS)
+of the production merge, followed by fixes. Unit suite 136 → 186 green. Full
+findings and deferred items: `docs/MERGE_AUDIT_REPORT.md`.
+
+- **Memory (1 GB Pi, was a no-op):** WebKit `recycle()` now terminates the web
+  process (and clears website data) so the kernel actually reclaims a leaking
+  renderer's RSS instead of a plain reload; `mem_rss_kb()` reports the web-process
+  RSS so the memory watchdog isn't blind. Feature-detected with a reload fallback.
+- **Self-heal:** Chromium gained a respawn ceiling (`SOC_MAX_RESPAWNS`, default 20)
+  + a parked terminal state so a permanently-broken panel stops respawning Chromium
+  forever; WebKit retry timers are tracked and cancelled (no stale/stacked reloads);
+  `WebKitPanel.stop()` tears down web process + timers on shutdown; CDP `rpc()` got a
+  per-recv socket timeout so a wedged Chromium heals instead of stalling self-heal.
+- **Credential injection origin gate:** host-side `socLogin()` refuses to fill unless
+  `location.origin` matches the panel's configured origin — an open redirect or a
+  compromised dashboard can no longer get SOC creds autofilled into an attacker page.
+- **VPN/RFC:** OpenVPN management-socket username/password are CR/LF-sanitized
+  (line-injection); materialized vault keys are cleaned via `try/finally` on every
+  exit path; IPv6 `host:port` parsing is bracket-aware (RFC 3986).
+- **Config validation:** VPN/tunnel argv values (`gateway`/`remote_host`/`realm`/…)
+  reject leading-dash/control/whitespace (argv option-injection); `remote_port` is
+  range-checked; grid geometry clamps to ≥1 cell for an oversized `gap`; panel `id`
+  is restricted to `[A-Za-z0-9_-]` and XML-escaped in the WM rc.xml generators.
+- **Installer/OS:** dedicated `socenv` group scopes `soc.env` read (no over-broad
+  kiosk-group grant); nftables pins NTP to `@ntp_servers` and rate-limits outbound
+  ICMP echo; generated `soc-wall.service` is `0640` (no `SOC_VAULT_EMAIL` leak);
+  `clean_state` rmtree is guarded by a path allowlist; ssh `-L` `extra_forwards` are
+  shape-validated and a non-default `host_key_checking` now requires a `known_hosts`.
+- **Deferred (needs on-hardware validation):** `forti-vpn.service` capability/syscall
+  sandboxing (validate against all 3 VPN backends); on-device check of the WebKit
+  web-process RSS-reclaim path (`make verify`). Single-use VPN OTP still on argv
+  (documented residual).
+
 ### Added
 
 - **Runtime memory watchdog (1 GB Pi).** The host periodically checks
