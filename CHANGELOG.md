@@ -48,10 +48,24 @@ findings and deferred items: `docs/MERGE_AUDIT_REPORT.md`.
   ICMP echo; generated `soc-wall.service` is `0640` (no `SOC_VAULT_EMAIL` leak);
   `clean_state` rmtree is guarded by a path allowlist; ssh `-L` `extra_forwards` are
   shape-validated and a non-default `host_key_checking` now requires a `known_hosts`.
+- **Live VPN validation (real gateways).** Fortinet (`openfortivpn`) and iNode (H3C SSL-VPN)
+  both authenticated and brought up full tunnels — including **both at once in parallel**
+  (`ppp0` 10.x + `inode0` 192.168.8.x), with the host default route/DNS left untouched
+  (`--no-routes` / `--split-tunnel`) and clean teardown. Exercised the real project code paths
+  (Fortinet via `forti-pinentry.sh`, password off argv; iNode via the `INodeDriver` + helper,
+  cert pinned). Classifier patterns matched real gateway output. See `docs/MERGE_AUDIT_REPORT.md`.
+- **Installer: vendored iNode backend permissions.** `install.sh` now clears group/other-write
+  on `vendor/iNode-VPN-Client/backends` after deploy. The C3-hardened `inode-svpn-helper`
+  refuses to load a group/other-writable backend as root, and `chown -R root:root` sets owner
+  but not mode — so the dev repo's group-writable backend would otherwise trip the guard and
+  break the iNode VPN on the Pi.
+- **`launch.sh` no-arg interactive menu.** Bare `./launch.sh` in a terminal now prompts for the
+  mode (Dev simulation / Configure / Production deploy) instead of silently running the dev
+  simulation; flags (`--setup`/`--pi`/`--headless`) and piped/non-interactive runs are unchanged.
 - **Deferred (needs on-hardware validation):** `forti-vpn.service` capability/syscall
   sandboxing (validate against all 3 VPN backends); on-device check of the WebKit
-  web-process RSS-reclaim path (`make verify`). Single-use VPN OTP still on argv
-  (documented residual).
+  web-process RSS-reclaim path (`make verify`); OpenVPN/WireGuard backends against real
+  gateways. Single-use VPN OTP still on argv (documented residual).
 
 ### Added
 
