@@ -2146,10 +2146,17 @@ class ConfigWindow(Gtk.Window):
         pending = result.get("pending_restarts") or []
         write_back = result.get("write_back", "ok")
         self_restart = bool(result.get("self_restart"))
+        applied_live = result.get("applied_live") or []
         bits = ["Saved ✓ — overrides.json updated"]
+        if applied_live:
+            # Width / height / fullscreen / cols / rows applied without a
+            # restart — surface what changed in-place so the operator
+            # doesn't think the wall ignored their edit.
+            bits.append(f"applied live ✓ ({', '.join(applied_live)} — "
+                        "no restart)")
         if self_restart:
-            bits.append("restarting wall to apply layout/grid/resolution "
-                        "(systemd respawns in ~3s)")
+            bits.append("restarting wall to apply layout change "
+                        "(launcher/systemd respawns in ~3s)")
         if pending:
             bits.append("⚠ PENDING restart (reboot the wall, or `sudo "
                         f"systemctl restart {' '.join(pending)}` as root): "

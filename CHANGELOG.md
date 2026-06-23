@@ -9,6 +9,130 @@ Production-hardening pass on top of the initial single-engine wall: multi-distro
 + multi-display-server install, a supervised multi-protocol VPN, an outbound
 proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
+### Auto-fix · ARM polish · no-reboot settings · Restart-actually-restarts (2026-06-23 night)
+
+Closes the post-reinstall friction loop: every manual fix-up I had to do
+last turn (after the reinstall) now applies automatically on `install.sh`,
+ARM support is no-surprises across the board, and the ⚙ Settings →
+Restart wall button + most layout edits work without a respawn.
+
+#### Auto-fix (every paper-cut from the last reinstall, fixed at source)
+
+- **`config/soc.env.example`** — quote `SOC_CONFIG_VAULT_ITEM`. The
+  unquoted value (`SOC Wall Config`) made bash interpret `Wall Config`
+  as a prefixed-command on every launcher source, emitting the noisy
+  `line 17: Wall: command not found`. (Harmless because python's
+  default for the env var was already `"SOC Wall Config"`, but it
+  obscured real errors.)
+- **`install.sh` no longer clobbers `default.target`** — the unconditional
+  flip to `multi-user.target` was breaking Plasma/GNOME desktops on
+  every install. New logic:
+    * `SOC_KIOSK_TTY1=1` → flip (the Pi kiosk path; explicit opt-in)
+    * current target ≠ graphical AND no active desktop session →
+      flip (headless server)
+    * otherwise → KEEP graphical.target; surface a one-line hint
+      naming the env var for the kiosk path
+  Either way, the prior target is recorded in
+  `/etc/soc-display/.prior-target` so `reinstall.py` can revert
+  cleanly on the next uninstall.
+- **`scripts/wall-windowed.sh`** (NEW) — canonical "launch the wall on
+  an existing desktop session" script. Handles the three integration
+  points that bit us:
+    * **XDG_RUNTIME_DIR**: mkdir 0700 if missing; tries `sudo install
+      -d` as a fallback so a wall not started by `soc-wall.service`
+      (which already has the ExecStartPre) gets the dir Wayland +
+      WebKitGTK require.
+    * **XAUTHORITY discovery**: walks `$HOME/.Xauthority`,
+      `/run/user/$(id -u)/xauth_*`, `/run/user/$(id -u)/
+      .mutter-Xwaylandauth.*`, and the `SUDO_USER`'s equivalents.
+      Surfaces a clear hint about `grant-soc-x-display.sh` if nothing
+      works.
+    * **Safe `soc.env` source**: a python rewriter quotes every
+      `KEY=VALUE` line via `shlex.quote` before bash sources it, so
+      hand-edits with unquoted spaces, embedded quotes, or
+      backslashes never poison the launch.
+  `install.sh` auto-deploys it as `$HOME/wall-launcher.sh` chowned
+  to the kiosk user.
+- **`scripts/grant-soc-x-display.sh`** (NEW) — one-shot helper for the
+  desktop user: `xhost +SI:localuser:soc` so a wall run as `soc` can
+  open windows on the desktop user's display. `--autostart` writes an
+  XDG autostart entry so the grant persists across logins.
+  `--revoke` undoes it; `--user <name>` targets a non-default user.
+  `--help` enforces "run as desktop user, NOT root" with a clean
+  error message + a brief explanation.
+- **`reinstall.py` sentinel-aware restore** — reads
+  `/etc/soc-display/.prior-target` written by the new `install.sh`;
+  restores that exact value (instead of always graphical.target) so
+  a true Pi kiosk that was deliberately on multi-user stays on
+  multi-user. Falls back to graphical.target when the sentinel is
+  absent (older install).
+
+#### ARM support
+
+- **`/proc/device-tree/model` surfaced** — on aarch64/arm64, install.sh
+  now prints the actual board name (e.g. "Raspberry Pi 5 Model B Rev
+  1.0") right under the architecture line, so the operator
+  confirms the target box at a glance.
+- **MemTotal hint** — install.sh reads `/proc/meminfo`; under 1.2 GB
+  it warns + names the tuning knobs (`SOC_MEM_MIN_AVAIL_MB`,
+  `SOC_MEM_CHECK_SEC`) so the operator knows the memory-watchdog
+  will recycle a panel occasionally.
+- Verified: no x86-specific code anywhere. `vendor/iNode-VPN-Client`
+  is pure Python; `vaultwarden/server:latest` is multi-arch (Docker
+  picks the host arch automatically); WebKitGTK + cryptography +
+  PyYAML all ship aarch64 wheels / packages on Bookworm-family
+  distros.
+
+#### Settings → no reboot needed for most display edits
+
+- **`main.apply_config` splits display changes** into live-apply vs
+  needs-restart:
+    * **LIVE** (no flicker, no exit): `width`, `height`, `fullscreen`,
+      `cols`, `rows` — provided the new cols/rows don't orphan an
+      existing panel.
+    * **soft-restart** (launcher loop / systemd respawns in ~3 s):
+      `layout` (single ↔ windows is a windowing-model swap), or
+      shrinking the grid below an existing panel's (col, row) — the
+      restart surfaces a confirmation chance before any panel
+      disappears.
+- New `_apply_display_live`:
+    * `window.resize()` + `_fit_to_screen()` for size changes
+    * `_toggle_fullscreen()` for fullscreen toggle
+    * detach + re-attach every panel widget to the grid for
+      cols/rows reflow (homogeneous grid handles cell autosize)
+    * mutates `self.conf.display` first so other read paths see new
+      values immediately
+- Configwin Apply message clearly says **"applied live ✓ (width,
+  height — no restart)"** when no respawn was needed.
+
+#### ⚙ Settings → Restart wall *actually restarts*
+
+The old `restart_wall()` did `sys.exit(0)` and trusted systemd's
+`Restart=always` to bring the wall back. On the standalone path (a
+desk operator running the wall via wall-launcher.sh, no systemd
+supervision), the wall just died. The fix has two layers:
+
+- **`scripts/wall-windowed.sh` wraps `python -m host.main` in a respawn
+  loop**: exit 0 → respawn; exit 2 → done; anything else → respawn
+  after 1 s (crash-loop cooldown). Operator chooses "Quit" in the
+  tray menu to actually stop (which exits with 2).
+- **`main.restart_wall` detects standalone vs systemd**:
+  `INVOCATION_ID` env var (set by systemd) decides. Under systemd
+  → `sys.exit(0)` as before. Standalone → tear down panel views,
+  then `os.execv(sys.executable, [sys.executable, "-m",
+  "host.main"])` to self-replace if the launcher loop isn't there
+  either; falls back to `sys.exit(0)` if `os.execv` fails.
+
+Combined: Restart-wall works regardless of how the wall was launched.
+
+#### Tests
+- 367 → 378 (+11). New: 8 for the live display-apply dispatch
+  (width/height/fullscreen/cols-grow live, cols-shrink restart with
+  orphan list, layout change restart, no-change no-restart, missing
+  wall safe, conf mutation order); 3 for soc.env quoting (bash-source
+  cleanly, regex guard against unquoted values with spaces, launcher
+  python rewrite handles hand-edit hazards).
+
 ### Reinstall tool · click-zone calibrate runtime · drift detail modal (2026-06-23 evening)
 
 The post-batch wiring pass. Closes the placeholders left after the

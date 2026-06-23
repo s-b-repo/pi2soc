@@ -270,18 +270,39 @@ def remove_units(runner: Runner) -> None:
     runner.run(["systemctl", "reset-failed"])
 
 
+PRIOR_TARGET_SENTINEL = "/etc/soc-display/.prior-target"
+
+
 def restore_default_target(runner: Runner) -> None:
-    """install.sh may flip default.target → multi-user.target for headless
-    kiosk boot. Put it back to graphical.target so a desktop user can log in
-    after the wall is gone."""
+    """Restore default.target to whatever it was BEFORE the install. The
+    sentinel `/etc/soc-display/.prior-target` is written by install.sh
+    immediately before any flip; if it's present + readable, we restore
+    that exact value. If it's absent (older install), fall back to the
+    safe-default behaviour of restoring graphical.target so a desktop
+    user can log in after the wall is gone."""
     section("Restoring default boot target")
     r = runner.run(["systemctl", "get-default"])
     current = (r.stdout or "").strip()
-    if current and current != "graphical.target":
-        print(f"  current default: {current} → restoring graphical.target")
-        runner.run(["systemctl", "set-default", "graphical.target"])
+    desired = "graphical.target"
+    if os.path.exists(PRIOR_TARGET_SENTINEL):
+        try:
+            with open(PRIOR_TARGET_SENTINEL, encoding="utf-8") as fh:
+                content = fh.read().strip()
+            # Sanity gate: only accept well-formed *.target names.
+            if content.endswith(".target") and " " not in content:
+                desired = content
+                print(f"  prior target sentinel: {desired}")
+        except OSError as e:
+            print(f"  could not read {PRIOR_TARGET_SENTINEL}: {e}; "
+                  "defaulting to graphical.target")
     else:
-        print(f"  default already {current or 'graphical.target'} (no change)")
+        print(f"  no sentinel at {PRIOR_TARGET_SENTINEL}; "
+              "defaulting to graphical.target")
+    if current and current != desired:
+        print(f"  current default: {current} → restoring {desired}")
+        runner.run(["systemctl", "set-default", desired])
+    else:
+        print(f"  default already {current or desired} (no change)")
 
 
 def remove_deploy_tree(runner: Runner) -> None:

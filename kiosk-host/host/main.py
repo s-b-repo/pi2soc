@@ -613,6 +613,94 @@ class KioskHost:
             log(f"calibrate_panel: view.calibrate raised: {e}")
             on_done(None)
 
+    def _apply_display_live(self, changes: dict, current: dict) -> bool:
+        """In-place display update — width/height/fullscreen/cols/rows.
+
+        Mutates `self.conf.display`, then nudges the live WallWindow:
+          width/height → window.resize + re-fit (homogeneous grid auto-
+            recomputes cell size)
+          fullscreen   → window.fullscreen / unfullscreen
+          cols/rows    → re-attach every panel widget at its (col, row)
+            with set_column_homogeneous / set_row_homogeneous (the new
+            cell count picks up automatically from the next paint).
+
+        Returns True on success, False on any unhandled exception (caller
+        then falls back to soft-restart). Never raises out — the wall
+        must keep running even if a live apply turns out to be a no-op."""
+        try:
+            wall = self.wall
+            if wall is None or wall.window is None:
+                return False
+            d = self.conf.display
+            # Mutate the config first so other paths (override save, status
+            # tab) see the new values immediately.
+            if "width" in changes:
+                d.width = int(changes["width"])
+            if "height" in changes:
+                d.height = int(changes["height"])
+            if "cols" in changes:
+                d.cols = int(changes["cols"])
+            if "rows" in changes:
+                d.rows = int(changes["rows"])
+            if "fullscreen" in changes:
+                d.fullscreen = bool(changes["fullscreen"])
+
+            # Width / height — resize the window. In fullscreen mode the WM
+            # owns the size, so we still update _fit_to_screen for the
+            # next size-changed signal.
+            if "width" in changes or "height" in changes:
+                try:
+                    wall.window.resize(d.width, d.height)
+                    wall._fit_to_screen()
+                except Exception:                        # noqa: BLE001
+                    pass
+
+            # Fullscreen toggle — match the new desired state.
+            if "fullscreen" in changes:
+                want_full = bool(d.fullscreen)
+                have_full = bool(getattr(wall, "_fullscreen", True))
+                if want_full != have_full:
+                    wall._toggle_fullscreen()
+
+            # cols/rows — recompute each panel's geometry, then re-attach
+            # widgets to the grid. The Gtk.Grid is homogeneous so cell
+            # size follows the grid's own size automatically.
+            if "cols" in changes or "rows" in changes:
+                from . import config as _cfg
+                # Re-derive each panel.geometry from the new cols/rows.
+                for p in self.conf.panels:
+                    p.geometry = _cfg.compute_geometry(d, p.grid)
+                # Detach + reattach so Gtk.Grid recomputes its layout from
+                # scratch. Each panel's widget is the existing webview —
+                # no reload, no flicker, just a different cell position.
+                grid = wall.grid
+                widgets = []
+                for v in self.panels_view:
+                    w = getattr(v, "widget", None)
+                    if w is not None:
+                        widgets.append((v.panel, w))
+                for _p, w in widgets:
+                    try:
+                        grid.remove(w)
+                    except Exception:                    # noqa: BLE001
+                        pass
+                grid.set_row_homogeneous(True)
+                grid.set_column_homogeneous(True)
+                for p, w in widgets:
+                    try:
+                        wall.attach(p, w)
+                    except Exception:                    # noqa: BLE001
+                        pass
+                grid.show_all()
+            log(f"display: applied live {sorted(changes)} "
+                f"(now {d.cols}x{d.rows} @ {d.width}x{d.height}, "
+                f"fullscreen={getattr(d, 'fullscreen', True)})")
+            return True
+        except Exception as e:                           # noqa: BLE001
+            log(f"display: live apply failed ({e}); falling back to "
+                "soft-restart")
+            return False
+
     def _save_login_zones_override(self, panel_id: str, zones: dict):
         """Merge {panel_id: {login_zones: zones}} into the overrides file
         so the calibration survives a restart. Reuses configwin's
@@ -641,19 +729,60 @@ class KioskHost:
         return n
 
     def restart_wall(self):
-        """Soft restart: exit cleanly so soc-wall.service (Restart=always,
-        RestartSec=3) respawns us with the current config. Used by the Actions
-        tab "Restart wall" button AND by apply_config when a layout / grid /
-        resolution change needs a full reload. Schedules the exit ~500 ms in
-        the future so the GUI gets to paint the 'restarting…' message first."""
-        log("restart_wall: scheduling self-exit (systemd will respawn in ~3s)")
+        """Soft restart: hand the runtime back to whoever launched us so they
+        respawn with the current config. Two paths, chosen automatically:
 
-        def _exit():
-            log("restart_wall: exiting")
-            import sys as _sys
-            _sys.exit(0)
+          - systemd-supervised (INVOCATION_ID is set by systemd):
+            sys.exit(0). The unit's Restart=always RestartSec=3 brings us
+            back within ~3 s.
+          - standalone (wall-windowed.sh's while-loop OR a direct python -m
+            host.main with no supervisor): sys.exit(0) still works under the
+            launcher loop; for the no-launcher case we ALSO arm an os.execv
+            fallback that replaces the current process with the same argv
+            so the wall comes back regardless of how it was started.
+
+        Scheduled ~500 ms in the future so the GUI paints the 'restarting…'
+        message first.
+
+        Used by the Actions-tab Restart button AND by apply_config when a
+        change can't be applied in-place (layout backend switch)."""
+        in_systemd = bool(os.environ.get("INVOCATION_ID"))
+        if in_systemd:
+            log("restart_wall: scheduling self-exit (systemd will respawn in ~3s)")
+        else:
+            log("restart_wall: scheduling self-restart (launcher loop or execv "
+                "fallback will respawn)")
+
+        def _restart():
+            log("restart_wall: tearing down panel views")
+            for v in self.panels_view:
+                if hasattr(v, "stop"):
+                    try:
+                        v.stop()
+                    except Exception:                    # noqa: BLE001
+                        pass
+            if in_systemd:
+                log("restart_wall: exiting (systemd will respawn)")
+                import sys as _sys
+                _sys.exit(0)
+                return False
+            # Standalone: prefer exit(0) so a wall-windowed.sh launcher
+            # loop respawns us; if there IS no launcher (a bare `python -m
+            # host.main`), the process would just die — so we ALSO try
+            # os.execv as a last-ditch self-replace. Order matters: exit
+            # would unwind cleanly; execv replaces immediately.
+            try:
+                log("restart_wall: re-execing via os.execv")
+                import sys as _sys
+                os.execv(_sys.executable,
+                          [_sys.executable, "-m", "host.main"])
+            except OSError as e:                         # noqa: BLE001
+                log(f"restart_wall: os.execv failed ({e}); exiting cleanly "
+                    "and trusting the launcher loop")
+                import sys as _sys
+                _sys.exit(0)
             return False
-        GLib.timeout_add(500, _exit)
+        GLib.timeout_add(500, _restart)
 
     def login_stats(self) -> dict:
         """Per-panel auto-login retry stats for the ⚙ Status tab. A panel whose
@@ -693,13 +822,24 @@ class KioskHost:
                 self.wall.grid.set_column_spacing(disp["gap"])
             except Exception:  # noqa: BLE001
                 pass
-        # Detect display changes that genuinely need the WallWindow to be
-        # rebuilt (layout / grid size / fullscreen / resolution / SOC_SESSION).
-        # Soft-restart via systemd respawn instead of asking the operator to
-        # reboot. `gap` and `auto` are live-applied above so they don't trigger.
+        # Display changes — try to apply LIVE first; soft-restart only when
+        # we genuinely cannot (the layout windowing model changed, or cells
+        # shrunk and existing panels would be orphaned).
+        #
+        # Live-apply scope (no flicker, no exit):
+        #   gap         already applied above (in-place row/col spacing)
+        #   width       window.resize() — homogeneous grid auto-resizes
+        #   height      same
+        #   fullscreen  use the existing _toggle_fullscreen path
+        #   cols/rows   reflow the grid in-place IF new cells >= existing
+        #               panels (no panel gets orphaned)
+        #
+        # Soft-restart (exit → launcher / systemd respawn):
+        #   layout      single ↔ windows is a windowing-model swap; the
+        #               WallWindow type differs. Restart is the clean path.
+        #   cols/rows shrinking that would orphan a configured panel —
+        #               surfaces a restart so the operator can confirm.
         if disp and self.wall is not None:
-            rebuild_keys = ("layout", "cols", "rows", "width", "height",
-                            "fullscreen")
             current = {"layout": self.conf.display.layout,
                        "cols": self.conf.display.cols,
                        "rows": self.conf.display.rows,
@@ -707,9 +847,34 @@ class KioskHost:
                        "height": self.conf.display.height,
                        "fullscreen": getattr(self.conf.display,
                                               "fullscreen", True)}
-            if any(k in disp and disp[k] != current.get(k)
-                   for k in rebuild_keys):
+            live_keys = ("width", "height", "fullscreen", "cols", "rows")
+            live_changes = {k: disp[k] for k in live_keys
+                            if k in disp and disp[k] != current.get(k)}
+            layout_change = ("layout" in disp
+                             and disp["layout"] != current["layout"])
+            # cols/rows shrinkage check — if the new grid is smaller than
+            # any existing panel's (col, row), live-reflow would orphan it.
+            shrink_orphans = []
+            if "cols" in live_changes or "rows" in live_changes:
+                new_cols = int(live_changes.get("cols", current["cols"]))
+                new_rows = int(live_changes.get("rows", current["rows"]))
+                for p in self.conf.panels:
+                    col, row = p.grid
+                    if col >= new_cols or row >= new_rows:
+                        shrink_orphans.append(p.id)
+            if layout_change or shrink_orphans:
                 result["self_restart"] = True
+                if shrink_orphans:
+                    result["pending_restarts"].append(
+                        f"grid shrink would orphan {shrink_orphans} — "
+                        "restart to confirm")
+            elif live_changes:
+                applied = self._apply_display_live(live_changes, current)
+                if applied:
+                    result["applied_live"] = sorted(live_changes)
+                else:
+                    # Live apply errored out — fall back to soft-restart.
+                    result["self_restart"] = True
         # Multi-VPN: _vpns is the canonical list; _vpn (legacy) is kept for
         # back-compat callers that still only know about a single VPN.
         vpns_ch = changes.pop("_vpns", None)

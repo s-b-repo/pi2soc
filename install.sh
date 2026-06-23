@@ -82,12 +82,38 @@ fi
 
 # Architecture note (ARM boards are the primary target; x86 works too).
 case "$ARCH" in
-  aarch64|arm64)  log "CPU architecture: $ARCH (64-bit ARM — e.g. Raspberry Pi 5)" ;;
+  aarch64|arm64)
+    log "CPU architecture: $ARCH (64-bit ARM — e.g. Raspberry Pi 5)"
+    # Surface the actual board model when /proc/device-tree/model exists
+    # (Raspberry Pi family + most ARM SBCs expose it). Lets the operator
+    # confirm at a glance that the install is going on the right box.
+    if [ -r /proc/device-tree/model ]; then
+      model="$(tr -d '\0' < /proc/device-tree/model)"
+      [ -n "$model" ] && log "  Board: $model"
+    fi
+    ;;
   armv7l|armv6l)  warn "CPU architecture: $ARCH (32-bit ARM). WebKitGTK is heavy here;"
                   warn "  a 64-bit OS is strongly recommended for the SOC wall." ;;
   x86_64|amd64)   log "CPU architecture: $ARCH (x86-64)" ;;
   *)              warn "CPU architecture: $ARCH (untested — proceeding anyway)" ;;
 esac
+
+# Memory hint. The wall + Vaultwarden + a couple of WebKit panels sit around
+# ~500 MB resident in production. < 1.2 GB total RAM means the memory
+# watchdog (host/main._check_memory) will recycle panels under pressure —
+# loudly enough that the operator should know up front + leave zram on.
+if [ -r /proc/meminfo ]; then
+  mem_kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo || echo 0)
+  mem_mb=$(( mem_kb / 1024 ))
+  if [ "$mem_mb" -gt 0 ]; then
+    log "Total RAM: ${mem_mb} MB"
+    if [ "$mem_mb" -lt 1200 ]; then
+      warn "Low-RAM box (${mem_mb} MB < 1200). Keep zram enabled and expect the"
+      warn "memory watchdog to recycle a panel occasionally under pressure."
+      warn "Tune via: SOC_MEM_MIN_AVAIL_MB / SOC_MEM_CHECK_SEC in soc.env"
+    fi
+  fi
+fi
 
 # --------------------------------------------------------------------------- #
 # Distro detection + package-manager abstraction
@@ -617,12 +643,61 @@ fi
 EOF
 chown -R "$KIOSK_USER:$KIOSK_USER" "$HOME_DIR/.config" "$HOME_DIR/.xinitrc" "$HOME_DIR/.bash_profile"
 
+# Per-user copy of the canonical windowed-mode launcher. The script in
+# $SOC_ROOT/scripts/wall-windowed.sh is read-only (root-owned); we drop a
+# 0755 copy in the kiosk user's home so a desk operator can launch the
+# wall under their own session without touching /opt:
+#   sudo -u "$KIOSK_USER" /home/<u>/wall-launcher.sh
+# The launcher handles XDG_RUNTIME_DIR creation, XAUTHORITY discovery,
+# safe soc.env sourcing (immune to unquoted values with spaces), and a
+# respawn loop so the "Restart wall" Settings button actually restarts
+# even when systemd isn't supervising (non-tty1-kiosk path).
+install -m 0755 -o "$KIOSK_USER" -g "$KIOSK_USER" \
+    "$SOC_ROOT/scripts/wall-windowed.sh" "$HOME_DIR/wall-launcher.sh"
+log "wall-launcher.sh deployed to $HOME_DIR/wall-launcher.sh"
+
 if [ "$HAS_SYSTEMD" = "1" ]; then
-  log "Enabling tty1 autologin"
-  mkdir -p /etc/systemd/system/getty@tty1.service.d
-  sed "s/--autologin soc /--autologin $KIOSK_USER /" \
-    "$SOC_ROOT/systemd/getty-autologin.conf" > /etc/systemd/system/getty@tty1.service.d/override.conf
-  systemctl set-default multi-user.target    # no desktop env; we run our own session
+  # --- tty1 autologin + default.target ------------------------------------
+  # Old behaviour: ALWAYS flipped default.target to multi-user.target and
+  # enabled tty1 autologin. On a Pi kiosk that's correct; on a desktop dev
+  # box (Plasma/GNOME) it silently breaks the desktop on the next reboot.
+  #
+  # New behaviour: detect whether this looks like a kiosk install:
+  #   * SOC_KIOSK_TTY1=1   — explicit operator opt-in (recommended for Pi)
+  #   * else: heuristic — graphical default + a logged-in graphical session
+  #     means "desktop user just installed for testing"; we skip the flip
+  #     and print the one-line opt-in.
+  # The prior target is recorded in $ETC/.prior-target so reinstall.py
+  # (and a manual restore) can revert cleanly on uninstall.
+  prior_target="$(systemctl get-default 2>/dev/null || echo graphical.target)"
+  printf '%s\n' "$prior_target" > "$ETC/.prior-target"
+  chmod 0644 "$ETC/.prior-target"
+
+  flip_default_target=0
+  if [ "${SOC_KIOSK_TTY1:-0}" = "1" ]; then
+    flip_default_target=1
+    log "SOC_KIOSK_TTY1=1 — will flip default.target → multi-user.target (Pi kiosk path)"
+  elif [ "$prior_target" != "graphical.target" ]; then
+    flip_default_target=1
+    log "default.target is already $prior_target — assuming kiosk path; flipping to multi-user.target"
+  elif ! loginctl list-sessions --no-legend 2>/dev/null | awk '$5 ~ /tty|seat/' | grep -q .; then
+    # graphical default but no active graphical session — headless box
+    flip_default_target=1
+    log "graphical.target default + no active graphical session — flipping to multi-user.target"
+  else
+    log "Detected active desktop session + graphical.target default —"
+    log "  KEEPING graphical.target (the wall starts as a normal app)."
+    log "  For Pi tty1 kiosk path instead: re-run with SOC_KIOSK_TTY1=1"
+    log "  Recovery if you flipped by accident: sudo systemctl set-default graphical.target"
+  fi
+
+  if [ "$flip_default_target" = "1" ]; then
+    log "Enabling tty1 autologin"
+    mkdir -p /etc/systemd/system/getty@tty1.service.d
+    sed "s/--autologin soc /--autologin $KIOSK_USER /" \
+      "$SOC_ROOT/systemd/getty-autologin.conf" > /etc/systemd/system/getty@tty1.service.d/override.conf
+    systemctl set-default multi-user.target    # no desktop env; we run our own session
+  fi
   systemctl daemon-reload
 else
   warn "no systemd — set up tty1 autologin for '$KIOSK_USER' with your init."
