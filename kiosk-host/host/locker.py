@@ -111,6 +111,64 @@ def verify_any(state_dir: str, code: str) -> bool:
     return ok
 
 
+def _verify_pin_hash(stored: str, code: str) -> bool:
+    """Verify a code against a salt$digest pair (the same shape stored in
+    panellock.pin), sourcing the stored value from a string rather than
+    reading a file. Used by verify_any_vault_first so vault-backed PIN
+    hashes go through identical comparison logic."""
+    try:
+        salt_hex, _, digest = (stored or "").strip().partition("$")
+        if not (salt_hex and digest):
+            return False
+        want = hashlib.sha256(bytes.fromhex(salt_hex)
+                              + code.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(want, digest)
+    except ValueError:
+        return False
+
+
+def verify_any_vault_first(vault, state_dir: str, code: str) -> bool:
+    """Try the vault-backed secrets first when present, fall back to the
+    local file pair otherwise. Either path may hold PIN, TOTP, or both;
+    a `code` that matches either type passes.
+
+    Policy (operator intent): when the vault has secrets enrolled, the
+    vault is the *source of truth* — the local files are NOT consulted
+    as a fallback, even if they happen to match. This prevents a stale
+    on-disk PIN from outlasting a rotation done at the glass.
+
+    If the vault is unreachable / not ready / has no items, falls all
+    the way through to verify_any() so the lock keeps working offline."""
+    if not code or not code.strip():
+        return False
+    if vault is not None and getattr(vault, "ready", False):
+        try:
+            v_pin  = _totp.load_vault(vault, "panellock_pin") if False else None
+            # ^ panellock_pin item naming reserved for Phase 6 — for now the
+            # panellock_totp item is the only vault-side store; the PIN stays
+            # in panellock.pin until Phase 6 wires a Vaultwarden secure note
+            # for the PIN hash. This branch falls through to file fallback
+            # cleanly when only TOTP is vaulted.
+            v_totp = _totp.load_vault(vault, "panellock")
+        except Exception:                              # noqa: BLE001
+            v_pin, v_totp = None, None
+        if v_totp:
+            if _totp.verify(v_totp, code):
+                return True
+            # Vault-side TOTP enrolled but didn't match → do NOT fall back
+            # to a local file for TOTP. Pin fallback only.
+            if pin_is_set(state_dir):
+                return verify_pin(state_dir, code)
+            return False
+        if v_pin:
+            if _verify_pin_hash(v_pin, code):
+                return True
+            # Same policy: vault-side PIN is truth → no fallback.
+            return False
+    # Neither vault nor a useful answer from it — local files.
+    return verify_any(state_dir, code)
+
+
 # --- the GTK lock window -------------------------------------------------- #
 class KioskLocker:
     """Holds a single lock window. Idempotent — calling lock() while locked

@@ -159,3 +159,74 @@ def clear(path: str) -> None:
         os.remove(path)
     except OSError:
         pass
+
+
+# --- vault-backed store (Phase 5 — centralise across roaming walls) ------- #
+# Replaces the local file pair (config.totp / panellock.totp) with vault
+# secure notes — same secret material, different storage. The local file
+# API above stays as the offline / dev fallback and is the migration
+# source when an operator switches an existing wall to vault-backed.
+
+_VAULT_TOTP_FOLDER = "SOC Wall Auth"
+
+_VAULT_ITEM_NAMES = {
+    "settings":   "SOC Settings TOTP",
+    "panellock":  "SOC Panel Lock TOTP",
+}
+
+
+def vault_item_for(kind: str) -> str:
+    """`kind` is 'settings' (gates the ⚙ window) or 'panellock' (gates
+    the wall input). Anything else is a programming error — raise."""
+    try:
+        return _VAULT_ITEM_NAMES[kind]
+    except KeyError:
+        raise ValueError(f"unknown TOTP kind: {kind!r}; "
+                         f"expected one of {list(_VAULT_ITEM_NAMES)}")
+
+
+def load_vault(vault, kind: str) -> str | None:
+    """Read the TOTP secret from the vault item's Notes field. Returns
+    None on empty / missing / unreadable so callers can fall back to the
+    file path. Errors propagating from the vault are swallowed — a
+    locker prompt should not stack-trace when Vaultwarden hiccups."""
+    try:
+        note = vault.notes(vault_item_for(kind)) if vault else ""
+    except Exception:                                  # noqa: BLE001
+        return None
+    note = (note or "").strip()
+    return note or None
+
+
+def save_vault(vault, vaultseed_args, kind: str, secret_b32: str) -> None:
+    """Persist `secret_b32` to the vault item as a secure note. Creates the
+    item if absent. `vaultseed_args = (url, email, master_password)` —
+    we delegate the write to vaultseed.upsert_secure_note so this module
+    stays free of HTTP plumbing."""
+    from . import vaultseed
+    url, email, master = vaultseed_args
+    vaultseed.upsert_secure_note(url, email, master,
+                                 name=vault_item_for(kind),
+                                 notes=secret_b32.strip(),
+                                 folder=_VAULT_TOTP_FOLDER)
+    if vault is not None:
+        try:
+            vault.invalidate(vault_item_for(kind))
+        except Exception:                              # noqa: BLE001
+            pass
+
+
+def clear_vault(vault, vaultseed_args, kind: str) -> bool:
+    """Delete the vault item. Returns True on actual deletion, False if it
+    was already absent. Raises on transport / auth failure so the GUI
+    can show a precise error."""
+    from . import vaultseed
+    url, email, master = vaultseed_args
+    rc = vaultseed.delete_login(url, email, master,
+                                name=vault_item_for(kind))
+    if vault is not None:
+        try:
+            vault.invalidate(vault_item_for(kind))
+        except Exception:                              # noqa: BLE001
+            pass
+    return bool(rc)

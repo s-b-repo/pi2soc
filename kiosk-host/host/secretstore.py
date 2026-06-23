@@ -272,13 +272,112 @@ def seal(master: str, pin: str, d: str | None = None):
 def unseal(d: str | None = None) -> str:
     """Recover the master password (host.key + machine-id, no PIN prompt —
     unattended). Raises SecretStoreError if not sealed / wrong host / missing
-    host.key / corrupt."""
+    host.key / corrupt.
+
+    Backend selection: when SOC_SECRET_BACKEND=libsecret is set, try the
+    user-keyring path first (KWallet / GNOME-Keyring via the freedesktop
+    Secret-Service spec). If it has an entry, return it; otherwise log a
+    warning and fall through to the sealed-file path. Either way the
+    sealed files remain the on-disk source of truth so re-seal works."""
+    if os.environ.get("SOC_SECRET_BACKEND") == "libsecret":
+        try:
+            v = libsecret_load()
+        except Exception as e:                         # noqa: BLE001
+            import logging
+            logging.warning("libsecret unseal failed: %s — "
+                            "falling back to sealed file", e)
+            v = None
+        if v:
+            return v
+        import logging
+        logging.warning("SOC_SECRET_BACKEND=libsecret but no entry found — "
+                        "falling back to sealed file")
     sd = secret_dir(d)
     host_key = _read_host_key(sd)
     material = _binding_material(host_key)
     pin = _decrypt(material, _read(os.path.join(sd, "pin.enc"))).decode()
     return _decrypt(material + b"\x00" + pin.encode(),
                     _read(os.path.join(sd, "master.enc"))).decode()
+
+
+# --- libsecret backend (Phase 5 — opt-in via SOC_SECRET_BACKEND=libsecret) -
+# Stores the master password in the user's login keyring. KWallet,
+# GNOME-Keyring, and KeePassXC's secret-service integration all speak the
+# freedesktop Secret-Service spec via libsecret. The keyring is unlocked
+# when the user logs in (auto-unlock with login password, configurable in
+# Plasma's System Settings → KDE Wallet), so the wall starts under the
+# user's session without prompting.
+#
+# Trade-off vs the sealed-file backend:
+#   * sealed file = host-bound, root-readable, survives without a user
+#     session (good for tty1 kiosk; bad for sharing across walls);
+#   * libsecret = user-bound, only accessible while the user's keyring is
+#     unlocked (good for desk deploys; the wall must run as that user).
+# Operators choose at setup time; we never auto-promote.
+
+_LIBSECRET_SCHEMA_NAME = "com.soc-wall.master"
+
+
+def _try_libsecret():
+    try:
+        import gi as _gi
+        _gi.require_version("Secret", "1")
+        from gi.repository import Secret as _Secret      # noqa: N812
+        return _Secret
+    except (ValueError, ImportError):
+        return None
+
+
+def libsecret_available() -> bool:
+    """True if the gi Secret-Service typelib is importable. Cheap probe —
+    only loads the binding once, doesn't hit DBus."""
+    return _try_libsecret() is not None
+
+
+def _libsecret_schema(Secret):
+    return Secret.Schema.new(
+        _LIBSECRET_SCHEMA_NAME, Secret.SchemaFlags.NONE,
+        {"role": Secret.SchemaAttributeType.STRING})
+
+
+def libsecret_store(master: str) -> None:
+    """Store the master password under role=master in the default
+    collection. Raises RuntimeError if libsecret is not installed."""
+    Secret = _try_libsecret()
+    if not Secret:
+        raise RuntimeError("libsecret not available — install gir1.2-secret-1")
+    schema = _libsecret_schema(Secret)
+    Secret.password_store_sync(
+        schema, {"role": "master"},
+        Secret.COLLECTION_DEFAULT,
+        "SOC Wall vault master",
+        master, None)
+
+
+def libsecret_load() -> str | None:
+    """Read the stored master, or None if not stored / agent unreachable."""
+    Secret = _try_libsecret()
+    if not Secret:
+        return None
+    schema = _libsecret_schema(Secret)
+    try:
+        return Secret.password_lookup_sync(schema, {"role": "master"}, None)
+    except Exception:                                  # noqa: BLE001
+        return None
+
+
+def libsecret_clear() -> bool:
+    """Remove the stored master. Returns True on success, False if the
+    backend is absent. Safe to call when nothing is stored."""
+    Secret = _try_libsecret()
+    if not Secret:
+        return False
+    schema = _libsecret_schema(Secret)
+    try:
+        Secret.password_clear_sync(schema, {"role": "master"}, None)
+        return True
+    except Exception:                                  # noqa: BLE001
+        return False
 
 
 def verify_pin(pin: str, d: str | None = None) -> bool:
