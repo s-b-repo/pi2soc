@@ -26,82 +26,146 @@ from gi.repository import Gtk, Gdk  # noqa: E402
 
 BACKGROUND = "#0b1020"
 
-_CSS = b"""
-window, grid, stack { background-color: #0b1020; }
+# --- Colour tokens (single source of truth for the wall palette) ---------- #
+# Every hex code in the CSS below should be one of these. Keeping the palette
+# small + named means future re-skins are one-line changes; ad-hoc inline
+# colours rot out of sync with the rest of the surface.
+TOKENS = {
+    "bg":            "#0b1020",   # primary background (wall + config)
+    "bg-toolbar":    "#0a0f1f",   # toolbar / headerbar
+    "bg-elev":       "#131a31",   # entries, raised cells
+    "bg-elev-2":     "#1b2b4a",   # buttons (idle)
+    "border-soft":   "rgba(126,150,255,0.18)",
+    "border":        "rgba(126,150,255,0.30)",
+    "border-strong": "rgba(126,150,255,0.35)",
+    "fg":            "#e7ecff",   # primary text on dark
+    "fg-muted":      "#aeb9e6",   # toolbar buttons, less-prominent text
+    "fg-soft":       "#c9d3f2",   # body text
+    "fg-dim":        "#8694c4",   # captions / sub-labels
+    "accent":        "#2f4fd0",   # primary action
+    "accent-text":   "#7e96ff",   # accent foreground (links, tags)
+    "ok":            "#57d9a3",   # online / success
+    "warn":          "#ffb450",   # connecting / amber
+    "warn-deep":     "#d9c66a",   # checking
+    "err":           "#ff8f80",   # offline / destructive
+    "err-text":      "#ff9c8f",   # error-state ids
+    "warn-bg":       "rgba(255,180,80,0.18)",  # drift-warning banner
+}
 
-.soc-status {
+
+def _css() -> bytes:
+    t = TOKENS
+    src = f"""
+window, grid, stack {{ background-color: {t['bg']}; }}
+
+.soc-status {{
   background-color: rgba(10, 15, 32, 0.92);
   border: 1px solid rgba(126, 150, 255, 0.28);
   border-radius: 10px;
   padding: 18px 28px;
-}
-.soc-status.error { border-color: rgba(255, 120, 110, 0.55); }
+}}
+.soc-status.error {{ border-color: rgba(255, 120, 110, 0.55); }}
 
-.soc-status-id {
-  color: #7e96ff;
+.soc-status-id {{
+  color: {t['accent-text']};
   font-weight: bold;
   font-size: 12px;
   letter-spacing: 2px;
-}
-.soc-status.error .soc-status-id { color: #ff9c8f; }
+}}
+.soc-status.error .soc-status-id {{ color: {t['err-text']}; }}
 
-.soc-status-msg { color: #c9d3f2; font-size: 15px; }
-.soc-status.error .soc-status-msg { color: #ffc2b8; }
+.soc-status-msg {{ color: {t['fg-soft']}; font-size: 15px; }}
+.soc-status.error .soc-status-msg {{ color: #ffc2b8; }}
 
-.soc-status spinner { color: #7e96ff; min-width: 22px; min-height: 22px; }
+.soc-status spinner {{ color: {t['accent-text']}; min-width: 22px; min-height: 22px; }}
 
 /* on-screen config window + corner gear */
-.soc-config { background-color: #0b1020; }
-.soc-config-title { color: #e7ecff; font-size: 18px; font-weight: bold; }
-.soc-config-sub  { color: #8694c4; font-size: 12px; }
-.soc-config-tag  { color: #7e96ff; font-weight: bold; }
-.soc-config-ok    { color: #57d9a3; font-size: 12px; }
-.soc-config-error { color: #ff8f80; font-size: 12px; }
-.soc-config entry {
-  background-color: #131a31; color: #e7ecff;
-  border: 1px solid rgba(126,150,255,0.3); border-radius: 6px; padding: 6px 8px;
-}
-.soc-config entry:focus { border-color: #7e96ff; }
-.soc-config button {
-  background-image: none; background-color: #1b2b4a; color: #c9d3f2;
-  border: 1px solid rgba(126,150,255,0.3); border-radius: 6px; padding: 6px 12px;
-}
-.soc-config-primary {
-  background-color: #2f4fd0; color: #ffffff; border-color: #2f4fd0;
-}
-.soc-config-sec { color: #8694c4; }
+.soc-config {{ background-color: {t['bg']}; }}
+.soc-config-title {{ color: {t['fg']}; font-size: 18px; font-weight: bold; }}
+.soc-config-sub  {{ color: {t['fg-dim']}; font-size: 12px; }}
+.soc-config-tag  {{ color: {t['accent-text']}; font-weight: bold; }}
+.soc-config-ok    {{ color: {t['ok']}; font-size: 12px; }}
+.soc-config-error {{ color: {t['err']}; font-size: 12px; }}
+.soc-config entry {{
+  background-color: {t['bg-elev']}; color: {t['fg']};
+  border: 1px solid {t['border']}; border-radius: 6px; padding: 6px 8px;
+}}
+.soc-config entry:focus {{ border-color: {t['accent-text']}; }}
+.soc-config button {{
+  background-image: none; background-color: {t['bg-elev-2']}; color: {t['fg-soft']};
+  border: 1px solid {t['border']}; border-radius: 6px; padding: 6px 12px;
+}}
+.soc-config-primary {{
+  background-color: {t['accent']}; color: #ffffff; border-color: {t['accent']};
+}}
+.soc-config-sec {{ color: {t['fg-dim']}; }}
 
-.soc-gear {
+/* Destructive buttons (Remove VPN, Delete vault item, Clear PIN).
+ * Subtle red outline + label so the destructive intent is visible at a
+ * glance without screaming. Honoured by both GtkButton (.destructive-
+ * action is the GTK convention) and the new soc- variant. */
+.soc-config button.destructive-action,
+.destructive-action {{
+  background-color: {t['bg-elev-2']};
+  color: {t['err']};
+  border-color: {t['err']};
+}}
+.soc-config button.destructive-action:hover,
+.destructive-action:hover {{
+  background-color: {t['err']};
+  color: #ffffff;
+}}
+
+.soc-gear, .soc-toolbar-action {{
   background-color: rgba(20,28,54,0.72);
-  border: 1px solid rgba(126,150,255,0.35);
+  border: 1px solid {t['border-strong']};
   border-radius: 8px; padding: 3px 12px; margin: 0 2px;
-  color: #aeb9e6; font-size: 13px; font-weight: bold;
-}
-.soc-gear:hover { background-color: rgba(47,79,208,0.85); color: #ffffff; }
+  color: {t['fg-muted']}; font-size: 13px; font-weight: bold;
+}}
+.soc-gear:hover, .soc-toolbar-action:hover {{
+  background-color: {t['accent']}; color: #ffffff;
+}}
 
 /* top toolbar (always-visible controls; webviews can't paint over it) */
-.soc-toolbar {
-  background-color: #0a0f1f;
-  border-bottom: 1px solid rgba(126,150,255,0.18);
+.soc-toolbar {{
+  background-color: {t['bg-toolbar']};
+  border-bottom: 1px solid {t['border-soft']};
   padding: 4px 8px;
-}
+}}
+
+/* File-hash drift warning bar (Phase 9 — shown above the toolbar when
+ * on-disk files don't match the deploy-time manifest). Subtle amber so
+ * it reads as "look at me" without being alarming. */
+.soc-warn-bar {{
+  background-color: {t['warn-bg']};
+  border-bottom: 1px solid {t['warn']};
+}}
+.soc-warn-bar label {{
+  color: {t['warn']};
+  font-weight: bold;
+  font-size: 13px;
+}}
 
 /* VPN status pill (top of the wall) */
-.soc-vpn-pill {
+.soc-vpn-pill {{
   background-image: none;
   background-color: rgba(20,28,54,0.82);
-  border: 1px solid rgba(126,150,255,0.30);
+  border: 1px solid {t['border']};
   border-radius: 12px; padding: 3px 14px; margin: 0 2px;
-  color: #c9d3f2; font-size: 13px; font-weight: bold;
-}
+  color: {t['fg-soft']}; font-size: 13px; font-weight: bold;
+}}
 /* Traffic-light pill colours: green=online, amber=connecting (probe timed
  * out, still mid-handshake), red=offline (refused / iface gone). */
-.soc-vpn-pill.online      { border-color: rgba(87,217,163,0.7);  color: #57d9a3; }
-.soc-vpn-pill.connecting  { border-color: rgba(255,180,80,0.75); color: #ffb450; }
-.soc-vpn-pill.offline     { border-color: rgba(255,120,110,0.7); color: #ff8f80; }
-.soc-vpn-pill.checking    { color: #d9c66a; }
-.soc-vpn-pill.unconfigured { color: #8694c4; }
+.soc-vpn-pill.online       {{ border-color: rgba(87,217,163,0.7);  color: {t['ok']}; }}
+.soc-vpn-pill.connecting   {{ border-color: rgba(255,180,80,0.75); color: {t['warn']}; }}
+.soc-vpn-pill.offline      {{ border-color: rgba(255,120,110,0.7); color: {t['err']}; }}
+.soc-vpn-pill.checking     {{ color: {t['warn-deep']}; }}
+.soc-vpn-pill.unconfigured {{ color: {t['fg-dim']}; }}
 """
+    return src.encode("utf-8")
+
+
+_CSS = _css()
 
 _applied = False
 
