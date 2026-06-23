@@ -129,6 +129,69 @@ Installs:
 Neither is started automatically — review them (fill the egress sets) first, then
 `systemctl start nftables` and `systemctl reload ssh`.
 
+## Vault is localhost-only
+
+The Vaultwarden listener is locked to loopback on both deploy paths:
+
+- **Native** (`systemd/vaultwarden.service`): `Environment=ROCKET_ADDRESS=127.0.0.1`.
+- **Docker** (`systemd/vaultwarden-docker.service`): the container is run with
+  `-p 127.0.0.1:8222:8222` — the host's docker-proxy binds to `127.0.0.1` only,
+  and the container's internal `ROCKET_ADDRESS=0.0.0.0` is correct (it must
+  accept traffic from the docker bridge interface). The external blast radius
+  is still loopback-only.
+
+```
+$ ss -tlnp | grep 8222
+LISTEN  ...  127.0.0.1:8222  ...  users:(("docker-proxy",pid=...,fd=7))
+```
+
+If you need to reach the web vault from your workstation, use an SSH tunnel:
+
+```
+ssh -L 8222:127.0.0.1:8222 wall.lan
+# then open http://localhost:8222 in your browser
+```
+
+`setup.py doctor` checks the listener bind and warns loudly if anything ever
+exposes it to `0.0.0.0`.
+
+## Tarpit (scanner deception, optional, port 80)
+
+`scripts/tarpit.py` + `systemd/soc-tarpit.service`: a stdlib HTTP server that
+answers `200 OK` with random-looking junk to ~30 common scanner targets
+(`/admin.php`, `/wp-login.php`, `/.env`, `/.git/HEAD`, `/actuator/health`,
+`/api/v1/*`, `/phpmyadmin/`, `/.aws/credentials`, etc.). Everything else
+returns `404`. Each matched response sleeps 0.5–2.0 s (drip) and is rate-
+limited per source IP (bounded LRU). The body shape matches what a header-
+only scanner would expect to find (JSON for `/api/`, KEY=VALUE for `.env`,
+HTML for `.php`) — plausible enough to register as a "hit", junk enough to
+be useless.
+
+**Off by default** — opt-in:
+
+```
+sudo bash -c 'echo SOC_TARPIT_ENABLE=1 > /etc/soc-display/tarpit.env'
+sudo systemctl enable --now soc-tarpit
+```
+
+Hardening: `User=nobody`, `Group=nogroup`, `CapabilityBoundingSet=
+CAP_NET_BIND_SERVICE` (for port 80) and nothing else, `ProtectSystem=strict`,
+`MemoryDenyWriteExecute=yes`, `SystemCallFilter=@system-service` minus
+`@privileged @resources`. The `Server:` header is stripped from every response
+so the tarpit doesn't itself fingerprint Python/BaseHTTPServer.
+
+The tarpit doesn't add a real listening surface — port 80 was otherwise closed
+on the kiosk by the nftables policy. The trade-off is one extra ~32 MB process
+and a deliberate decoy for automated scanners; manual attackers are not
+fooled by it.
+
+## Browser anti-fingerprinting
+
+Both panel engines (WebKitGTK and Chromium) ship with a pinned generic Chrome
+User-Agent (`Chrome/124.0.0.0`) so a passing scanner / MITM reading wall
+traffic can't read the exact `webkit2gtk` version or kernel signature. Override
+per deploy via `SOC_BROWSER_UA` in `soc.env` if a dashboard needs a specific UA.
+
 ## Tunnel key hardening
 
 The autossh tunnel uses a **dedicated, passphrase-less ed25519 key** that is

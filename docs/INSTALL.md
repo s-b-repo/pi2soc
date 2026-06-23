@@ -44,15 +44,17 @@ Any other distro: install the dependencies from the package lists in
 
 ```bash
 cd p2soc
-sudo ./install.sh
+sudo python3 setup.py        # the install tool (wraps install.sh; asks before each step)
+# …or call the package installer directly to use the env knobs below:
+sudo bash install.sh
 ```
 
-Knobs (env vars):
+Knobs (env vars — for the direct `bash install.sh` form):
 
 | Var | Default | Meaning |
 |---|---|---|
 | `SESSION` | `auto` | display stack: `auto` (install both; at runtime try **Wayland → XWayland → XLibre → Xorg**), or force one of `wayland` / `xwayland` / `xlibre` / `xorg` / `x11` |
-| `VW_MODE` | `docker` | `docker` (official image) or `native` (binary at `/usr/local/bin/vaultwarden`) |
+| `VW_MODE` | `native` | `native` (binary at `/usr/local/bin/vaultwarden`, hardened unit) or `docker` (official image) |
 | `HARDEN` | `0` | `1` also installs the nftables firewall + key-only sshd |
 | `KIOSK_USER` | `soc` | kiosk login user (autologin on tty1) |
 | `SVC_USER` | `socsvc` | service user that owns the autossh tunnel |
@@ -66,9 +68,11 @@ without systemd), configures zram, generates the 2×2 layout, and enables tty1
 autologin. The chosen `SESSION` is written to `soc.env` as `SOC_SESSION` and can
 be changed there any time.
 
-> Easiest path: after the installer, run the guided wizard
-> `python3 /opt/soc-display/setup.py` to write `panels.yaml`, `soc.env`, and
-> the config interactively (Vaultwarden's own config is in its systemd unit).
+> First boot configures itself: `soc-firstboot.service` runs the setup page once
+> on tty1 (screen preset + panels, and the vault PIN if it was not sealed at
+> install), writes `/etc/soc-display/.configured`, then the wall launches and never
+> shows the page again. To run it now instead: `/opt/soc-display/launch.sh --setup`
+> (or `python3 /opt/soc-display/setup.py firstboot`). Re-run: `launch.sh --reconfigure`.
 
 ## 3. Configure (the installer prints this list)
 

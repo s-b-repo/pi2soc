@@ -32,19 +32,18 @@ WebKit cache on 1 GB boards, GPU compositing on the Pi 5).
 
 ![wall](docs/img/wall.png)
 
-> Produced by the dev harness (`make verify`): four panels logged in — WebKit
-> direct, WebKit through a tunnel, Chromium via CDP, and a WebKit panel with a
-> live chart.
+> Four panels logged in — WebKit direct, WebKit through a tunnel, Chromium via
+> CDP, and a WebKit panel with a live chart.
 
 ## Docs
 
-- [**Full setup guide**](docs/SETUP.md) — start-to-finish bring-up (dev + Pi) via the `setup.py` wizard
+- [**Full setup guide**](docs/SETUP.md) — start-to-finish bring-up via `setup.py` + the first-launch setup page
+- [**Wizard walkthrough**](docs/WIZARD.md) — what to enter at every prompt (selectors auto-detected, with examples)
 - [**Production deploy**](docs/DEPLOY.md) — the real Pi/kiosk install + `setup.py install/doctor/repair`
 - [Architecture](docs/ARCHITECTURE.md) — topology, boot/data-flow, RAM budget, rationale
 - [Install on the Pi](docs/INSTALL.md) — step-by-step bring-up + checklist
 - [Configuration](docs/CONFIGURATION.md) — `panels.yaml` reference, finding selectors, keep-alive
 - [Security](docs/SECURITY.md) — threat model, the unattended-unlock tradeoff, hardening
-- [Development](docs/DEVELOPMENT.md) — dev harness, make targets, testing
 - [Changelog](CHANGELOG.md) — what changed
 
 ---
@@ -95,46 +94,33 @@ Chromium is opt-in per panel. zram + throttled chart refresh absorb the rest.
 | `openbox/` | `rc.xml.tmpl` (2×2, no panel, draggable), `menu.xml`, `autostart` |
 | `labwc/` | `rc.xml.tmpl` — the Wayland twin of the Openbox config |
 | `scripts/` | `start-session.sh`, `wayland-session.sh`, `launcher.sh`, `autossh-tunnel.sh`, `forti-vpn*.{sh,py}`, `gen-openbox-rc.py`, `gen-labwc-rc.py`, `tunnel-args.py`, `pinentry-vault.py`, `xinitrc` |
-| `systemd/` | `vaultwarden(-docker).service`, `autossh-tunnel.service`, `forti-vpn.service`, `getty-autologin.conf` |
+| `systemd/` | `vaultwarden(-docker).service`, `autossh-tunnel.service`, `forti-vpn.service`, `soc-firstboot.service`, `getty-autologin.conf` |
 | `security/` | `nftables.conf`, `sshd_hardening.conf`, `zram.conf`, `99-soc-sysctl.conf`, `tunnel_key.note` |
-| `dev/` | dummy panels, vault seeding, tunnel stand-in, `auth-proxy.py`, `verify*.sh`, `run-wall.sh` |
-| `setup.py` | menu / `deploy` / `first-run` / `wizard` / `doctor` / `repair` / `creds`: writes config, seals the master password (one-time PIN), pushes config to the vault |
+| `setup.py` | the install tool: `install` / `menu` / `firstboot` / `deploy` / `first-run` / `wizard` / `doctor` / `repair` / `creds` — installs, configures, seals the master password (one-time PIN), pushes config to the vault |
 | `install.sh` | idempotent multi-distro installer (apt/dnf/pacman/zypper/apk/xbps, X.Org/XLibre/Wayland) |
 
 ---
 
-## Try it on your workstation (no Pi needed)
-
-Requires: `python3` + `python3-gi` + `gir1.2-webkit2-4.x`, `Xvfb`/`Xephyr`,
-`chromium`, ImageMagick (`import`).
-
-**Fastest first run** — one idempotent command sets up the venv + dev vault, then
-launches the wall (use `--pi` instead to hand off to the production deploy):
+## Install (Raspberry Pi / kiosk box)
 
 ```bash
-./launch.sh             # show the wall in a window (Xephyr); headless if no display
-./launch.sh --headless  # headless end-to-end check (Xvfb + screenshot)
-./launch.sh --pi        # production: sudo setup.py deploy (install + configure + seal + checks)
+sudo python3 setup.py     # install OS packages + services (wraps install.sh)
+sudo reboot               # first boot runs the one-time setup page on tty1
 ```
 
-Or drive the pieces directly:
+On first boot the wall walks through a one-time setup page (screen preset +
+panels, and the vault PIN if it was not sealed at install), writes
+`/etc/soc-display/.configured`, then launches — and never shows the page again.
+Run it on demand with `./launch.sh --setup`, re-run with `./launch.sh --reconfigure`,
+and diagnose/fix with `./launch.sh --repair`. Full walkthrough:
+[docs/DEPLOY.md](docs/DEPLOY.md) and [docs/SETUP.md](docs/SETUP.md).
+
+Run the unit tests on any Linux box (no Pi, no display needed — they use a fake
+in-memory vault):
 
 ```bash
-make verify         # headless: brings up 4 dummy panels + the host, asserts logins,
-                    # tunnel gate, Chromium CDP, writes dev/run/verify.png
-make verify-single  # headless check of the single-window (Wayland-style) layout
-make verify-proxy   # headless check of the authenticated-proxy path (WebKit + Chromium)
-make dev            # interactive: shows the wall in a Xephyr window (Ctrl-C to stop)
-make test           # unit tests (config, geometry, injection, VPN supervisor, proxy, perf)
-make vpn-check      # dry-run the VPN: resolve creds + print the openfortivpn command
-```
-
-`make verify` uses the **dev vault backend** (a JSON file) so it needs no
-Vaultwarden. To exercise the real **rbw → Vaultwarden** path:
-
-```bash
-make vault      # starts Vaultwarden in Docker, registers an account,
-                # seeds 4 logins via the API, verifies rbw can read them
+make test     # unit tests (config, geometry, injection, VPN supervisor, proxy, perf)
+make lint     # shell + python syntax check
 ```
 
 ---
@@ -287,8 +273,7 @@ PARTICULAR PURPOSE.
 
 ## Contributing
 
-Issues and PRs welcome. Run `make lint && make test && make verify` before
-submitting; see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+Issues and PRs welcome. Run `make lint && make test` before submitting.
 
 > Use only against panels and networks you are authorized to access. This is a
 > defensive monitoring tool, not an access-bypass tool — it auto-fills

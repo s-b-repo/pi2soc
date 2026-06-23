@@ -94,9 +94,12 @@ window, grid, stack { background-color: #0b1020; }
   border-radius: 12px; padding: 3px 14px; margin: 0 2px;
   color: #c9d3f2; font-size: 13px; font-weight: bold;
 }
-.soc-vpn-pill.online    { border-color: rgba(87,217,163,0.7);  color: #57d9a3; }
-.soc-vpn-pill.offline   { border-color: rgba(255,120,110,0.7); color: #ff8f80; }
-.soc-vpn-pill.checking  { color: #d9c66a; }
+/* Traffic-light pill colours: green=online, amber=connecting (probe timed
+ * out, still mid-handshake), red=offline (refused / iface gone). */
+.soc-vpn-pill.online      { border-color: rgba(87,217,163,0.7);  color: #57d9a3; }
+.soc-vpn-pill.connecting  { border-color: rgba(255,180,80,0.75); color: #ffb450; }
+.soc-vpn-pill.offline     { border-color: rgba(255,120,110,0.7); color: #ff8f80; }
+.soc-vpn-pill.checking    { color: #d9c66a; }
 .soc-vpn-pill.unconfigured { color: #8694c4; }
 """
 

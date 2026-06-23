@@ -62,7 +62,7 @@ supervisor self-restart); only autologin + unit supervision are wired by hand.
 | Component | File(s) | Responsibility |
 |---|---|---|
 | Config | `kiosk-host/host/config.py`, `config/panels.yaml` | parse panels, derive effective URL + 2×2 geometry |
-| Vault | `kiosk-host/host/vault.py` | read creds via `rbw` (prod) or a JSON file (dev); RAM-only TTL cache |
+| Vault | `kiosk-host/host/vault.py` | read creds from Vaultwarden via `rbw`; RAM-only TTL cache |
 | Injection | `kiosk-host/host/inject.py`, `inject/login.js.tmpl` | render the bootstrap + the just-in-time `socLogin` call (JSON-escaped) |
 | WebKit panel | `kiosk-host/host/webkit_panel.py` | WebKitWebView (own window or embedded) + `socCreds` handler, proxy auth, crash-reload, status overlay |
 | Chromium panel | `kiosk-host/host/chromium_panel.py` | spawn `chromium --app`, drive login + proxy auth over CDP, respawn on death |

@@ -137,9 +137,9 @@ def _read_host_key(sd: str) -> bytes:
     except FileNotFoundError:
         raise SecretStoreError(
             "host.key missing — the seal is bound to a per-host key that is not "
-            "present (copied without it, or never sealed); re-run setup.py to re-seal")
+            "present (copied without it, or never sealed); re-run `sudo python3 setup.py first-run` to re-seal")
     if len(key) < 32:
-        raise SecretStoreError("host.key is truncated/corrupt — re-run setup.py to re-seal")
+        raise SecretStoreError("host.key is truncated/corrupt — re-run `sudo python3 setup.py first-run` to re-seal")
     return key
 
 
@@ -189,7 +189,7 @@ def _decrypt(material: bytes, blob: bytes) -> bytes:
     except Exception:  # cryptography.exceptions.InvalidTag, etc.
         raise SecretStoreError(
             "could not unseal — wrong machine (the secret is bound to the host "
-            "it was sealed on) or the files are corrupt; re-run setup.py to re-seal")
+            "it was sealed on) or the files are corrupt; re-run `sudo python3 setup.py first-run` to re-seal")
 
 
 def _write_atomic(path: str, data: bytes) -> str:

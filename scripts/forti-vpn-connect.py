@@ -11,11 +11,10 @@ via scripts/forti-vpn.sh.
 Upstream: https://github.com/adrienverge/openfortivpn
 
 Env:
-  SOC_VAULT_BACKEND   rbw (default) | dev          — selects the vault backend
   SOC_PANELS_FILE     path to panels.yaml
   SOC_READY_TIMEOUT   seconds to wait for the vault per attempt (default 120)
   SOC_VPN_DRY_RUN=1   resolve creds + print the command, then exit (no connect) —
-                      used by `make vpn-check` to verify wiring without a FortiGate
+                      verify the wiring without a FortiGate
   SOC_VPN_AUTH_RETRY_DELAY / SOC_VPN_CERT_RETRY_DELAY   long backoffs (default 300)
   SOC_VPN_BACKOFF_INITIAL / SOC_VPN_BACKOFF_MAX         network backoff (5 / 60)
 """

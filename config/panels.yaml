@@ -7,9 +7,7 @@
 #
 # Copy this to /etc/soc-display/panels.yaml on the Pi (install.sh does it) and
 # replace the placeholder IPs / vault items / selectors with your real ones.
-#
-# For local development against the dummy panels, use config/panels.dev.yaml
-# (the Makefile `dev`/`verify` targets point there).
+# (Or let the first-launch setup page write it for you — see docs/SETUP.md.)
 # -----------------------------------------------------------------------------
 
 display:

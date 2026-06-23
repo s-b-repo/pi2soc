@@ -231,6 +231,19 @@ class WebKitPanel:
                 s.set_hardware_acceleration_policy(hw)
             except Exception:                              # very old 4.0 builds
                 pass
+        # Anti-fingerprinting: set a generic Chrome User-Agent. The default
+        # WebKitGTK UA leaks "WebKit2/X.Y", the host kernel, and architecture
+        # — a passing scanner / MITM reading wall traffic would otherwise see
+        # exactly which version a Pi is running. SOC_BROWSER_UA overrides if
+        # an operator needs a panel-specific UA.
+        ua = os.environ.get(
+            "SOC_BROWSER_UA",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        try:
+            s.set_user_agent(ua)
+        except Exception:                                  # noqa: BLE001
+            pass
 
         # ---- self-healing ----------------------------------------------------
         # 4.0 has web-process-crashed; >= 2.20 (both 4.0 and 4.1 builds we
@@ -249,6 +262,11 @@ class WebKitPanel:
             self.webview.connect("load-changed", self._on_load_changed))
         self._handler_ids.append(
             self.webview.connect("authenticate", self._on_authenticate))
+        # Blocked-URL filter (panel.blocked_url_patterns). Wired regardless of
+        # whether the panel has any patterns set — operators can add them at
+        # the glass without restarting, and the empty-list fast path is cheap.
+        self._handler_ids.append(
+            self.webview.connect("decide-policy", self._on_decide_policy))
 
         # match the wall background so navigations never flash white
         rgba = Gdk.RGBA()
@@ -321,6 +339,7 @@ class WebKitPanel:
         if not self._ever_loaded:
             self.status.update("connecting…")
         self._login_attempts = 0           # fresh page = fresh login budget
+        self._relogin_landed = False       # allow relogin nav on next login
         self.webview.load_uri(url)
         self.log(f"[{self.panel.id}] webkit loading {url}")
 
@@ -503,6 +522,46 @@ class WebKitPanel:
         self._retry_id = GLib.timeout_add_seconds(int(delay), _go)
 
     # ---- proxy auth ---------------------------------------------------------
+    def _on_decide_policy(self, _wv, decision, decision_type):
+        """Block navigations to any URL matching panel.blocked_url_patterns
+        (fnmatch). Used to keep the operator out of dashboard account-
+        settings / change-password pages from the wall, without preventing
+        them from viewing the dashboard itself.
+
+        Returns False (== don't claim the decision) for everything we don't
+        block, so WebKit's default policy still runs.
+        """
+        patterns = getattr(self.panel, "blocked_url_patterns", None) or []
+        if not patterns:
+            return False
+        # Only care about NAVIGATION_ACTION + NEW_WINDOW_ACTION; let
+        # response decisions through (the request is already in flight; the
+        # navigation event upstream is where we want to intervene).
+        try:
+            nav_kind = (WebKit2.PolicyDecisionType.NAVIGATION_ACTION,
+                        WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION)
+            if decision_type not in nav_kind:
+                return False
+            req = decision.get_navigation_action().get_request()
+            uri = req.get_uri() or ""
+        except Exception:                                  # noqa: BLE001
+            return False
+        import fnmatch
+        for pat in patterns:
+            if fnmatch.fnmatch(uri, pat):
+                try:
+                    decision.ignore()
+                except Exception:                          # noqa: BLE001
+                    pass
+                self.log(f"[{self.panel.id}] blocked navigation to {uri} "
+                         f"(matches blocked_url_pattern {pat!r})")
+                # Render a small in-page banner the next tick — best-effort.
+                self._evaluate(inject.prompt_call(
+                    f"⛔ navigation to {uri} blocked by policy "
+                    f"(blocked_url_patterns: {pat!r})"))
+                return True
+        return False
+
     def _on_authenticate(self, _wv, request):
         """Answer the proxy's 407 challenge with vault credentials. Site-level
         auth (401) is left to the page (panels log in via injection instead)."""
@@ -567,6 +626,18 @@ class WebKitPanel:
                 self.on_login_success(self.panel)
             except Exception as e:  # noqa: BLE001
                 self.log(f"[{self.panel.id}] login-success hook: {e}")
+        # Optional post-login landing: dashboards often log in to a `/login`
+        # screen and then need to be navigated to `/home` (or wherever the
+        # operator actually wants to watch). Done once per page-load so a
+        # `relogin_url` that itself bounces back to login can't loop us.
+        relogin = getattr(self.panel, "relogin_url", None)
+        if relogin and not getattr(self, "_relogin_landed", False):
+            try:
+                self._relogin_landed = True
+                self.log(f"[{self.panel.id}] post-login -> relogin_url {relogin}")
+                self.webview.load_uri(relogin)
+            except Exception as e:  # noqa: BLE001
+                self.log(f"[{self.panel.id}] relogin navigation failed: {e}")
 
     def _do_login(self):
         self._login_attempts += 1

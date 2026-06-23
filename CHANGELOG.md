@@ -9,6 +9,202 @@ Production-hardening pass on top of the initial single-engine wall: multi-distro
 + multi-display-server install, a supervised multi-protocol VPN, an outbound
 proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
+### Setup auto-fix · vault-stored VPN cfg · scanner deception · windowed wall · multi-VPN (2026-06-23)
+
+End-to-end pass after a real-install dogfooding session caught half a dozen
+silent gaps and added the hardening + UX features they exposed.
+
+- **Wall windowed-mode** — `display.fullscreen: false` (or `SOC_WINDOWED=1`)
+  opens the wall as a normal desktop window sized to `display.width × height`
+  with WM decorations, so it can live alongside KDE/Plasma without taking
+  over the screen. Production fullscreen path unchanged. F11 still toggles.
+  Added a `fullscreen` checkbox on the Display tab.
+- **Multi-VPN** — `vpns: [...]` list (legacy `vpn:` mapping still parses),
+  a new `forti-vpn@<name>.service` templated unit so each VPN runs in its
+  own supervisor, one top-bar pill per VPN with a green/amber/red
+  traffic-light (green=online, amber=connecting/probe-timeout, red=offline),
+  GUI VPN tab now shows two sections side-by-side. The pill click only
+  reconnects that one VPN.
+- **VPN full config from vault (Fortinet/iNode)** — `config_from_vault: true`
+  on a `fortinet`/`inode` VPN now overlays a KEY=VALUE block from the vault
+  item's Notes onto the live vpn dict (`gateway=`, `port=`, `realm=`,
+  `trusted_cert=`, `domain=`, etc.). Strict allowlist — unknown keys are
+  logged and rejected. Never written to disk. Means you can rotate a
+  gateway/cert from the web vault UI without touching `panels.yaml`.
+- **Scanner-deception tarpit** — new `scripts/tarpit.py` + `soc-tarpit.service`
+  (off by default, opt-in via `SOC_TARPIT_ENABLE=1`). Port 80; `/admin.php`,
+  `/wp-login.php`, `/.env`, `/actuator/`, `/api/v1/`, `/phpmyadmin/`,
+  `/.git/HEAD`, `/.aws/credentials` ... ~30 common scanner targets all
+  return `200 OK` after a 0.5–2.0 s drip with a 4–32 KB body shaped to look
+  like the requested file (JSON for `/api/`, KEY=VALUE for `.env`, HTML
+  for `.php`). Per-IP rate-limited (bounded LRU). Strips `Server:` header.
+  Runs as `nobody` with `CAP_NET_BIND_SERVICE` only.
+- **Browser anti-fingerprinting** — both WebKit and Chromium panels now
+  send a generic stable Chrome UA (`Chrome/124.0.0.0`) so a passing
+  scanner / MITM reading wall traffic can't read the exact webkit2gtk
+  version or kernel signature. Overrideable per deploy via `SOC_BROWSER_UA`.
+- **Setup auto-fix (bakes this session's manual fix-ups)**:
+  - `setup.py first-run` now chowns the sealed secret files to the wall user
+    (`soc`) after sealing — previously left `root:root 0600`, which the wall
+    couldn't read so it failed silently at `vault.open()`.
+  - `setup.py first-run` materialises `~/.config/rbw/config.json` for BOTH
+    root and the wall user (`sudo -u soc rbw config set …`), eliminating the
+    "default pinentry, TTY error" trap.
+  - `soc-wall.service` `ExecStartPre=+/bin/sh -c 'install -d -m 0700 -o soc
+    -g soc /run/user/$(id -u soc)'` so cold boot has a runtime dir before
+    rbw, pulse, WebKit need it.
+  - `install.sh` setfacl now grants soc.env to BOTH `KIOSK_USER` and
+    `SVC_USER` (was service-user-only — wall couldn't read its own env).
+  - `install.sh` post-install sanity-check: `sudo -u <KIOSK_USER> cat
+    soc.env` must succeed or it warns out loud.
+- **Auto-register Vaultwarden account** — `setup.py first-run` probes for
+  the account; if missing, transiently drops `[Service]
+  Environment=SIGNUPS_ALLOWED=true`, restarts vaultwarden, registers via
+  `vaultseed.register_account()` (RSA keypair + symmetric key + PBKDF2),
+  then reverts. The only out-of-band manual web-UI step is gone.
+- **Honest Apply messages** — VPN/Tunnel restart no longer silently
+  no-ops when the wall lacks privilege; configwin's success message reads
+  `Saved ✓ · ⚠ PENDING restart (sudo systemctl restart forti-vpn@<name>)`.
+- **Vault note write-back is honest** — `_push_config_to_vault` returns
+  `deferred:<reason>` on missing prereqs; the GUI surfaces *"your changes
+  will be lost at next boot unless you fix this"*.
+- **Vault.notes_required()** — new loud variant; `fortivpn.py` uses it for
+  `config_from_vault` so empty Notes surfaces a useful error instead of an
+  openvpn parser failure.
+- **Doctor: config-vs-units drift detector** — flags `vpn.enabled` in
+  config but `systemctl is-enabled forti-vpn` returning `disabled`,
+  `static`, etc. Catches the install.sh-only-enables-units-at-install-time
+  gap before reboot.
+- **vpnstatus 4-state** — added `STATE_CONNECTING` (probe TCP timeout =
+  amber, vs. refused = red); `_tcp_probe()` distinguishes timeout from
+  refusal; `vpn_name()` for the pill label.
+- **GUI gaps filled** — Panels tab Advanced now exposes per-panel
+  `allow_insecure`, `allow_media`, global-proxy bypass (`proxy:`), and
+  `keepalive` (strategy + interval). Display tab adds `fullscreen` toggle
+  alongside layout/grid/resolution. Status tab now warns loudly when vault
+  is unreachable, master is not sealed, panels have URLs but no creds,
+  or login selectors look stale (auto-login attempts climbing without
+  success).
+- **Loud failure surfaces** — `start-session.sh` paints a red message on
+  `/dev/tty1` when the firstboot marker is missing OR when no display
+  stack is installed (instead of looping a black screen in the journal).
+  `tunnel-args.py` exits non-zero with a clear "enabled but no forwards"
+  error. `pinentry-vault.py` writes an actionable stderr line ("no sealed
+  master in $SOC_SECRET_DIR — run `sudo python3 setup.py first-run`")
+  instead of returning empty.
+- **Tests** — 223 passing (+8 since last entry: tarpit handlers/rate-
+  limiter, Fortinet KV from vault, plus the proxy/tunnel/display
+  multi-VPN suites added earlier in this pass).
+
+### Wizard: auto-detect panel login forms + clearer selector prompts (2026-06-23)
+
+The configuration wizard now figures out the login selectors for you and makes
+the "selectors are not credentials" distinction unmissable — the latter being a
+real footgun (typing a username/password into a selector prompt breaks login and
+writes the password into plain config).
+
+- **Login-form auto-detection.** For a `direct` panel, `setup.py` fetches the
+  login URL and derives the username/password/submit selectors + `login_marker`,
+  then offers a single **"Use these detected selectors? [Y]"** instead of four
+  prompts. Reads server-rendered forms from the DOM; fingerprints JS/SPA logins
+  (Zabbix, Grafana, Wazuh/Kibana, Keycloak) and fills a known preset to verify;
+  flags HTTP Basic auth. Pure stdlib (`urllib` + `html.parser`); fully graceful
+  on unreachable hosts (still guesses from the URL path) and skipped under
+  `--defaults`. Self-signed TLS is read only after an explicit prompt (the probe
+  sends no credentials).
+- **URL prompts accept a bare host.** `login URL` / `Vaultwarden URL` now
+  normalize `10.14.0.2` or `host:port` to `http://…` instead of rejecting them;
+  validation (scheme, port range) still applies.
+- **Plain-language `login_marker`.** Inline help explains it's the wall's
+  "logged out?" detector and that the suggested default (the password selector)
+  is almost always right.
+- **Panels are optional — configure at the glass.** The wizard can skip panel
+  setup entirely (**"Configure panels now?" → n**) or per panel (**"Configure
+  this panel now?"**), filling the grid with blank `{id, grid}`
+  *click-to-configure* tiles. Point them at real tools — and store their logins —
+  later from the running wall's **⚙ settings window** (Panels + Credentials tabs;
+  already in `configwin.py`). The `panels.yaml` renderer and the review summary
+  now handle blank tiles.
+- **Everything else is now at the glass too.** The ⚙ window grows two new tabs
+  and an expanded Display tab so the wizard is no longer the only path:
+  - **Proxy tab** — enable, URL, vault login (proxy creds), ignore-hosts list.
+  - **Tunnel tab** — SSH jump host, identity, `known_hosts`, host-key-check
+    mode, and extra `bindaddr:port:host:port` forwards. Apply restarts
+    `autossh-tunnel`.
+  - **Display tab** — gains **grid size (cols × rows)** and **resolution
+    (width × height + auto-detect)** alongside the existing layout / gap.
+    Growing the grid auto-creates blank click-to-configure tiles for the new
+    cells on restart, so the operator can add a 5th panel by bumping `rows`.
+  Overrides round-trip through `to_yaml` back to the Vaultwarden config note,
+  same write-back path the VPN tab uses. Tests:
+  `test_proxy_settings.py`, `test_tunnel_settings.py`, `test_display_settings.py`
+  (16 new, 215 total).
+- **Docs.** New [`docs/WIZARD.md`](docs/WIZARD.md) — a prompt-by-prompt
+  walkthrough with examples; `CONFIGURATION.md` / `SETUP.md` updated.
+- Tests: selector derivation, product fingerprinting, SPA fallback, and URL
+  normalization (`kiosk-host/tests/test_setup_commands.py`).
+
+### Removed the dev simulation — production-only tooling (2026-06-23)
+
+The tree is now production-only: there is no dev/dummy-panel mode. Unit suite still
+192 green (rewritten onto an in-memory fake vault).
+
+- **Deleted the `dev/` harness** entirely (dummy panels, `run-wall.sh`, `verify*.sh`,
+  `seed-vault.sh`/`seed-ciphers.py`, `auth-proxy.py`, `tcp-forward.py`,
+  `register-vaultwarden.py`) and `docs/DEVELOPMENT.md`.
+- **Removed the JSON dev vault backend.** `kiosk-host/host/vault.py` is rbw-only —
+  `_make_backend()` always returns `RbwBackend`; `DevFileBackend` /
+  `SOC_VAULT_BACKEND=dev` / `SOC_DEV_VAULT` are gone.
+- **`setup.py` is production-only:** no `--target dev`, no dev paths in
+  `resolve_paths` (always `/etc/soc-display`, root required), no vault-backend
+  choice (always rbw), and the dev branches/notes are gone.
+- **`launch.sh` is production-only:** configure-once-then-run plus
+  `--setup`/`--reconfigure`/`--repair`; the Xephyr dummy-panel simulation and the
+  `SOC_VAULT_BACKEND:-dev` default are removed.
+- **Makefile** drops the dev/verify/vault targets (`make dev`, `dev-vault`,
+  `verify`, `verify-single`, `verify-proxy`, `verify-vpn`, `vpn-check`, `vault`);
+  what remains is `venv` / `test` / `lint` / `install` / `clean` / `distclean`.
+  Also deleted `config/panels.dev.yaml` and `config/panels.vpn-dev.yaml`.
+- **Tests** no longer use the dev backend: a `kiosk-host/tests/conftest.py` provides
+  an in-memory `FakeBackend` (`fake_vault` / `use_fake_backend` fixtures); the five
+  vault tests and the two WM-generator tests were rewritten (the latter onto a new
+  `kiosk-host/tests/data/panels.test.yaml`).
+- Docs (`README`, `SETUP`, `DEPLOY`, `ARCHITECTURE`, `CONFIGURATION`, `CLAUDE.md`)
+  updated to the production-only model; the VPN dry-run is now reached via
+  `SOC_VPN_DRY_RUN=1` instead of the removed `make vpn-check`.
+
+### Install/launch tooling split + first-boot setup page (2026-06-23)
+
+Reworked the entry points into **two tools** and fixed two install-flow bugs hit on a
+fresh Kali bring-up. Unit suite 186 → 192 green.
+
+- **Fixed `PermissionError: './install.sh'`.** `install.sh` shipped without the exec bit
+  (git `100644`), and `setup.py` invoked it as `./install.sh`, which needs that bit. The bit
+  is now set, **and** all four `setup.py` call sites + `make install` invoke it as
+  `bash <abs>/install.sh` — never dependent on the exec bit or cwd again (a downloaded/unzipped
+  tree loses the bit).
+- **Package-install failures now show the real error.** `pm_install()` ran the package manager
+  with output hidden, so a held apt/dpkg lock, missing network, or a stale mirror all surfaced
+  as the misleading "check the package names" with the whole core list. It now re-runs the
+  failing set once with the manager's own error shown, and the message lists the real causes.
+- **Two tools.** `setup.py` is the **installer** (OS packages via `install.sh` + services +
+  optional PIN seal); `launch.sh` is the **app** (run / `--repair` / `--reconfigure`).
+  `install.sh` is now an internal helper, not a third user-facing tool. Bare `setup.py` on a
+  TTY runs the install flow; `setup.py menu` lists every action.
+- **First-time setup page, used once.** A new `setup.py firstboot` (screen + panels, seal the
+  vault PIN if not already sealed, push config/creds) runs on the first `./launch.sh` **and** on
+  the first Pi boot via the new `systemd/soc-firstboot.service` (tty1 oneshot,
+  `ConditionPathExists=!…/.configured`, ordered before autologin); it writes
+  `/etc/soc-display/.configured` so every later boot launches straight to the wall.
+  `start-session.sh` warns-and-continues if it ever arrives unconfigured (never a black screen).
+  Re-run with `launch.sh --reconfigure`.
+- **Screen presets.** The wizard's Display step offers `auto / 1920x1080 / 2560x1440 / 3840x2160
+  / 1280x720 / custom` (auto-detect-at-launch remains the default).
+- **PIN seal (both/fallback).** The installer seals if a master password is given at install
+  time; otherwise the first-boot setup page seals it (skipped if already sealed).
+- Docs (`SETUP`/`DEPLOY`/`INSTALL`/`CLAUDE.md`) updated to the two-tool model; tests added for
+  the screen presets, the `.configured` marker, and `firstboot`'s seal-if-unsealed behaviour.
+
 ### Security & reliability audit pass (2026-06-23)
 
 Four-domain read-only audit (secrets/crypto, kiosk runtime, VPN/RFC, installer/OS)

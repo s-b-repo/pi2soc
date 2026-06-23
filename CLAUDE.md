@@ -14,26 +14,34 @@ docs/                Architecture, config, deploy, security docs
 inject/              login.js.tmpl — injected login bootstrap
 security/            sysctl, nftables, sshd hardening
 systemd/             Service units (vaultwarden, autossh, forti-vpn, autologin)
-setup.py             Multi-mode wizard (wizard/doctor/repair/deploy/creds/first-run)
-install.sh           Multi-distro installer (apt/dnf/pacman/zypper/apk/xbps)
-launch.sh            Boot entrypoint
+setup.py             Install tool (install/firstboot/wizard/doctor/repair/deploy/creds/first-run)
+install.sh           Multi-distro package installer (apt/dnf/pacman/zypper/apk/xbps); called by setup.py
+launch.sh            App entrypoint — run / --repair / first-time setup page (once)
+systemd/soc-firstboot.service   tty1 oneshot: runs the setup page once on first boot
 ```
+
+## Two tools
+
+- **Install** (`sudo python3 setup.py`): OS packages (via `install.sh`) + services +
+  optional PIN seal. `install.sh` is an internal helper, not a separate user-facing tool.
+- **App** (`./launch.sh`): runs the wall; `--repair` diagnoses/fixes; the **first-time setup
+  page** (screen preset + panels + PIN-if-unsealed) runs **once**, gated by the marker
+  `/etc/soc-display/.configured`, on first `launch.sh` and on first Pi boot (soc-firstboot.service).
+  `setup.py firstboot` is that page; `launch.sh --reconfigure` re-runs it.
 
 ## Build / test commands
 
 ```bash
-make venv            # create .venv (system-site-packages for PyGObject)
+make venv            # create .venv (system-site-packages for PyGObject) — used by tests
 make test            # unit tests (no display needed)
 make lint            # shell + python syntax check
-make verify          # headless e2e (Xvfb, 4 panels, auto-login, screenshot)
-make verify-single   # single-window Wayland layout check
-make verify-proxy    # authenticated proxy path check
-make verify-vpn      # all 3 VPN backends (fortinet/openvpn/wireguard) with fakes
-make dev             # interactive dev in Xephyr
-make vault           # start Vaultwarden in Docker + seed via rbw
-make dev-vault       # write dev vault JSON (no Docker needed)
-make install         # install on the Pi (sudo)
+make install         # install on the Pi (sudo bash install.sh)
+make clean           # remove Python caches   ·   make distclean also drops .venv
 ```
+
+This is a **production-only** tree — there is no dev simulation / dummy-panel
+harness. Tests run against a fake in-memory vault (`kiosk-host/tests/conftest.py`),
+never a real rbw/Vaultwarden.
 
 ## Key architecture
 
@@ -48,8 +56,9 @@ make install         # install on the Pi (sudo)
 ## Conventions
 
 - Pure stdlib for setup.py (runs before venv)
-- `config/panels.yaml` is the reference config; `panels.local.yaml` for local overrides
+- `config/panels.yaml` is the reference config (the wall's config lives in the
+  Vaultwarden `SOC Wall Config` note in production; the file is the fallback)
 - `.env` / `vaultwarden.env` contain actual secrets — NEVER commit (gitignored)
-- Tests run with `SOC_VAULT_BACKEND=dev` and a JSON file vault
+- rbw is the only vault backend; tests inject a fake backend (see conftest.py)
 - Multi-distro: install.sh detects package manager; `SOC_SKIP_PACKAGES=1` for unsupported
 - Non-systemd graceful: deploys files, prints manual steps

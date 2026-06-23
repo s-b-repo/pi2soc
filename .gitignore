@@ -2,7 +2,6 @@
 .env
 *.env
 !.env.example
-config/panels.local.yaml
 secrets/
 keys/
 *.key
@@ -18,8 +17,14 @@ venv/
 *.egg-info/
 .pytest_cache/
 
-# dev runtime
-dev/run/
+# logs / local runtime
 *.log
-.xephyr.pid
 .audit/
+
+# operator-local artifacts — never push (PROMPT.txt = the operator's prompt
+# scratchpad with sensitive context; .claude/ = harness state; MEMORY.md =
+# Claude Code's persistent memory; secret/ = host-sealed material).
+PROMPT.txt
+.claude/
+MEMORY.md
+secret/

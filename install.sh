@@ -163,9 +163,19 @@ pm_install(){       # required packages: try the set, then bisect to name culpri
     pm_install_cmd "$p" >/dev/null 2>&1 || failed+=("$p")
   done
   [ "${#failed[@]}" -eq 0 ] && return 0
+  # Surface the package manager's OWN error. When the whole core set "fails"
+  # (even python3/curl), the cause is almost never a wrong package name — it is
+  # the package manager itself: a held dpkg/apt lock, no network/proxy, or a
+  # stale/unreachable mirror. We install with output hidden (clean logs on the
+  # happy path), so re-run the failing set ONCE with output shown before dying.
+  warn "package install failed for: ${failed[*]}"
+  warn "re-running it with the package manager's output shown:"
+  pm_install_cmd "${failed[@]}" || true
   die "could not install required package(s): ${failed[*]}
-   Check the package names for your distro and install them manually,
-   then re-run ./install.sh (or with SOC_SKIP_PACKAGES=1 once they are present)."
+   Likely causes (see the error just above): another apt/dpkg (or dnf/pacman/...)
+   process holding the lock; no network / proxy; a stale or unreachable mirror;
+   or a package name that differs on this distro. Fix that, then re-run
+   ./install.sh (or set SOC_SKIP_PACKAGES=1 once the deps are present)."
 }
 
 pm_try(){           # optional packages: best effort, one by one, warn only
@@ -326,7 +336,7 @@ pm_try openvpn wireguard-tools
 # iNode SSL-VPN solves the gateway's login CAPTCHA with tesseract (pkg name varies)
 pm_try tesseract-ocr tesseract
 
-# rbw is how the kiosk reads Vaultwarden; without it only the dev backend works
+# rbw is how the kiosk reads Vaultwarden — the wall cannot read logins without it
 if ! command -v rbw >/dev/null 2>&1; then
   if [ "$SKIP_PACKAGES" != "1" ] && [ "${#PK_RBW[@]}" -gt 0 ]; then
     pm_install_cmd "${PK_RBW[@]}" >/dev/null 2>&1 || true
@@ -380,9 +390,8 @@ fi
 # --------------------------------------------------------------------------- #
 log "Installing project to $SOC_ROOT"
 mkdir -p "$SOC_ROOT"
-# copy everything except the dev harness / venv / git. SEC-12: exclude dev/
-# ENTIRELY — it carries test fixtures (seed-ciphers.py wipes a vault, dummy
-# panels with throwaway passwords) that have no place on a production box.
+# copy everything except the venv / git / caches. (--exclude='dev' is kept as a
+# belt-and-suspenders guard; the dev harness has been removed from the tree.)
 tar -C "$SRC_DIR" \
     --exclude='.git' --exclude='.venv' --exclude='dev' --exclude='__pycache__' \
     -cf - . | tar -C "$SOC_ROOT" -xf -
@@ -423,20 +432,33 @@ chmod 0750 "$ETC/keys"; chown "$SVC_USER:$SVC_USER" "$ETC/keys"
 # Host-bound sealed vault secret (master.enc / pin.enc) — owned by the kiosk user
 # (it unlocks the vault at boot), 0700. setup.py first-run/deploy seals it here.
 mkdir -p "$ETC/secret"; chmod 0700 "$ETC/secret"; chown "$KIOSK_USER:$KIOSK_USER" "$ETC/secret"
-# soc.env must be readable by BOTH the kiosk user (sources it at session start)
-# and the autossh service user — but NEVER world-readable (it holds the vault
-# email/URL, secret-dir path and config-item name). Prefer an ACL; if ACLs are
-# unavailable, fall back to a shared group (add the service user to the kiosk
-# user's group). The sealed-secret dir stays 0700, so this grants soc.env only.
-if ! setfacl -m u:"$SVC_USER":r "$ETC/soc.env" 2>/dev/null; then
-  warn "setfacl unavailable — granting $SVC_USER read on soc.env via a dedicated group (not world-readable)"
-  # Use a dedicated 'socenv' group scoped to soc.env ONLY. Adding $SVC_USER to
-  # the kiosk LOGIN group would grant it read on every group-readable file the
-  # kiosk user owns; a single-purpose group keeps the grant to this one file.
+# soc.env must be readable by BOTH the kiosk user (the wall sources it at
+# session start) AND the autossh service user — but NEVER world-readable (it
+# holds the vault email/URL, secret-dir path and config-item name). Prefer an
+# ACL; if ACLs are unavailable, fall back to a shared group. The sealed-secret
+# dir stays 0700, so this grants soc.env only.
+#
+# Audit HIGH #27: a previous version only added the ACL for SVC_USER, leaving
+# the wall (which runs as KIOSK_USER) unable to read soc.env. The wall would
+# boot, fail to source the env, and silently die at vault.open(). Both users
+# now get an ACL entry, AND ownership is normalised to root:KIOSK_USER 0640 so
+# even on filesystems without ACL the wall can still read by group.
+chown "root:$KIOSK_USER" "$ETC/soc.env"; chmod 0640 "$ETC/soc.env"
+ACL_OK=1
+setfacl -m "u:$KIOSK_USER:r" "$ETC/soc.env" 2>/dev/null || ACL_OK=0
+setfacl -m "u:$SVC_USER:r"  "$ETC/soc.env" 2>/dev/null || ACL_OK=0
+if [ "$ACL_OK" = 0 ]; then
+  warn "setfacl unavailable — granting $SVC_USER read on soc.env via a dedicated group"
+  # The KIOSK_USER already has read via group ownership (root:$KIOSK_USER 0640).
+  # SVC_USER needs a separate single-purpose group so it doesn't get blanket
+  # access to other files KIOSK_USER might own.
   getent group socenv >/dev/null 2>&1 || groupadd -r socenv 2>/dev/null \
     || warn "could not create group socenv"
   usermod -aG socenv "$SVC_USER" 2>/dev/null \
     || warn "could not add $SVC_USER to group socenv; autossh may not read soc.env"
+  # When falling back to socenv group, KIOSK_USER must also be in it (since the
+  # file's group becomes socenv, not KIOSK_USER's primary group).
+  usermod -aG socenv "$KIOSK_USER" 2>/dev/null || true
   chown "root:socenv" "$ETC/soc.env"; chmod 0640 "$ETC/soc.env"
 fi
 
@@ -488,15 +510,27 @@ want_tunnel(){ "$SOC_ROOT/.venv/bin/python" -c "import sys;sys.path.insert(0,'$S
 want_vpn(){ "$SOC_ROOT/.venv/bin/python" -c "import sys;sys.path.insert(0,'$SOC_ROOT/kiosk-host');from host import config;v=config.load('$ETC/panels.yaml').vpn or {};k=config.vpn_kind(v);ok=bool(v.get('enabled')) and ((k=='fortinet' and v.get('gateway')) or (k in ('openvpn','wireguard') and v.get('config')));sys.exit(0 if ok else 1)"; }
 
 if [ "$HAS_SYSTEMD" = "1" ]; then
-  log "Installing systemd services (vaultwarden, autossh-tunnel, forti-vpn, soc-wall)"
+  log "Installing systemd services (vaultwarden, autossh-tunnel, forti-vpn, soc-wall, soc-firstboot, soc-tarpit)"
   cp "$SOC_ROOT/systemd/autossh-tunnel.service" /etc/systemd/system/
   cp "$SOC_ROOT/systemd/forti-vpn.service" /etc/systemd/system/
+  cp "$SOC_ROOT/systemd/forti-vpn@.service" /etc/systemd/system/
+  # Scanner-deception tarpit on port 80. Installed but NEVER auto-enabled —
+  # opt-in with: SOC_TARPIT_ENABLE=1 in $ETC/tarpit.env, then
+  # `systemctl enable --now soc-tarpit`. See docs/SECURITY.md.
+  cp "$SOC_ROOT/systemd/soc-tarpit.service" /etc/systemd/system/
   # Supervised kiosk session (env baked in, no soc.env) — setup.py regenerates it
   # with the wizard's values. Installed but NOT enabled: switching the boot from
   # getty-autologin to this service must be validated on the target display (see
   # the end-of-run notes), so we don't flip it automatically.
   [ -f /etc/systemd/system/soc-wall.service ] || \
     cp "$SOC_ROOT/systemd/soc-wall.service" /etc/systemd/system/
+  # First-boot setup page: a tty1 oneshot that runs the interactive configuration
+  # (setup.py firstboot) BEFORE the kiosk session, but only while unconfigured. It
+  # self-skips once $ETC/.configured exists, so every later boot goes straight to
+  # the wall. Templated for the chosen SOC_ROOT/ETC.
+  sed -e "s#@SOC_ROOT@#$SOC_ROOT#g" -e "s#@ETC@#$ETC#g" \
+      "$SOC_ROOT/systemd/soc-firstboot.service" \
+      > /etc/systemd/system/soc-firstboot.service
   # PERF-2: bound the journal so 24/7 self-healing log spam can't fill the SD
   # card or burn its write endurance.
   install -d /etc/systemd/journald.conf.d
@@ -504,6 +538,9 @@ if [ "$HAS_SYSTEMD" = "1" ]; then
   systemctl restart systemd-journald 2>/dev/null || true
   systemctl daemon-reload
   systemctl enable vaultwarden.service
+  # First-boot setup runs once on tty1 (Condition skips it once configured).
+  systemctl enable soc-firstboot.service 2>/dev/null \
+    || warn "could not enable soc-firstboot.service — run setup on first boot with ./launch.sh"
   if want_tunnel; then
     systemctl enable autossh-tunnel.service
     log "autossh-tunnel enabled (tunnels configured)"
@@ -617,8 +654,11 @@ cat <<EOF
 
 $(printf '\033[32mInstall complete.\033[0m')  Next steps:
 
-  0. Easiest: run the guided menu ->  python3 $SOC_ROOT/setup.py
-     (Deploy / Clean deploy / Configure / First-time setup / Diagnose / Repair)
+  0. The wall configures itself ONCE on first boot: a setup page runs on tty1
+     (screen preset + panels, and the vault PIN if not sealed here), writes
+     $ETC/.configured, then the wall launches; every later boot goes straight in.
+     Configure now instead of at boot:  $SOC_ROOT/launch.sh --setup
+     Diagnose / fix any time:           $SOC_ROOT/launch.sh --repair
   1. Edit $ETC/panels.yaml         -> your panels (IPs, ports, selectors, vault_item, tunnel, vpn)
      (or let the wizard write it; the config is then pushed into Vaultwarden as
       the 'SOC Wall Config' note — the wall's source of truth at boot)
@@ -644,3 +684,17 @@ $([ "$HAS_SYSTEMD" = 1 ] || printf '%s\n' "        tty1 autologin you must wire 
 The wall comes up automatically on tty1 -> $([ "$SESSION" = x11 ] && echo "startx -> Openbox" || echo "cage/labwc (Wayland)") -> logged-in panels.
 Debugging: $([ "$HAS_SYSTEMD" = 1 ] && echo "journalctl -t soc-kiosk -f (host)  journalctl -u forti-vpn -f (VPN)" || echo "the launcher logs to stdout/syslog; run forti-vpn-connect.py in the foreground to watch it")
 EOF
+
+# Sanity self-check: confirm the wall user can actually read soc.env. This used
+# to silently break (install only ACL'd the SERVICE user, not the KIOSK user)
+# and the wall would boot, fail to source soc.env, then silently die at
+# vault.open(). Caught at install-time, fixable on the spot.
+if [ "$HAS_SYSTEMD" = "1" ] && id "$KIOSK_USER" >/dev/null 2>&1; then
+  if ! sudo -u "$KIOSK_USER" cat "$ETC/soc.env" >/dev/null 2>&1; then
+    warn "POST-INSTALL CHECK FAILED: $KIOSK_USER cannot read $ETC/soc.env"
+    warn "Fix with:  setfacl -m u:$KIOSK_USER:r $ETC/soc.env"
+    warn "(or:  chown root:$KIOSK_USER $ETC/soc.env  ;  chmod 0640 $ETC/soc.env)"
+  else
+    log "post-install: $KIOSK_USER can read $ETC/soc.env ✓"
+  fi
+fi

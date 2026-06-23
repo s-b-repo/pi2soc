@@ -24,14 +24,30 @@ def _master() -> str:
         cand = os.path.join(base, "kiosk-host")
         if os.path.isdir(cand):
             sys.path.insert(0, cand)
+    sealed = False
     try:
         from host import secretstore
-        if secretstore.is_sealed():
+        sealed = secretstore.is_sealed()
+        if sealed:
             return secretstore.unseal()
     except Exception as e:  # noqa: BLE001 — surface to rbw's stderr, fall through
-        sys.stderr.write(f"pinentry-vault: {e}\n")
+        sys.stderr.write(f"pinentry-vault: cannot unseal host-bound master "
+                         f"({e}). If you re-imaged or moved the SD card, "
+                         f"re-run: sudo python3 setup.py first-run\n")
     # Dev / seeding only: an explicit env-provided master (never in prod soc.env).
-    return os.environ.get("SOC_VAULT_PASSWORD", "")
+    env_master = os.environ.get("SOC_VAULT_PASSWORD", "")
+    if not env_master and not sealed:
+        # Empty return would make rbw fail with a generic decryption error that
+        # gives the operator zero idea WHY. Write a loud, actionable line to
+        # stderr — rbw forwards pinentry stderr to the journal, so this lands
+        # in `journalctl -u soc-wall`.
+        sd = os.environ.get("SOC_SECRET_DIR") or "/etc/soc-display/secret"
+        sys.stderr.write(
+            f"pinentry-vault: NO sealed master in {sd} and SOC_VAULT_PASSWORD "
+            f"is unset — the vault cannot be unlocked. Run:\n"
+            f"    sudo python3 setup.py first-run\n"
+            f"to seal the master password host-bound (one-time setup).\n")
+    return env_master
 
 
 def _enc(s: str) -> str:

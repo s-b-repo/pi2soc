@@ -300,23 +300,89 @@ class Supervisor:
         except OSError:
             return base
 
+    # Keys an operator may set in a vault Notes KEY=VALUE block when
+    # config_from_vault is on for fortinet/inode. Strict allowlist: anything
+    # else is rejected so the vault note can't smuggle an arbitrary VPN setting
+    # past the on-screen review. Mirrors the GUI VPN tab fields.
+    _VAULT_VPN_NOTES_KEYS = {"gateway", "port", "realm", "domain",
+                             "trusted_cert", "ca_file", "ready_probe",
+                             "insecure", "set_routes", "set_dns",
+                             "half_internet_routes", "otp_from_vault"}
+
+    def _parse_vpn_notes_kv(self, notes: str) -> dict:
+        """Parse a vault-Notes KEY=VALUE block into a dict. Ignores blank lines
+        and `#` comments. Rejects unknown keys (loud — surfaces in the journal
+        so the operator notices a typo). Coerces port to int, booleans to bool."""
+        out = {}
+        for ln in notes.splitlines():
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            if "=" not in s:
+                continue
+            k, _, v = s.partition("=")
+            k = k.strip().lower()
+            v = v.strip().strip('"').strip("'")
+            if k not in self._VAULT_VPN_NOTES_KEYS:
+                self.log(f"WARNING vault VPN-notes: unknown key {k!r} ignored "
+                         f"(allowed: {sorted(self._VAULT_VPN_NOTES_KEYS)})")
+                continue
+            if k == "port":
+                try:
+                    out[k] = int(v)
+                except ValueError:
+                    self.log(f"WARNING vault VPN-notes: port={v!r} not an int")
+                    continue
+            elif v.lower() in ("true", "yes", "1"):
+                out[k] = True
+            elif v.lower() in ("false", "no", "0"):
+                out[k] = False
+            else:
+                out[k] = v
+        return out
+
     def _materialize_config(self) -> bool:
-        """If vpn.config_from_vault, fetch the .ovpn/.conf from the vault item's
-        Notes and write it to a 0600 file in the 0700 soc-vpn dir, then point
-        vpn['config'] at it. Returns False if it cannot be read/written."""
+        """If vpn.config_from_vault, hydrate the VPN config from the vault item's
+        Notes. Two shapes are supported (auto-detected by VPN type):
+
+          fortinet / inode  — Notes is a KEY=VALUE block (gateway=..., port=...,
+                              realm=..., trusted_cert=..., ...). Overlaid onto
+                              `self.vpn` in memory. NEVER written to disk (the
+                              gateway/realm aren't secret but pinning them in
+                              the vault lets you change them on the fly via the
+                              web vault without touching panels.yaml).
+
+          openvpn / wireguard — Notes is a full .ovpn/.conf file. Written to a
+                              0600 temp file in the 0700 soc-vpn dir; the file
+                              is removed when the supervisor exits.
+
+        Returns False if it cannot be read/written."""
         if not self.vpn.get("config_from_vault"):
             return True
         item = self.vpn.get("vault_item")
         try:
             vault = Vault(ttl=0)
             vault.open()
-            content = vault.notes(item)
+            content = vault.backend.notes_required(item, purpose="VPN config")
         except VaultError as e:
             self.log(f"ERROR reading VPN config from vault item '{item}': {e}")
             return False
-        if not content.strip():
-            self.log(f"ERROR vault item '{item}' has no Notes content (the VPN config)")
-            return False
+
+        if self.driver.kind in ("fortinet", "inode"):
+            # KEY=VALUE overlay path — no on-disk file
+            kv = self._parse_vpn_notes_kv(content)
+            if not kv:
+                self.log(f"ERROR vault item '{item}' Notes had no usable "
+                         f"KEY=VALUE lines for {self.driver.kind} VPN")
+                return False
+            redacted = {k: ("***" if k == "trusted_cert" else v)
+                        for k, v in kv.items()}
+            self.vpn.update(kv)
+            self.log(f"overlaid {len(kv)} VPN field(s) from vault item "
+                     f"'{item}' Notes: {redacted}")
+            return True
+
+        # openvpn / wireguard: write Notes verbatim to a 0600 temp config
         d = self._soc_vpn_dir()
         if self.driver.kind == "wireguard":
             iface = os.path.basename(str(self.vpn.get("config") or "wg0"))
@@ -767,7 +833,34 @@ def main() -> int:
     for w in conf.warnings:
         log(f"WARNING {w}")
 
-    vpn = conf.vpn or {}
+    # Multi-VPN: SOC_VPN_NAME or SOC_VPN_INDEX selects which entry in conf.vpns
+    # this supervisor manages. Used by the systemd template forti-vpn@.service
+    # so each instance owns exactly one VPN. With neither set, fall back to the
+    # first entry (= legacy single-VPN behaviour, what forti-vpn.service does).
+    vpn = {}
+    wanted_name = (os.environ.get("SOC_VPN_NAME") or "").strip()
+    wanted_idx_raw = (os.environ.get("SOC_VPN_INDEX") or "").strip()
+    if wanted_name:
+        vpn = next((v for v in conf.vpns if v.get("name") == wanted_name), {})
+        if not vpn:
+            log(f"FATAL: no VPN named {wanted_name!r} in config "
+                f"(have: {[v.get('name') for v in conf.vpns]})")
+            sd_notify(f"STATUS=no VPN named {wanted_name!r}")
+            sup = Supervisor({}, "")
+            sup.install_signal_handlers()
+            return sup.idle()
+    elif wanted_idx_raw:
+        try:
+            wanted_idx = int(wanted_idx_raw)
+            vpn = conf.vpns[wanted_idx]
+        except (ValueError, IndexError):
+            log(f"FATAL: SOC_VPN_INDEX={wanted_idx_raw!r} invalid")
+            sd_notify("STATUS=bad SOC_VPN_INDEX")
+            sup = Supervisor({}, "")
+            sup.install_signal_handlers()
+            return sup.idle()
+    else:
+        vpn = conf.vpn or {}                # back-compat: first entry
     kind = cfg.vpn_kind(vpn)
     driver = vpndrivers.get_driver(vpn)
     pinentry = os.environ.get("SOC_VPN_PINENTRY") or os.path.join(

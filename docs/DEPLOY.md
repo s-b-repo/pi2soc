@@ -1,8 +1,7 @@
 # Production deploy
 
 The real install on a Raspberry Pi / kiosk box, where systemd autostarts the
-wall on boot and restarts it after a crash. The dev `make dev` runner is for a
-workstation only; production is `install.sh` + systemd.
+wall on boot and restarts it after a crash. Production is `install.sh` + systemd.
 
 ## 0. Prereqs
 
@@ -10,22 +9,35 @@ workstation only; production is `install.sh` + systemd.
   64-bit recommended, an HDMI monitor, network, SSH.
 - Copy this repo to the box and `cd` into it.
 
-## 1. One command
+## 1. Install, then first boot
+
+Two steps: **install** the OS packages + services, then **boot** — the wall runs a
+one-time setup page on first boot and launches itself on every boot after.
 
 ```bash
-sudo python3 setup.py deploy        # or run `setup.py` and pick "Deploy" from the menu
+sudo python3 setup.py               # INSTALL: OS packages + services (+ optional PIN seal)
+sudo systemctl reboot               # first boot runs the setup page on tty1, once
 ```
 
-End-to-end: OS installer → config wizard → start Vaultwarden → **seal the master
-password (one-time PIN)** → push the config + logins into the vault → `doctor`.
-Add `--clean` to wipe generated config/state first. On a box that is already
-installed, deploy **skips the slow OS-package step** (it asks first; pass
-`--fresh` to force a full reinstall). The manual equivalent:
+On first boot `soc-firstboot.service` opens the setup page on the console (screen
+preset + panels, and the vault PIN if it was not sealed at install), writes
+`/etc/soc-display/.configured`, then the wall starts; every later boot goes straight
+to the wall. Run the page on demand with `./launch.sh --setup`, and re-run it later
+with `./launch.sh --reconfigure`. Repairs: `./launch.sh --repair`.
+
+**All-in-one (hands-on) alternative** — do everything now, before reboot:
 
 ```bash
-sudo ./install.sh                 # packages, users, /opt + /etc, systemd units, autologin
-sudo python3 setup.py             # menu → Configure (panels.yaml + soc.env)
-sudo python3 setup.py first-run   # one-time PIN + seal the master password
+sudo python3 setup.py deploy        # install → configure → start Vaultwarden → seal PIN → creds → doctor
+```
+
+Add `--clean` to wipe generated config/state first; on an already-installed box deploy
+**skips the slow OS-package step** (pass `--fresh` to force a reinstall). The fully
+manual equivalent:
+
+```bash
+sudo bash install.sh              # packages, users, /opt + /etc, systemd units, autologin
+sudo python3 setup.py firstboot   # the setup page: panels.yaml + soc.env + seal-if-needed
 sudo python3 setup.py doctor
 ```
 

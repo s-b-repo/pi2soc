@@ -55,8 +55,26 @@ def main():
     forwards += [_validate_extra_forward(f)
                  for f in (t.get("extra_forwards", []) or [])]
 
-    if not t.get("enabled", True) or not forwards or not t.get("jump_host"):
-        return  # nothing to tunnel
+    # A disabled tunnel section, or one explicitly empty, is a legitimate no-op
+    # — print nothing and let autossh-tunnel.sh sleep. But an ENABLED tunnel
+    # section with a jump_host yet zero forwards is a misconfiguration: the
+    # operator clearly intended to tunnel something, but no panel uses
+    # mode: tunnel and no extra_forwards is set. autossh-tunnel.sh would
+    # silently fall through to `sleep infinity`, looking identical to "no
+    # tunnels intended". Surface the mistake to the journal so it isn't
+    # silently swallowed.
+    if not t.get("enabled", True):
+        return
+    if not t.get("jump_host"):
+        return                              # nothing to point ssh at
+    if not forwards:
+        sys.stderr.write(
+            "tunnel-args: tunnel.enabled=true and jump_host is set, but NO "
+            "panels use mode: tunnel and tunnel.extra_forwards is empty — "
+            "there is nothing for autossh to forward. Either disable the "
+            "tunnel section, or give a panel mode: tunnel (Panels tab) / "
+            "add an extra_forward (Tunnel tab).\n")
+        sys.exit(2)
 
     # SEC-6: verify the jump host's key. Default is strict 'yes' — the operator
     # provisions the key into known_hosts (verifying the fingerprint out of band)

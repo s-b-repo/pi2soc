@@ -1,22 +1,15 @@
 """
 Credential access for the SOC kiosk host.
 
-Two backends, selected by $SOC_VAULT_BACKEND:
-
-  rbw  (default, production)  Reads logins from Vaultwarden via the `rbw` CLI.
-                             Unattended unlock uses a pinentry wrapper that
-                             UNSEALS the host-bound master (scripts/pinentry-vault.py)
-                             — no plaintext master password on disk.
-  dev  (local testing)       Reads logins from a JSON file ($SOC_DEV_VAULT),
-                             so the kiosk host runs end-to-end on x86 without
-                             Vaultwarden installed.
+Reads logins from Vaultwarden via the `rbw` CLI. Unattended unlock uses a pinentry
+wrapper that UNSEALS the host-bound master (scripts/pinentry-vault.py) — no
+plaintext master password on disk.
 
 Credentials are held only in a short-TTL in-RAM cache and never written to disk
 by this process.
 """
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import threading
@@ -26,6 +19,22 @@ from typing import Dict, Tuple
 
 class VaultError(Exception):
     pass
+
+
+def _tcp_reachable(url: str, timeout: float = 1.5) -> bool:
+    """Cheap pre-flight: is something listening at `url`'s host:port? Used so
+    `Vault.open()` can bail with 'Vaultwarden is not listening' instead of
+    letting rbw produce an opaque 'connection refused' that obscures the cause."""
+    import socket
+    import urllib.parse
+    try:
+        u = urllib.parse.urlparse(url)
+        host = u.hostname or "127.0.0.1"
+        port = u.port or (443 if u.scheme == "https" else 8222)
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -46,7 +55,7 @@ class RbwBackend:
             r = subprocess.run(["rbw", *args], capture_output=True, text=True,
                                env=e, timeout=30)
         except FileNotFoundError:
-            raise VaultError("rbw not found on PATH (install it or use SOC_VAULT_BACKEND=dev)")
+            raise VaultError("rbw not found on PATH — install it (e.g. cargo install rbw)")
         except subprocess.TimeoutExpired:
             raise VaultError(f"rbw {' '.join(args)} timed out")
         if check and r.returncode != 0:
@@ -63,6 +72,23 @@ class RbwBackend:
             self._rbw("config", "set", "pinentry", self.pinentry, check=False)
 
     def unlock(self):
+        # Bail early with an actionable error instead of letting rbw fail with
+        # "invalid email" (when SOC_VAULT_EMAIL is empty) or "connection refused"
+        # (when Vaultwarden is not listening). Both were silent prod-breakage
+        # paths flagged by the audit: the wall booted, vault.open() failed, and
+        # every panel just showed the unconfigured tile with no clue why.
+        if not self.email:
+            raise VaultError(
+                "SOC_VAULT_EMAIL is empty — the wall cannot unlock the vault. "
+                "Run 'sudo python3 setup.py wizard' (sets the email) followed "
+                "by 'sudo python3 setup.py first-run' (seals the master + "
+                "registers the Vaultwarden account).")
+        if self.url and not _tcp_reachable(self.url):
+            raise VaultError(
+                f"Vaultwarden at {self.url} is not reachable — check "
+                f"'systemctl status vaultwarden' (the wall needs the vault to "
+                f"start, even with blank tiles, so the GUI can read/write "
+                f"credentials at the glass).")
         self.configure()
         if self.interactive:
             # operator unlocks manually after boot; just make sure agent is up.
@@ -83,57 +109,37 @@ class RbwBackend:
 
     def notes(self, item: str) -> str:
         """The item's Notes field (used to hold a VPN config — wg .conf / .ovpn —
-        so its keys live in Vaultwarden instead of on disk). '' if empty."""
+        so its keys live in Vaultwarden instead of on disk). '' if empty.
+
+        Callers that REQUIRE the notes (e.g. config_from_vault: true for the VPN)
+        should call notes_required() instead — an empty Notes used as a config
+        file silently fails downstream with a parser error that doesn't mention
+        the vault."""
         out = self._rbw("get", "--field", "notes", item, check=False)
         if out:
             return out
         # secure-note items return the note as the main value
         return self._rbw("get", item, check=False)
 
-
-class DevFileBackend:
-    """JSON: { "Item Name": {"username": "...", "password": "..."}, ... }"""
-    def __init__(self):
-        self.path = os.environ.get("SOC_DEV_VAULT", "dev/run/dev-vault.json")
-        self._data = None
-
-    def _load(self):
-        if self._data is None:
-            try:
-                with open(self.path, encoding="utf-8") as fh:
-                    self._data = json.load(fh)
-            except FileNotFoundError:
-                raise VaultError(f"dev vault file not found: {self.path}")
-        return self._data
-
-    def configure(self):
-        pass
-
-    def unlock(self):
-        self._load()
-
-    def sync(self):
-        self._data = None
-        self._load()
-
-    def get(self, item: str) -> Tuple[str, str]:
-        rec = self._load().get(item)
-        if not rec:
-            raise VaultError(f"dev vault has no item '{item}'")
-        return rec.get("username", ""), rec["password"]
-
-    def notes(self, item: str) -> str:
-        rec = self._load().get(item) or {}
-        return rec.get("notes", "")
+    def notes_required(self, item: str, purpose: str = "") -> str:
+        """notes() that RAISES on empty/missing — for callers that depend on the
+        Notes field actually carrying content (e.g. openvpn/wireguard config
+        from vault). `purpose` is interpolated into the error so the operator
+        knows which feature is broken."""
+        out = self.notes(item)
+        if not out.strip():
+            what = f" for {purpose}" if purpose else ""
+            raise VaultError(
+                f"vault item '{item}' has an empty Notes field{what} — "
+                f"paste the .ovpn / .conf content into the Notes section of "
+                f"that item in Vaultwarden (web UI or the ⚙ Credentials tab).")
+        return out
 
 
 def _make_backend():
-    name = os.environ.get("SOC_VAULT_BACKEND", "rbw").lower()
-    if name == "dev":
-        return DevFileBackend()
-    if name == "rbw":
-        return RbwBackend()
-    raise VaultError(f"unknown SOC_VAULT_BACKEND={name}")
+    # Production-only: every credential comes from Vaultwarden via rbw. The legacy
+    # JSON "dev" backend was removed; tests inject a fake backend onto Vault.backend.
+    return RbwBackend()
 
 
 # --------------------------------------------------------------------------- #

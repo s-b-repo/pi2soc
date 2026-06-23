@@ -22,13 +22,12 @@ Usage:
   python3 setup.py creds           # store logins in Vaultwarden
   python3 setup.py --dry-run       # show what it would write, write nothing
   python3 setup.py --defaults      # accept every default (non-interactive wizard)
-  python3 setup.py --target pi     # write to /etc/soc-display (default when root)
-  python3 setup.py --target dev    # write to the repo (config/panels.local.yaml, .env)
   python3 setup.py --section vpn   # jump straight to one section
                                    #   (display|panels|tunnel|vpn|proxy|vault|server|all)
 
-Run with no arguments on a terminal for the menu; piped input or --defaults runs
-the wizard directly. Nothing here needs root unless you ask it to run ./install.sh.
+Run with no arguments on a terminal to install (OS packages + services);
+`setup.py menu` lists every action. Piped input or --defaults runs the wizard.
+Writing to /etc/soc-display needs root (sudo).
 """
 from __future__ import annotations
 
@@ -39,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import time
+from html.parser import HTMLParser
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
@@ -102,9 +102,12 @@ def _readline(prompt: str) -> str:
         sys.exit(130)
 
 
-def ask(prompt: str, default: str = "", *, allow_empty=True, validate=None) -> str:
+def ask(prompt: str, default: str = "", *, allow_empty=True, validate=None,
+        normalize=None) -> str:
     """Prompt for a value. `validate(value) -> error string | None` rejects +
-    re-prompts on bad input. A non-empty default is assumed already valid."""
+    re-prompts on bad input. `normalize(value) -> value` rewrites the raw input
+    before validation (e.g. supplying a missing URL scheme). A non-empty default
+    is assumed already valid."""
     d = f" [{default}]" if default != "" else ""
     while True:
         if ASSUME_DEFAULTS:
@@ -116,6 +119,8 @@ def ask(prompt: str, default: str = "", *, allow_empty=True, validate=None) -> s
                 return default
             warn("a value is required")
             continue
+        if normalize is not None:
+            raw = normalize(raw)
         if validate is not None:
             problem = validate(raw)
             if problem:
@@ -134,6 +139,13 @@ def v_url(s: str):
     if m and not (0 < int(m.group(1)) < 65536):
         return "port must be 1-65535"
     return None
+
+
+def n_url(s: str) -> str:
+    """Default a bare host or host/path to http:// so operators can type
+    '10.14.0.2' or '10.14.0.2/zabbix/index.php' without it being rejected for a
+    missing scheme. Anything already carrying a scheme is left untouched."""
+    return s if "://" in s else "http://" + s
 
 
 def v_hostport(s: str):
@@ -314,6 +326,33 @@ def rewrite_env(path: str, *, remove=(), set_kv=None, mode: int = 0o600,
     os.chmod(path, mode)
 
 
+def is_configured(paths) -> bool:
+    """True once the first-time setup page has run on this host. The app (launch.sh
+    / the tty1 boot oneshot) launches straight to the wall when this marker exists,
+    and runs the setup page once when it does not."""
+    return os.path.exists(paths.get("configured_marker", ""))
+
+
+def mark_configured(paths, dry: bool = False) -> None:
+    """Drop the 'configured' marker so the wall launches directly from now on."""
+    m = paths.get("configured_marker")
+    if not m:
+        return
+    if dry:
+        print(yellow(f"   [dry-run] would mark configured: {m}"))
+        return
+    parent = os.path.dirname(m)
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
+    with open(m, "w", encoding="utf-8") as fh:
+        fh.write(f"configured={time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+    try:
+        os.chmod(m, 0o644)
+    except OSError:
+        pass
+    ok(f"marked configured: {m}")
+
+
 def load_env_file(path: str) -> dict:
     """Tiny KEY=VALUE reader for using a previous soc.env as defaults."""
     out = {}
@@ -398,26 +437,33 @@ def render_panels_yaml(cfg: dict) -> str:
                      f"remote_host: {yq(t['remote_host'])}, remote_port: {t['remote_port']} }}")
             L.append(f"    path: {yq(p.get('path', '/'))}")
             L.append(f"    scheme: {yq(p.get('scheme', 'http'))}")
-        else:
+        elif p.get("url"):
             L.append(f"    url: {yq(p['url'])}")
-        L.append(f"    vault_item: {yq(p['vault_item'])}")
-        s = p["selectors"]
-        L.append("    selectors:")
-        L.append(f"      user: {yq(s['user'])}")
-        L.append(f"      pass: {yq(s['pass'])}")
-        if s.get("submit"):
-            L.append(f"      submit: {yq(s['submit'])}")
-        L.append(f"    login_marker: {yq(p['login_marker'])}")
-        k = p["keepalive"]
-        ka = f"    keepalive: {{ strategy: {k['strategy']}"
-        if k["strategy"] != "none":
-            ka += f", intervalSec: {k.get('intervalSec', 600)}"
-        if k["strategy"] == "xhr" and k.get("url"):
-            ka += f", url: {yq(k['url'])}"
-        if k["strategy"] == "click" and k.get("target"):
-            ka += f", target: {yq(k['target'])}"
-        ka += " }"
-        L.append(ka)
+        else:
+            L.append("    # blank tile — set the URL/login at the glass (⚙ on-screen "
+                     "config) or by re-running setup.py wizard")
+        if p.get("vault_item"):
+            L.append(f"    vault_item: {yq(p['vault_item'])}")
+        if p.get("selectors"):
+            s = p["selectors"]
+            L.append("    selectors:")
+            L.append(f"      user: {yq(s['user'])}")
+            L.append(f"      pass: {yq(s['pass'])}")
+            if s.get("submit"):
+                L.append(f"      submit: {yq(s['submit'])}")
+        if p.get("login_marker"):
+            L.append(f"    login_marker: {yq(p['login_marker'])}")
+        if p.get("keepalive"):
+            k = p["keepalive"]
+            ka = f"    keepalive: {{ strategy: {k['strategy']}"
+            if k["strategy"] != "none":
+                ka += f", intervalSec: {k.get('intervalSec', 600)}"
+            if k["strategy"] == "xhr" and k.get("url"):
+                ka += f", url: {yq(k['url'])}"
+            if k["strategy"] == "click" and k.get("target"):
+                ka += f", target: {yq(k['target'])}"
+            ka += " }"
+            L.append(ka)
         L.append("")
     # tunnel
     t = cfg["tunnel"]
@@ -539,7 +585,17 @@ def render_wall_unit(e: dict, *, user: str = "soc",
                      soc_root: str = "/opt/soc-display") -> str:
     """Generate the supervised soc-wall.service: the kiosk session as a systemd
     service with the non-secret config baked in as Environment= lines (no soc.env)
-    and Restart=always (a dead compositor/session recovers instead of going dark)."""
+    and Restart=always (a dead compositor/session recovers instead of going dark).
+
+    Refuses to render with an empty SOC_VAULT_EMAIL: that produced a wall that
+    booted, failed `rbw config set email ""`, then died at vault.open() with
+    every panel painting the unconfigured tile (audit HIGH #3). Catch it here
+    instead of at boot."""
+    if not str(e.get("SOC_VAULT_EMAIL") or "").strip():
+        raise ValueError(
+            "SOC_VAULT_EMAIL is empty — refusing to render soc-wall.service "
+            "with a vault account that doesn't exist. Re-run setup.py wizard "
+            "and set a real email at the 'vault account email' prompt.")
     def env_line(k: str, v: str) -> str:
         # systemd needs the whole assignment quoted when the value has spaces.
         return f'Environment="{k}={v}"' if " " in v else f"Environment={k}={v}"
@@ -637,13 +693,316 @@ def load_unit_env(path: str) -> dict:
 DEF_SELECTORS = {"user": "#username", "pass": "#password", "submit": "button[type=submit]"}
 
 
+# --------------------------------------------------------------------------- #
+# Login-form auto-detection.
+#
+# Given a panel's login URL, fetch the page and work out the CSS selectors for
+# the username / password / submit elements and what product it is, so the
+# wizard can pre-fill the selector prompts instead of making the operator hand-
+# write them (the common failure mode being typing the *credentials* into the
+# *selector* fields). Pure stdlib: urllib + html.parser. Best-effort and fully
+# graceful — any failure falls back to manual entry and on-screen guidance.
+# --------------------------------------------------------------------------- #
+class _LoginFormParser(HTMLParser):
+    """Collect <input>/<button> elements (tagged with the <form> they're in),
+    the <title> and <meta> tags — enough to find a login form + fingerprint."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.inputs, self.buttons, self.metas = [], [], []
+        self.title = ""
+        self._titling = False
+        self._forms, self._nform = [], 0
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "form":
+            self._nform += 1
+            self._forms.append(self._nform)
+        elif tag == "input":
+            a["_form"] = self._forms[-1] if self._forms else None
+            self.inputs.append(a)
+        elif tag == "button":
+            a["_form"] = self._forms[-1] if self._forms else None
+            self.buttons.append(a)
+        elif tag == "meta":
+            self.metas.append(a)
+        elif tag == "title":
+            self._titling = True
+
+    def handle_endtag(self, tag):
+        if tag == "form" and self._forms:
+            self._forms.pop()
+        elif tag == "title":
+            self._titling = False
+
+    def handle_data(self, data):
+        if self._titling:
+            self.title += data
+
+
+def _url_path(url: str) -> str:
+    m = re.match(r"^[a-z]+://[^/]+(/[^?#]*)?", url or "", re.I)
+    return (m.group(1) or "") if m else ""
+
+
+def _attr_selector(a: dict, tag: str = "input") -> str:
+    """Most stable CSS selector for a form element: prefer #id, then [name],
+    then [type]."""
+    if a.get("id"):
+        return "#" + a["id"]
+    if a.get("name"):
+        return '%s[name="%s"]' % (tag, a["name"])
+    if a.get("type"):
+        return '%s[type="%s"]' % (tag, a["type"])
+    return tag
+
+
+# (name, title substrings, html substrings, url-path substrings, selector preset)
+# Used both to label the login type and to supply selectors for JS-rendered
+# (SPA) panels whose form never appears in the static HTML.
+_PRODUCT_SIGNATURES = [
+    ("Zabbix", ["zabbix"], ["zabbix"], ["/zabbix"],
+        {"user": "#name", "pass": "#password", "submit": "#enter"}),
+    ("Grafana", ["grafana"], ["grafana-app", "grafanabootdata"], [],
+        {"user": 'input[name="user"]', "pass": 'input[name="password"]',
+         "submit": "button[type=submit]"}),
+    ("Wazuh / Kibana", ["wazuh", "kibana", "opensearch"],
+        ["kbn-injected-metadata", "opensearch", "wazuh"], [],
+        {"user": '[data-test-subj="user-name"]', "pass": '[data-test-subj="password"]',
+         "submit": '[data-test-subj="submit"]'}),
+    ("Keycloak (SSO)", ["keycloak"], ["kc-form-login", "kc-login"],
+        ["/realms/", "/auth/realms/"],
+        {"user": "#username", "pass": "#password", "submit": "#kc-login"}),
+]
+
+
+def _match_product(title_lc: str, html_lc: str, path_lc: str):
+    for name, titles, htmls, paths, preset in _PRODUCT_SIGNATURES:
+        if (any(t in title_lc for t in titles)
+                or any(h in html_lc for h in htmls)
+                or any(p in path_lc for p in paths if p)):
+            return name, dict(preset)
+    return None, None
+
+
+def _looks_like_spa(html_lc: str) -> bool:
+    return any(s in html_lc for s in (
+        'id="root"', 'id="app"', "reactroot", "ng-app", "__nuxt",
+        "window.grafanabootdata"))
+
+
+def parse_login_html(html: str, final_url: str = "") -> dict:
+    """Locate a login form in static HTML and derive selectors. Returns a dict:
+    kind ('form' | 'spa' | 'unknown'), product, user, pass, submit,
+    login_marker, notes. Pure function — no network — so it is unit-testable."""
+    p = _LoginFormParser()
+    try:
+        p.feed(html or "")
+    except Exception:                                  # malformed markup: salvage what we got
+        pass
+    html_lc = (html or "").lower()
+    product, preset = _match_product(
+        (p.title or "").strip().lower(), html_lc, _url_path(final_url).lower())
+
+    pw = pw_i = None
+    for i, a in enumerate(p.inputs):
+        if a.get("type", "").lower() == "password":
+            pw, pw_i = a, i
+            break
+
+    if pw is None:                                     # no form in static HTML
+        kind = "spa" if (product or _looks_like_spa(html_lc)) else "unknown"
+        res = {"kind": kind, "product": product, "user": "", "pass": "",
+               "submit": "", "login_marker": "", "notes": []}
+        if preset:
+            res.update(preset)
+            res["login_marker"] = preset.get("pass", "")
+        return res
+
+    pass_sel = _attr_selector(pw, "input")
+    form = pw.get("_form")
+
+    user_sel = ""
+    for a in reversed(p.inputs[:pw_i]):                # nearest field before the password
+        if a.get("_form") != form:
+            continue
+        if a.get("type", "text").lower() in (
+                "hidden", "submit", "button", "checkbox", "radio", "image", "file", "password"):
+            continue
+        user_sel = _attr_selector(a, "input")
+        break
+    if not user_sel and preset:
+        user_sel = preset.get("user", "")
+
+    submit_sel = ""
+    for b in p.buttons:                                # a submit button wins
+        if b.get("_form") == form and b.get("type", "submit").lower() == "submit":
+            submit_sel = _attr_selector(b, "button")
+            break
+    if not submit_sel:
+        for a in p.inputs:
+            if a.get("_form") == form and a.get("type", "").lower() == "submit":
+                submit_sel = _attr_selector(a, "input")
+                break
+    # submit may stay "" — login.js then submits the form natively (== Enter).
+
+    return {"kind": "form", "product": product,
+            "user": user_sel or DEF_SELECTORS["user"], "pass": pass_sel,
+            "submit": submit_sel, "login_marker": pass_sel, "notes": []}
+
+
+def print_selector_help():
+    """The manual fallback: how to find a selector, and the key reminder that a
+    selector is not a credential."""
+    note("To find one: open the page in a browser, right-click the field →")
+    note('Inspect, then use its id (#id), name (input[name="…"]) or type')
+    note('(input[type="password"]).')
+    note("A selector points at WHERE a box is — it is NOT your username or")
+    note("password. Real logins go in the Vaultwarden item ('vault item name';")
+    note("store with:  setup.py creds).")
+
+
+def _print_suggestion(product: str, sel: dict, guessed: bool):
+    tag = "guessed from the product — VERIFY" if guessed else "auto-detected"
+    marker = sel.get("login_marker") or sel.get("pass") or "(none)"
+    print(dim(f"   suggested selectors ({tag}):"))
+    print(dim(f"      username field : {sel.get('user') or '(none)'}"))
+    print(dim(f"      password field : {sel.get('pass') or '(none)'}"))
+    print(dim(f"      submit button  : {sel.get('submit') or '(blank → press Enter)'}"))
+    print(dim(f"      login marker   : {marker}   (how the wall spots the login page)"))
+    note("These say WHERE the login boxes are on the page — they are NOT your")
+    note("username/password. Your real login goes in the Vaultwarden item named at")
+    note("the 'vault item name' prompt (store it with:  setup.py creds).")
+    if guessed:
+        note("VERIFY in a browser: right-click the field → Inspect (prefer #id).")
+
+
+def detect_login(url: str, timeout: int = 6) -> dict:
+    """Probe a direct-mode login URL and return suggested selectors (possibly
+    {}). Prints a summary + guidance. Network/parse failures degrade gracefully
+    — the wizard never blocks or aborts on this."""
+    import socket
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    note(f"probing {url} to auto-detect the login form …")
+    req = urllib.request.Request(url, headers={"User-Agent": "soc-wall-setup"})
+    insecure = False
+    try:
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.URLError as e:
+            if not isinstance(getattr(e, "reason", None), ssl.SSLError):
+                raise
+            # Self-signed cert (common on internal panels). Don't silently skip
+            # verification — ask. The probe sends NO credentials and only reads
+            # the login HTML to guess selectors (which you verify), so a MITM
+            # could at worst suggest wrong selectors, not capture a login.
+            warn(f"{url} has an untrusted TLS certificate (self-signed?).")
+            note("For production, install a trusted cert or pin its sha256.")
+            if not ask_bool("read the page once without verifying the cert "
+                            "(this probe only)?", False):
+                note("skipped — using defaults.")
+                print_selector_help()
+                return {}
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+            insecure = True
+        final_url = resp.geturl()
+        raw = resp.read(512 * 1024)
+        charset = resp.headers.get_content_charset() or "utf-8"
+        try:
+            html = raw.decode(charset, "replace")
+        except LookupError:
+            html = raw.decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        if e.code == 401 and "basic" in (e.headers.get("WWW-Authenticate", "") or "").lower():
+            warn(f"{url} uses HTTP Basic auth (a browser popup, not a web form).")
+            note("Form-fill auto-login can't drive that native dialog — put the")
+            note("panel behind a proxy that renders an HTML login form instead.")
+            return {}
+        warn(f"server returned HTTP {e.code} for {url}; using defaults.")
+        print_selector_help()
+        return {}
+    except (urllib.error.URLError, socket.timeout, OSError) as e:
+        warn(f"couldn't reach {url} ({getattr(e, 'reason', e)}).")
+        note("That's expected if the VPN/tunnel isn't up yet during setup.")
+        prod, preset = _match_product("", "", _url_path(url).lower())
+        if preset:                                      # still guess from the URL path
+            preset["login_marker"] = preset.get("pass", "")
+            ok(f"the URL looks like {prod} — suggesting its known selectors.")
+            _print_suggestion(prod, preset, guessed=True)
+            return preset
+        print_selector_help()
+        return {}
+    except Exception as e:                              # never let detection break the wizard
+        warn(f"auto-detect failed ({e}); using defaults.")
+        print_selector_help()
+        return {}
+
+    if insecure:
+        note(f"(read {final_url} over an unverified connection — pin its sha256 for production.)")
+
+    res = parse_login_html(html, final_url)
+    prod = res.get("product")
+    keys = ("user", "pass", "submit", "login_marker")
+    if res["kind"] == "form" and res.get("pass"):
+        ok(f"detected a {prod + ' ' if prod else ''}login form at {final_url}")
+        _print_suggestion(prod, res, guessed=False)
+        return {k: res[k] for k in keys}
+    if prod:                                            # JS-rendered: fall back to product preset
+        warn(f"{final_url} looks like {prod}, but its login form is drawn by")
+        note("JavaScript, so I can't read it from static HTML. Using known")
+        note(f"{prod} selectors:")
+        _print_suggestion(prod, res, guessed=True)
+        return {k: res.get(k, "") for k in keys}
+    warn(f"no login form found in the static HTML of {final_url}.")
+    print_selector_help()
+    return {}
+
+
+# Screen-size presets offered by the wizard. "auto" detects the resolution from
+# the display at launch (xrandr on X11, wlr-randr on Wayland — the long-standing
+# default); "custom" falls back to hand-entered width/height. Each entry is
+# (label, value, blurb) where value is None=auto, "custom", or a (w, h) tuple.
+DISPLAY_PRESETS = [
+    ("auto",      None,         "detect the resolution from the display at launch"),
+    ("1920x1080", (1920, 1080), "1080p / Full HD"),
+    ("2560x1440", (2560, 1440), "1440p / QHD"),
+    ("3840x2160", (3840, 2160), "4K / UHD"),
+    ("1280x720",  (1280, 720),  "720p"),
+    ("custom",    "custom",     "enter width + height by hand"),
+]
+
+
 def section_display(prev) -> dict:
     step(1, 7, "Display geometry")
     note("The screen is split into a grid; each cell holds one panel window.")
     pd = (prev or {}).get("display", {}) if prev else {}
-    auto = ask_bool("Auto-detect resolution from xrandr at launch?", pd.get("auto", True))
-    width = ask_int("Screen width (px), used when auto is off", int(pd.get("width", 1920)))
-    height = ask_int("Screen height (px)", int(pd.get("height", 1080)))
+    prev_w, prev_h = int(pd.get("width", 1920)), int(pd.get("height", 1080))
+    # Screen size: pick a preset, auto-detect at launch, or enter a custom size.
+    # Seed the default from the previous answer (auto if it was auto, else the
+    # matching preset, else custom).
+    labels = [f"{name}  ({blurb})" for name, _v, blurb in DISPLAY_PRESETS]
+    if pd.get("auto", True):
+        def_label = labels[0]
+    else:
+        def_label = next((labels[i] for i, (_n, v, _b) in enumerate(DISPLAY_PRESETS)
+                          if isinstance(v, tuple) and v == (prev_w, prev_h)),
+                         labels[-1])
+    sel = DISPLAY_PRESETS[labels.index(ask_choice("screen size", labels, def_label))][1]
+    if sel is None:                       # auto-detect at launch (keep a fallback size)
+        auto, width, height = True, prev_w, prev_h
+    elif sel == "custom":
+        auto = False
+        width = ask_int("Screen width (px)", prev_w)
+        height = ask_int("Screen height (px)", prev_h)
+    else:                                 # a fixed preset
+        auto, (width, height) = False, sel
     cols = ask_int("Grid columns", int(pd.get("cols", 2)), lo=1, hi=4)
     rows = ask_int("Grid rows", int(pd.get("rows", 2)), lo=1, hi=4)
     gap = ask_int("Gap between cells (px, 0 = seamless)", int(pd.get("gap", 0)), lo=0)
@@ -659,6 +1018,22 @@ def section_panels(display, prev) -> list:
     cols, rows = display["cols"], display["rows"]
     cap = cols * rows
     prev_panels = (prev or {}).get("panels", []) if prev else []
+    # Panels are optional at install time. You can skip this whole section and set
+    # every tile later from the running wall's ⚙ settings window (URL, vault login,
+    # and credentials) — no SSH, no file editing. Skipping fills the grid with
+    # blank "click-to-configure" tiles.
+    note("Set panels up now, or skip and configure each tile from the running wall's")
+    note("⚙ settings window (URL + vault login + credentials). Skipping creates blank")
+    note("tiles you point at real tools at the glass — no SSH or file editing.")
+    if not ask_bool("Configure panels now?", True):
+        panels = []
+        for i in range(cap):
+            pp = prev_panels[i] if i < len(prev_panels) else {}
+            panels.append(dict(id=pp.get("id", f"p{i+1}"), engine="webkit",
+                               grid=[i % cols, i // cols], mode="direct"))
+        ok(f"{cap} blank tile(s) created — configure them at the glass "
+           f"(⚙ corner gear / Ctrl+Shift+C)")
+        return panels
     count = ask_int(f"How many panels? (grid holds {cap})", min(cap, len(prev_panels) or 4),
                     lo=1, hi=cap)
     panels = []
@@ -666,6 +1041,18 @@ def section_panels(display, prev) -> list:
         pp = prev_panels[i] if i < len(prev_panels) else {}
         print()
         print(cyan(f"   ── Panel {i+1} of {count} ──"))
+        # Every panel is optional: leave it a blank tile now and set its URL later
+        # from the on-screen config (⚙) or by re-running the wizard. Beats inventing
+        # a throwaway URL just to get past the prompt.
+        was_blank = bool(pp) and not (pp.get("url") or pp.get("tunnel") or pp.get("vault_item"))
+        if not ask_bool("Configure this panel now? (n = leave a blank tile)", not was_blank):
+            gc, gr = i % cols, i // cols
+            pgrid = pp.get("grid", [gc, gr])
+            bid = pp.get("id", f"p{i+1}")
+            panels.append(dict(id=bid, engine=pp.get("engine", "webkit"),
+                               grid=[int(pgrid[0]), int(pgrid[1])], mode="direct"))
+            ok(f"panel {bid} left blank — set its URL later (⚙ on-screen config or re-run)")
+            continue
         pid = ask("id (window class becomes soc-<id>)", pp.get("id", f"p{i+1}"), allow_empty=False)
         engine = ask_choice("engine", ["webkit", "chromium"], pp.get("engine", "webkit"))
         gc = i % cols
@@ -686,20 +1073,43 @@ def section_panels(display, prev) -> list:
             panel["scheme"] = ask_choice("local scheme", ["http", "https"], pp.get("scheme", "http"))
         else:
             panel["url"] = ask("login URL", pp.get("url", f"http://192.168.1.{50+i}:3000/login"),
-                               allow_empty=False, validate=v_url)
+                               allow_empty=False, validate=v_url, normalize=n_url)
         panel["vault_item"] = ask("vault item name (the Vaultwarden login to use)",
                                   pp.get("vault_item", f"SOC Panel {i+1}"), allow_empty=False)
-        note("CSS selectors for the login form — Inspect the page to find these.")
+        # Auto-detect the login form for direct panels so selectors are pre-filled
+        # (and credentials don't get typed into the selector fields). Read-only
+        # probe; skipped in non-interactive (--defaults) runs.
+        probed = mode == "direct" and not ASSUME_DEFAULTS
+        suggest = detect_login(panel["url"]) if probed else {}
         ps = pp.get("selectors", {})
-        sel = {
-            "user": ask("  username field selector", ps.get("user", DEF_SELECTORS["user"])),
-            "pass": ask("  password field selector", ps.get("pass", DEF_SELECTORS["pass"])),
-            "submit": ask("  submit button selector (blank = press Enter)",
-                          ps.get("submit", DEF_SELECTORS["submit"])),
-        }
-        panel["selectors"] = sel
-        panel["login_marker"] = ask("login_marker (selector present ONLY on the login page)",
-                                    pp.get("login_marker", sel["pass"]))
+        # Happy path: detection found a usable form — offer a single confirmation
+        # instead of four selector prompts the operator may not understand.
+        if suggest.get("user") and suggest.get("pass") and \
+                ask_bool("Use these detected selectors?", True):
+            sel = {"user": suggest["user"], "pass": suggest["pass"],
+                   "submit": suggest.get("submit", "")}
+            panel["selectors"] = sel
+            panel["login_marker"] = suggest.get("login_marker", sel["pass"])
+            ok("selectors + login_marker set from auto-detect")
+        else:
+            if not probed:              # tunnel / non-interactive: nothing was printed above
+                note("CSS selectors below say WHERE the login boxes are — NOT your login.")
+                note("Find them in a browser: right-click a field → Inspect (prefer #id).")
+            sel = {
+                "user": ask("  username field selector",
+                            ps.get("user", suggest.get("user", DEF_SELECTORS["user"]))),
+                "pass": ask("  password field selector",
+                            ps.get("pass", suggest.get("pass", DEF_SELECTORS["pass"]))),
+                "submit": ask("  submit button selector (blank = press Enter)",
+                              ps.get("submit", suggest.get("submit", DEF_SELECTORS["submit"]))),
+            }
+            panel["selectors"] = sel
+            note("login_marker = how the wall notices a panel is logged OUT so it can")
+            note("re-login. It's a selector that appears ONLY on the login page; the")
+            note("password box is ideal, so the default below is usually right — Enter.")
+            panel["login_marker"] = ask(
+                "login_marker (selector seen ONLY on the login page)",
+                pp.get("login_marker", suggest.get("login_marker", sel["pass"])))
         pk = pp.get("keepalive", {})
         strat = ask_choice("keep-alive strategy", ["reload", "xhr", "click", "none"],
                            pk.get("strategy", "reload"))
@@ -885,24 +1295,18 @@ def section_vault(paths, prev_env, has_vpn) -> dict:
     step(6, 7, "Secrets vault (rbw / Vaultwarden)")
     e = dict(prev_env)
     note("The kiosk reads every login — and its own config — from Vaultwarden via")
-    note("rbw (or a JSON file in dev). No secret is written to any .env: the master")
-    note("password is sealed host-bound under $SOC_SECRET_DIR; first-run / deploy")
-    note("generates the one-time PIN and seals it.")
-    backend = ask_choice("vault backend", ["rbw", "dev"], e.get("SOC_VAULT_BACKEND", paths["default_backend"]))
-    e["SOC_VAULT_BACKEND"] = backend
-    if backend == "dev":
-        note("Dev backend reads dev/run/dev-vault.json — no Vaultwarden needed.")
-        e.setdefault("SOC_VAULT_EMAIL", "kiosk@soc.local")
-        e.setdefault("SOC_VAULT_URL", "http://127.0.0.1:8222")
-    else:
-        e["SOC_VAULT_EMAIL"] = ask("vault account email",
-                                   e.get("SOC_VAULT_EMAIL", "kiosk@soc.local"),
-                                   allow_empty=False, validate=v_email)
-        e["SOC_VAULT_URL"] = ask("Vaultwarden URL",
-                                 e.get("SOC_VAULT_URL", "http://127.0.0.1:8222"),
-                                 allow_empty=False, validate=v_url)
-        note("Master password: sealed at first-run (setup.py first-run / deploy),")
-        note("never written in cleartext. Re-run first-run to change/re-seal it.")
+    note("rbw. No secret is written to any .env: the master password is sealed")
+    note("host-bound under $SOC_SECRET_DIR; first-run / deploy generates the")
+    note("one-time PIN and seals it.")
+    e["SOC_VAULT_BACKEND"] = "rbw"
+    e["SOC_VAULT_EMAIL"] = ask("vault account email",
+                               e.get("SOC_VAULT_EMAIL", "kiosk@soc.local"),
+                               allow_empty=False, validate=v_email)
+    e["SOC_VAULT_URL"] = ask("Vaultwarden URL",
+                             e.get("SOC_VAULT_URL", "http://127.0.0.1:8222"),
+                             allow_empty=False, validate=v_url, normalize=n_url)
+    note("Master password: sealed at first-run (setup.py first-run / deploy),")
+    note("never written in cleartext. Re-run first-run to change/re-seal it.")
     e["SOC_SECRET_DIR"] = paths["secret_dir"]
     e["SOC_CONFIG_VAULT_ITEM"] = e.get(
         "SOC_CONFIG_VAULT_ITEM", paths.get("config_vault_item", "SOC Wall Config"))
@@ -975,22 +1379,14 @@ def post_actions(env: Env, cfg: dict, target: str, dry: bool):
     if dry:
         note("dry-run: skipping actions")
         return
-    if env.has_apt and ask_bool("Run the installer (sudo ./install.sh) now?", False):
+    if env.has_apt and ask_bool("Run the installer (install.sh) now?", False):
         installer = os.path.join(REPO, "install.sh")
-        _run((["./install.sh"] if env.is_root else ["sudo", "./install.sh"]))
-    if target == "dev":
-        if ask_bool("Seed the dev vault (make dev-vault)?", True):
-            _run(["make", "dev-vault"])
-        if cfg["vpn"].get("enabled") and ask_bool("Dry-run the VPN wiring (make vpn-check)?", True):
-            _run(["make", "vpn-check"])
-        if ask_bool("Run the headless end-to-end check (make verify)?", False):
-            _run(["make", "verify"])
-        if ask_bool("Launch the wall now in a window (make dev)?", False):
-            _run(["make", "dev"])
-    else:
-        note("On the Pi, finish: start Vaultwarden, create the account, then store")
-        note("the logins with:  python3 setup.py creds   (or add them in the web vault).")
-        note("Check everything with:  python3 setup.py doctor   then reboot.")
+        # Invoke via `bash <abs path>` — never rely on the +x bit or cwd (a
+        # downloaded/unzipped tree often loses the exec bit; see install.sh).
+        _run(["bash", installer] if env.is_root else ["sudo", "bash", installer])
+    note("Finish: start Vaultwarden, create the account, then store the logins")
+    note("with:  python3 setup.py creds   (or add them in the web vault).")
+    note("Check everything with:  python3 setup.py doctor   then reboot.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1030,9 +1426,6 @@ def store_credentials(soc_env: dict, cfg: dict, dry: bool):
     """Write each item's username+password into Vaultwarden (vaultseed). Run this
     AFTER Vaultwarden is up + the account exists. Operator can skip + add by hand."""
     banner("Store credentials in Vaultwarden")
-    if (soc_env or {}).get("SOC_VAULT_BACKEND") != "rbw":
-        note("vault backend is not 'rbw' — credentials live in the dev JSON; skipping.")
-        return
     url = soc_env.get("SOC_VAULT_URL", "")
     email = soc_env.get("SOC_VAULT_EMAIL", "")
     pw = _resolve_master(soc_env)
@@ -1145,7 +1538,7 @@ def _alive(url):
 
 def cmd_doctor(args) -> int:
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = "pi"     # production-only: the wall always deploys to /etc/soc-display
     paths = resolve_paths(target)
     soc_env = load_env_file(paths["soc_env"])
     banner("SOC video-wall · doctor")
@@ -1278,6 +1671,38 @@ def cmd_doctor(args) -> int:
                 subprocess.run(["systemctl", "is-active", u], capture_output=True,
                                text=True).stdout.strip() or "unknown")))
 
+        # Drift detector: install.sh enables forti-vpn / autossh-tunnel only
+        # when panels.yaml at install time used them. The ⚙ VPN / Tunnel tabs
+        # can flip vpn.enabled / tunnel.enabled later — and then nothing
+        # would enable the unit, so it would never come up on reboot. Audit
+        # MED #7. Flag the mismatch so the operator notices before reboot.
+        def _config_vs_unit_drift():
+            try:
+                conf_path = soc_env.get("SOC_PANELS_FILE") or os.path.join(
+                    REPO, "config", "panels.yaml")
+                if not os.path.exists(conf_path):
+                    return ("OK", "no panels.yaml to compare", "")
+                from host import config as _cfg  # type: ignore
+                conf = _cfg.load(conf_path)
+                pairs = (("forti-vpn", bool((conf.vpn or {}).get("enabled"))),
+                         ("autossh-tunnel",
+                          bool((conf.tunnel or {}).get("enabled", False))
+                          and any(p.mode == "tunnel" for p in conf.panels)))
+                bad = []
+                for u, want in pairs:
+                    r = subprocess.run(["systemctl", "is-enabled", u],
+                                       capture_output=True, text=True)
+                    state = r.stdout.strip()
+                    if want and state in ("disabled", "static", "masked", ""):
+                        bad.append(f"{u} (config says enabled, unit is {state or 'unknown'})")
+                if bad:
+                    return ("WARN", "; ".join(bad),
+                            "systemctl enable " + " ".join(b.split()[0] for b in bad))
+                return ("OK", "config & unit-enabled state agree", "")
+            except Exception as e:  # noqa: BLE001
+                return ("WARN", f"drift check skipped ({e})", "")
+        d.check("config<->units drift", _config_vs_unit_drift)
+
     print()
     if d.fails:
         print(red(f"   {d.fails} problem(s), {d.warns} warning(s) — run: setup.py repair"))
@@ -1288,7 +1713,7 @@ def cmd_doctor(args) -> int:
 
 def cmd_repair(args) -> int:
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = "pi"     # production-only: the wall always deploys to /etc/soc-display
     paths = resolve_paths(target)
     root = paths.get("soc_root", REPO)
     banner("SOC video-wall · repair")
@@ -1307,12 +1732,28 @@ def cmd_repair(args) -> int:
     if env.has_apt or _have("dnf") or _have("pacman") or _have("zypper") \
             or _have("apk") or _have("xbps-install"):
         if ask_bool("Install missing OS packages (runs install.sh --deps-only)?", True):
-            _run(["./install.sh", "--deps-only"] if env.is_root
-                 else ["sudo", "./install.sh", "--deps-only"])
+            installer = os.path.join(REPO, "install.sh")
+            _run(["bash", installer, "--deps-only"] if env.is_root
+                 else ["sudo", "bash", installer, "--deps-only"])
 
-    # 3) rbw
-    if not _have("rbw") and ask_bool("Install rbw via cargo (needs rust)?", False):
-        _run(["cargo", "install", "rbw"])
+    # 3) rbw  — production-only: rbw is the only vault backend, so a missing
+    # rbw means the wall will fail at vault.open(). On boxes without cargo the
+    # old "Install via cargo? [n]" default left the operator without a fix
+    # path; now point at the distro package when cargo is absent.
+    if not _have("rbw"):
+        if _have("cargo"):
+            if ask_bool("Install rbw via cargo (rust toolchain present)?", True):
+                _run(["cargo", "install", "rbw"])
+        else:
+            warn("rbw is not on PATH and cargo is absent. Install via your "
+                 "distro:")
+            note("  apt:     sudo apt install rbw")
+            note("  dnf:     sudo dnf install rbw")
+            note("  pacman:  sudo pacman -S rbw")
+            note("  zypper:  sudo zypper install rbw")
+            note("  apk:     sudo apk add rbw")
+            note("  cargo:   sudo apt install cargo && cargo install rbw")
+            note("Then re-run: sudo python3 setup.py repair")
 
     # 3b) sealed-secret dir + rbw pinentry (the no-plaintext-.env unlock path)
     soc_env = load_env_file(paths["soc_env"])
@@ -1370,36 +1811,68 @@ def cmd_repair(args) -> int:
 
 
 def cmd_install(args) -> int:
+    """The install tool: OS packages + services (install.sh), bring Vaultwarden up,
+    optionally seal the vault master now, then a health check. Panels + screen are
+    NOT configured here — the wall does that on first launch (./launch.sh). This is
+    the default action of `setup.py` on a terminal."""
     env = Env()
-    banner("SOC video-wall · install (full)")
-    note("Runs the OS installer, then the config wizard, then doctor.")
+    target = "pi"     # production-only: the wall always deploys to /etc/soc-display
+    paths = resolve_paths(target)
+    banner("SOC video-wall · install")
+    note("Installs the OS packages + services. The wall configures itself on first")
+    note("launch (screen preset + panels) — run ./launch.sh afterwards.")
     if not env.is_root:
         warn("the OS install needs root — you'll be prompted for sudo.")
+
+    has_pm = (env.has_apt or _have("dnf") or _have("pacman") or _have("zypper")
+              or _have("apk") or _have("xbps-install"))
+    fresh = getattr(args, "fresh", False)
     if ask_bool("Run the OS installer (install.sh) now?", True):
-        rc = _run(["./install.sh"] if env.is_root else ["sudo", "./install.sh"])
-        if rc not in (0, None):
-            err("install.sh failed — fix the error above, then re-run setup.py install")
-            return rc or 1
-    if ask_bool("Run the configuration wizard now?", True):
-        cmd_wizard(args)
-    note("Now: start Vaultwarden, create the account, then `setup.py creds` to store logins.")
+        if has_pm:
+            # Via `bash <abs path>` — never rely on the +x bit or cwd.
+            installer = os.path.join(REPO, "install.sh")
+            cmd = ["bash", installer] + (["--fresh"] if fresh else [])
+            rc = _run(cmd if env.is_root else ["sudo"] + cmd)
+            if rc not in (0, None):
+                err("install.sh failed — fix the error above, then re-run setup.py install")
+                return rc or 1
+        else:
+            note("no known package manager — skipping the OS install.")
+
+    soc_env = load_env_file(paths["soc_env"])
+    is_rbw = (soc_env or {}).get("SOC_VAULT_BACKEND", paths["default_backend"]) == "rbw"
+
+    # bring Vaultwarden up so the first-launch page (and an optional seal) can reach it
+    if is_rbw and _have("systemctl") and os.path.isdir("/run/systemd/system"):
+        if ask_bool("Start Vaultwarden now (systemctl start vaultwarden)?", target == "pi"):
+            _run(["systemctl", "start", "vaultwarden"] if env.is_root
+                 else ["sudo", "systemctl", "start", "vaultwarden"])
+
+    # Optional: seal the master now — the *install* half of the both/fallback
+    # policy. Skipping is fine: the first-launch setup page seals it instead.
+    if is_rbw and ask_bool("Seal the vault master password now? "
+                           "[No = seal on first launch instead]", False):
+        cmd_firstrun(args)
+
+    note("Next: run the wall with  ./launch.sh  (it configures itself on first run).")
     return cmd_doctor(args)
 
 
 def cmd_menu(args) -> int:
     """Interactive launcher — the default when run with no subcommand on a TTY."""
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = "pi"     # production-only: the wall always deploys to /etc/soc-display
     banner("SOC video-wall · setup")
-    print(f"   target   : {bold(target)}  "
-          f"({'Raspberry Pi / root' if target == 'pi' else 'dev workstation'})")
+    print(f"   target   : {bold(target)}  (Raspberry Pi / root)")
     print(f"   detected : root={env.is_root} apt={env.has_apt} pi={env.is_pi} "
           f"venv={env.has_venv} rbw={_have('rbw')}")
     options = [
-        ("deploy", "Deploy", "full automated install + configure + seal PIN + credentials"),
+        ("install", "Install", "OS packages + services (install.sh); then run ./launch.sh"),
+        ("firstboot", "First-time setup page", "configure screen + panels (+ seal) — the once-only app page"),
+        ("deploy", "Deploy (all-in-one)", "install + configure + seal PIN + credentials in one pass"),
         ("clean", "Clean deploy", "wipe generated config/state, then deploy fresh"),
         ("wizard", "Configure", "edit panels, vault, VPN, proxy (writes the config files)"),
-        ("first-run", "First-time setup", "generate the one-time PIN + seal the master password"),
+        ("first-run", "Seal PIN", "generate the one-time PIN + seal the master password"),
         ("doctor", "Diagnose", "check this install and report problems"),
         ("repair", "Repair", "install missing packages / venv / keys doctor flagged"),
         ("creds", "Credentials", "store panel / VPN / proxy logins in Vaultwarden"),
@@ -1428,7 +1901,8 @@ def cmd_menu(args) -> int:
     if choice == "clean":
         args.clean = True
         return cmd_deploy(args)
-    return {"deploy": cmd_deploy, "wizard": cmd_wizard, "doctor": cmd_doctor,
+    return {"install": cmd_install, "firstboot": cmd_firstboot,
+            "deploy": cmd_deploy, "wizard": cmd_wizard, "doctor": cmd_doctor,
             "repair": cmd_repair, "creds": cmd_creds,
             "first-run": cmd_firstrun}[choice](args)
 
@@ -1447,22 +1921,140 @@ def _unseal_master(secret_dir, prompt_label=None) -> str:
     return ask_secret(prompt_label) if prompt_label else ""
 
 
+_VW_SIGNUP_DROPIN = "/etc/systemd/system/vaultwarden.service.d/soc-signups.conf"
+
+
+def _vw_alive(url: str, timeout: float = 1.0) -> bool:
+    """True if Vaultwarden answers /alive at `url` within `timeout` seconds."""
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/alive", timeout=timeout) as r:
+            return getattr(r, "status", 200) == 200
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def _vw_wait(url: str, timeout: float = 30.0) -> bool:
+    """Block (with a small polling loop) until Vaultwarden answers /alive, or
+    timeout. Used after restarting the service so registration calls don't race
+    the listener coming back up."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _vw_alive(url, timeout=0.5):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _vw_signups_on() -> bool:
+    """Drop in a root-only override that flips SIGNUPS_ALLOWED=true and restart
+    Vaultwarden. Returns True if the drop-in is in place and the service came
+    back. Best-effort: a missing systemctl just means we can't auto-register
+    (the caller falls back to printing manual instructions)."""
+    if not _have("systemctl") or not os.path.isdir("/run/systemd/system"):
+        return False
+    try:
+        os.makedirs(os.path.dirname(_VW_SIGNUP_DROPIN), mode=0o755, exist_ok=True)
+        with open(_VW_SIGNUP_DROPIN, "w", encoding="utf-8") as fh:
+            fh.write("[Service]\nEnvironment=SIGNUPS_ALLOWED=true\n")
+        os.chmod(_VW_SIGNUP_DROPIN, 0o644)
+    except OSError as e:
+        err(f"could not write {_VW_SIGNUP_DROPIN} ({e}); skipping auto-register")
+        return False
+    _run(["systemctl", "daemon-reload"])
+    _run(["systemctl", "restart", "vaultwarden"])
+    return True
+
+
+def _vw_signups_off():
+    """Remove the transient SIGNUPS_ALLOWED drop-in and restart Vaultwarden so
+    the vault returns to its locked-down state. Idempotent."""
+    try:
+        os.remove(_VW_SIGNUP_DROPIN)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        warn(f"could not remove {_VW_SIGNUP_DROPIN} ({e}) — VAULT REMAINS OPEN; "
+             f"remove it by hand and 'systemctl restart vaultwarden'")
+        return
+    try:
+        os.rmdir(os.path.dirname(_VW_SIGNUP_DROPIN))
+    except OSError:
+        pass            # other drop-ins may exist; leave the dir
+    if _have("systemctl") and os.path.isdir("/run/systemd/system"):
+        _run(["systemctl", "daemon-reload"])
+        _run(["systemctl", "restart", "vaultwarden"])
+
+
+def _ensure_vw_account(url: str, email: str, master: str, dry: bool) -> bool:
+    """Make sure a Vaultwarden account exists for `email`/`master` at `url`.
+    Probes first; if missing, transiently enables signups, registers, then
+    reverts. Returns True if the account is usable when we leave. Idempotent
+    (a re-run with the right password just confirms existence)."""
+    sys.path.insert(0, os.path.join(REPO, "kiosk-host"))
+    try:
+        from host import vaultseed  # type: ignore
+    except Exception as e:                          # noqa: BLE001
+        warn(f"vaultseed unavailable ({e}) — cannot auto-register; register at "
+             f"{url}/#/login")
+        return False
+    if not vaultseed.available():
+        warn("'cryptography' is missing — cannot auto-register; install it or "
+             f"register at {url}/#/login")
+        return False
+    if not _vw_alive(url, timeout=2.0):
+        warn(f"Vaultwarden is not reachable at {url}/alive — start it first "
+             f"(systemctl start vaultwarden), then re-run setup.py first-run")
+        return False
+    try:
+        if vaultseed.account_exists(url, email, master):
+            ok(f"Vaultwarden account for '{email}' already exists ✓")
+            return True
+    except vaultseed.VaultSeedError as e:
+        warn(f"could not probe for an existing account ({e}); skipping auto-register")
+        return False
+    note(f"no Vaultwarden account for '{email}' — registering automatically.")
+    if dry:
+        print(yellow(f"   [dry-run] would flip SIGNUPS_ALLOWED=true, register "
+                     f"'{email}', then revert"))
+        return False
+    if not _vw_signups_on():
+        note("could not enable signups via systemd — register manually instead:")
+        note(f"  systemctl edit vaultwarden  ->  Environment=SIGNUPS_ALLOWED=true")
+        note(f"  systemctl restart vaultwarden ; open {url}/#/login ; revert.")
+        return False
+    try:
+        if not _vw_wait(url, timeout=30):
+            err("Vaultwarden did not come back after the signup-enabling restart")
+            return False
+        try:
+            vaultseed.register_account(url, email, master)
+            ok(f"registered Vaultwarden account '{email}' ✓")
+            return True
+        except vaultseed.VaultSeedError as e:
+            err(f"registration failed: {e}")
+            return False
+    finally:
+        _vw_signups_off()
+        if _vw_wait(url, timeout=30):
+            ok("Vaultwarden restarted with signups OFF again")
+        else:
+            warn("Vaultwarden did not come back after disabling signups — check "
+                 "'systemctl status vaultwarden'")
+
+
 def cmd_firstrun(args) -> int:
     """First-time setup: generate a one-time PIN, seal the vault master password
     host-bound (no plaintext .env), point rbw at the unsealing pinentry. Asks
     before overwriting an existing seal; re-runnable to change the password."""
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = "pi"     # production-only: the wall always deploys to /etc/soc-display
     paths = resolve_paths(target)
     soc_env = load_env_file(paths["soc_env"])
     banner("SOC video-wall · first-time setup (PIN + seal)")
     plaintext = soc_env.get("SOC_VAULT_PASSWORD", "")
-    backend = soc_env.get("SOC_VAULT_BACKEND", paths["default_backend"])
-    # A dev backend needs no seal — UNLESS a plaintext master is still sitting in
-    # soc.env, in which case we seal it and scrub the line regardless of backend.
-    if backend != "rbw" and not plaintext:
-        note("vault backend is 'dev' — no sealing needed (dev reads the JSON vault).")
-        return 0
     sys.path.insert(0, os.path.join(REPO, "kiosk-host"))
     try:
         from host import secretstore  # type: ignore
@@ -1502,6 +2094,27 @@ def cmd_firstrun(args) -> int:
                 # any plaintext gets scrubbed) — never lock the wall out.
                 if secretstore.unseal(sd) != master:
                     raise secretstore.SecretStoreError("seal did not unseal to the same value")
+                # Chown sealed files to the wall user. first-run runs as root,
+                # so the files end up root:root 0600 — the soc user that runs
+                # the wall cannot read them, and rbw unlock silently dies with
+                # 'permission denied'. Caught during the GUI bring-up: a wall
+                # that boots, looks sealed, but cannot self-unlock the vault.
+                wall_user = soc_env.get("SOC_WALL_USER", "soc")
+                try:
+                    import pwd
+                    pw = pwd.getpwnam(wall_user)
+                    for fn in ("host.key", "master.enc", "pin.enc", "pin.hash"):
+                        p = os.path.join(sd, fn)
+                        if os.path.exists(p):
+                            os.chown(p, pw.pw_uid, pw.pw_gid)
+                            os.chmod(p, 0o600)
+                except KeyError:
+                    warn(f"wall user '{wall_user}' not found — sealed files "
+                         f"left root-owned; chown them after creating the user")
+                except OSError as e:
+                    warn(f"could not chown sealed files to {wall_user} ({e}) — "
+                         f"the wall will fail to unseal until: "
+                         f"sudo chown {wall_user}:{wall_user} {sd}/*")
             except secretstore.SecretStoreError as e:
                 err(f"could not seal: {e}")
                 return 1
@@ -1519,14 +2132,48 @@ def cmd_firstrun(args) -> int:
     else:
         note("kept the existing sealed secret.")
 
-    # point rbw at the unsealing pinentry + bake email/url into rbw's own config
+    # Ensure a Vaultwarden account exists for this email + master. Probes first
+    # (idempotent on re-runs); if missing AND we are root AND vaultwarden is up,
+    # transiently flips SIGNUPS_ALLOWED=true via a systemd drop-in, registers,
+    # then reverts. The whole chain ("install with no panels → configure at the
+    # glass → save creds from the Credentials tab") is dead without this — see
+    # configwin.py _save_cred / vaultseed.upsert_login.
+    vw_url = soc_env.get("SOC_VAULT_URL", "http://127.0.0.1:8222")
+    vw_email = soc_env.get("SOC_VAULT_EMAIL", "")
+    # `master` is scrubbed (= "") after sealing — re-prompt only if we need it
+    # for registration AND we didn't already have it. Common case: just sealed,
+    # so we still have the value in-scope only via secretstore.unseal.
+    try:
+        from host import secretstore  # type: ignore
+        register_master = secretstore.unseal(sd) if secretstore.is_sealed(sd) else ""
+    except Exception:                                # noqa: BLE001
+        register_master = ""
+    if vw_email and register_master:
+        _ensure_vw_account(vw_url, vw_email, register_master, args.dry_run)
+    elif not vw_email:
+        warn("SOC_VAULT_EMAIL is empty in soc.env — cannot auto-register the "
+             "Vaultwarden account (re-run setup.py wizard to set it)")
+    register_master = ""                              # scrub
+
+    # Point rbw at the unsealing pinentry + bake email/url into rbw's own
+    # config — for ROOT (running setup) AND for the wall user (kiosk_user).
+    # Without the wall-user step the wall booted as `soc`, found a default
+    # rbw config with pinentry=pinentry, and got stuck on a TTY-pinentry
+    # error. Baked after this session's bring-up flushed out the gap.
     if _have("rbw"):
-        if soc_env.get("SOC_VAULT_EMAIL"):
-            _run(["rbw", "config", "set", "email", soc_env["SOC_VAULT_EMAIL"]])
-        if soc_env.get("SOC_VAULT_URL"):
-            _run(["rbw", "config", "set", "base_url", soc_env["SOC_VAULT_URL"]])
-        _run(["rbw", "config", "set", "pinentry", paths["pinentry"]])
-        ok("rbw configured (email / base_url / pinentry -> pinentry-vault.py)")
+        wall_user = soc_env.get("SOC_WALL_USER", "soc")
+        for as_user in (None, wall_user):
+            prefix = (["sudo", "-u", as_user]
+                      if as_user and not args.dry_run else [])
+            if soc_env.get("SOC_VAULT_EMAIL"):
+                _run(prefix + ["rbw", "config", "set", "email",
+                               soc_env["SOC_VAULT_EMAIL"]])
+            if soc_env.get("SOC_VAULT_URL"):
+                _run(prefix + ["rbw", "config", "set", "base_url",
+                               soc_env["SOC_VAULT_URL"]])
+            _run(prefix + ["rbw", "config", "set", "pinentry", paths["pinentry"]])
+            ok(f"rbw configured for {as_user or 'root'} "
+               f"(email / base_url / pinentry -> pinentry-vault.py)")
     else:
         warn("rbw is not on PATH — install it, then re-run first-run to configure it")
 
@@ -1554,6 +2201,76 @@ def cmd_firstrun(args) -> int:
                             set_kv=updates, mode=paths["env_mode"])
                 ok(f"removed plaintext SOC_VAULT_PASSWORD from {paths['soc_env']} "
                    f"(master is now host-sealed)")
+    return 0
+
+
+def _secret_is_sealed(sd: str) -> bool:
+    """True if a host-bound master is already sealed in `sd`. Never raises — a
+    missing 'cryptography' or secret store just means 'not sealed yet'."""
+    sys.path.insert(0, os.path.join(REPO, "kiosk-host"))
+    try:
+        from host import secretstore  # type: ignore
+        return secretstore.is_sealed(sd)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def cmd_firstboot(args) -> int:
+    """First-launch setup page (runs once). This is what the *app* shows the very
+    first time the wall comes up — in a terminal (launch.sh) or on tty1 (the
+    soc-firstboot oneshot). It configures the wall (screen preset + panels), seals
+    the vault master under a one-time PIN if the installer did not already, offers
+    to push the config + logins into Vaultwarden, then drops the 'configured'
+    marker so every later boot launches straight to the wall. Re-run it with
+    `launch.sh --reconfigure` (or by removing the marker)."""
+    env = Env()
+    target = "pi"     # production-only: the wall always deploys to /etc/soc-display
+    paths = resolve_paths(target)
+    banner("SOC video-wall · first-time setup")
+    if target == "pi" and not env.is_root:
+        err("the first-time setup writes to /etc/soc-display — re-run as root (sudo).")
+        return 1
+    note("One-time setup. It runs again only with `launch.sh --reconfigure`")
+    note("(or if the marker is removed).")
+
+    # 1) configuration wizard — writes panels.yaml / soc.env / soc-wall.service.
+    #    Reuse the deploy hand-off flag so the wizard skips its own post-actions.
+    args._in_deploy = True
+    try:
+        rc = cmd_wizard(args)
+    finally:
+        args._in_deploy = False
+    if rc not in (0, None):
+        err("setup did not complete — not marking the host configured.")
+        return rc or 1
+
+    cfg = _LAST_CFG or load_yaml(paths["panels_installed"]) or {}
+    soc_env = _LAST_SOC_ENV or load_env_file(paths["soc_env"])
+    is_rbw = (soc_env or {}).get("SOC_VAULT_BACKEND") == "rbw"
+
+    # 2) seal the master under a one-time PIN — the *fallback* half of the
+    #    both/fallback policy: only when the installer did not already seal it.
+    if is_rbw:
+        sd = (soc_env or {}).get("SOC_SECRET_DIR") or paths["secret_dir"]
+        if _secret_is_sealed(sd):
+            note("vault master already sealed (done at install) — keeping it.")
+        elif ask_bool("Seal the vault master password now (one-time PIN)?", True):
+            cmd_firstrun(args)
+            soc_env = load_env_file(paths["soc_env"])
+
+    # 3) push the config + store the logins (rbw only; each asks first)
+    if is_rbw:
+        push_config_to_vault(soc_env, cfg, paths, args.dry_run)
+    if cfg.get("panels"):
+        store_credentials(soc_env, cfg, args.dry_run)
+
+    # 4) mark configured so the app launches directly from now on
+    mark_configured(paths, args.dry_run)
+    banner("Setup complete")
+    if target == "pi":
+        note("The wall starts automatically on tty1. Re-run: launch.sh --reconfigure")
+    else:
+        note("Run the wall with  ./launch.sh  (re-run setup: ./launch.sh --reconfigure)")
     return 0
 
 
@@ -1597,13 +2314,11 @@ def clean_state(paths, args) -> None:
     """Remove generated config + runtime state for a fresh deploy (files are
     backed up first). Does NOT remove installed OS packages or Vaultwarden data."""
     banner("Clean (reset generated state)")
-    state = os.environ.get("SOC_STATE_DIR") or (
-        "/var/lib/soc-wall" if paths["mode"] == "pi"
-        else os.path.join(REPO, "dev", "run", "state"))
+    state = os.environ.get("SOC_STATE_DIR") or "/var/lib/soc-wall"
     targets = [paths["panels_out"], paths["soc_env"],
                paths["secret_dir"], state]
-    if paths["mode"] == "dev":
-        targets.append(os.path.join(REPO, "dev", "run"))
+    if paths.get("configured_marker"):
+        targets.append(paths["configured_marker"])
     # Path-prefix allowlist: clean_state derives `state` (and friends) partly from
     # the environment (SOC_STATE_DIR), so an env-poisoned SOC_STATE_DIR=/etc could
     # otherwise offer a destructive rmtree of a system dir. Only ever touch paths
@@ -1614,7 +2329,6 @@ def clean_state(paths, args) -> None:
         os.path.dirname(paths.get("panels_out", "")),
         paths.get("secret_dir", ""),
         "/var/lib/soc-wall",
-        os.path.join(REPO, "dev"),
         os.path.join(REPO, "config"),
     ) if p]
 
@@ -1662,7 +2376,7 @@ def cmd_deploy(args) -> int:
     seal PIN -> push config + creds -> health check. Each step asks first, so it
     is safe to run (and re-run) interactively."""
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = "pi"     # production-only: the wall always deploys to /etc/soc-display
     paths = resolve_paths(target)
     banner("SOC video-wall · deploy (end to end)")
     if getattr(args, "clean", False):
@@ -1693,7 +2407,8 @@ def cmd_deploy(args) -> int:
     else:
         run_install = ask_bool("Step 1/6 — install OS packages + services (install.sh)?", True)
     if run_install and has_pm:
-        cmd = ["./install.sh"] + (["--fresh"] if fresh else [])
+        installer = os.path.join(REPO, "install.sh")
+        cmd = ["bash", installer] + (["--fresh"] if fresh else [])
         rc = _run(cmd if env.is_root else ["sudo"] + cmd)
         if rc not in (0, None):
             err("install.sh failed — fix the error above, then re-run deploy")
@@ -1733,16 +2448,12 @@ def cmd_deploy(args) -> int:
         else:
             note("Step 3/6 — no systemd; start Vaultwarden via your init manager.")
         note("Create the kiosk account in the web vault (signups on) if not done yet.")
-    else:
-        note("Step 3/6 — dev vault backend; no Vaultwarden server needed.")
 
     # 4) first-time setup: seal the master password under a one-time PIN
     if is_rbw:
         if ask_bool("Step 4/6 — first-time setup: seal the master password (PIN)?", True):
             cmd_firstrun(args)
             soc_env = load_env_file(paths["soc_env"])
-    else:
-        note("Step 4/6 — dev backend; no PIN / seal needed.")
 
     # 5) push the config into the vault + store the logins
     if is_rbw:
@@ -1758,16 +2469,13 @@ def cmd_deploy(args) -> int:
     rc = cmd_doctor(args)
 
     banner("Deploy complete")
-    if target == "pi":
-        note("If doctor is clean, reboot to bring up the wall:  systemctl reboot")
-    else:
-        note("Dev: launch the wall with  make dev   (headless check:  make verify)")
+    note("If doctor is clean, reboot to bring up the wall:  systemctl reboot")
     return rc
 
 
 def cmd_creds(args) -> int:
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = "pi"     # production-only: the wall always deploys to /etc/soc-display
     paths = resolve_paths(target)
     soc_env = load_env_file(paths["soc_env"])
     cfg = load_yaml(paths["panels_installed"]) or {}
@@ -1781,35 +2489,23 @@ def cmd_creds(args) -> int:
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def resolve_paths(target: str) -> dict:
-    if target == "pi":
-        return dict(
-            mode="pi",
-            panels_out="/etc/soc-display/panels.yaml",
-            panels_installed="/etc/soc-display/panels.yaml",
-            soc_env="/etc/soc-display/soc.env",
-            wall_unit="/etc/systemd/system/soc-wall.service",
-            soc_root="/opt/soc-display",
-            pinentry="/opt/soc-display/scripts/pinentry-vault.py",
-            secret_dir="/etc/soc-display/secret",
-            config_vault_item="SOC Wall Config",
-            inject_tmpl="/opt/soc-display/inject/login.js.tmpl",
-            default_backend="rbw",
-            panels_mode=0o644, env_mode=0o640,
-        )
+def resolve_paths(target: str = "pi") -> dict:
+    # Production-only: the wall always deploys to /etc/soc-display + /opt/soc-display.
+    # (`target` is kept for call/test compatibility; there is no dev target.)
     return dict(
-        mode="dev",
-        panels_out=os.path.join(REPO, "config", "panels.local.yaml"),
-        panels_installed=os.path.join(REPO, "config", "panels.local.yaml"),
-        soc_env=os.path.join(REPO, ".env"),
-        wall_unit=os.path.join(REPO, "dev", "run", "soc-wall.service"),
-        soc_root=REPO,
-        pinentry=os.path.join(REPO, "scripts", "pinentry-vault.py"),
-        secret_dir=os.path.join(REPO, "dev", "run", "secret"),
+        mode="pi",
+        panels_out="/etc/soc-display/panels.yaml",
+        panels_installed="/etc/soc-display/panels.yaml",
+        soc_env="/etc/soc-display/soc.env",
+        wall_unit="/etc/systemd/system/soc-wall.service",
+        soc_root="/opt/soc-display",
+        pinentry="/opt/soc-display/scripts/pinentry-vault.py",
+        secret_dir="/etc/soc-display/secret",
+        configured_marker="/etc/soc-display/.configured",
         config_vault_item="SOC Wall Config",
-        inject_tmpl=os.path.join(REPO, "inject", "login.js.tmpl"),
-        default_backend="dev",
-        panels_mode=0o644, env_mode=0o600,
+        inject_tmpl="/opt/soc-display/inject/login.js.tmpl",
+        default_backend="rbw",
+        panels_mode=0o644, env_mode=0o640,
     )
 
 
@@ -1818,19 +2514,19 @@ def main():
     ap = argparse.ArgumentParser(
         description="Setup, diagnose, repair + install the SOC video wall.")
     ap.add_argument("command", nargs="?", default=None,
-                    choices=["menu", "deploy", "first-run", "wizard", "doctor",
-                             "repair", "install", "creds"],
-                    help="menu (default on a TTY) | deploy (full automated "
-                         "deploy) | first-run (seal the one-time PIN) | wizard "
-                         "(config) | doctor (diagnose) | repair (fix/install "
-                         "missing) | install (OS install + wizard) | creds (logins)")
+                    choices=["menu", "install", "firstboot", "deploy", "first-run",
+                             "wizard", "doctor", "repair", "creds"],
+                    help="install (default on a TTY: OS packages + services) | "
+                         "menu (all actions) | firstboot (the once-only first-launch "
+                         "setup page) | deploy (full automated deploy) | first-run "
+                         "(seal the one-time PIN) | wizard (config) | doctor "
+                         "(diagnose) | repair (fix/install missing) | creds (logins)")
     ap.add_argument("--clean", action="store_true",
                     help="deploy: wipe generated config/state first (fresh deploy)")
     ap.add_argument("--fresh", action="store_true",
                     help="deploy: force a full OS reinstall even if already installed")
     ap.add_argument("--dry-run", action="store_true", help="show what would be written; write nothing")
     ap.add_argument("--defaults", action="store_true", help="accept every default (non-interactive)")
-    ap.add_argument("--target", choices=["pi", "dev"], help="where to write (default: pi if root, else dev)")
     ap.add_argument("--section", choices=["all", "display", "panels", "tunnel", "vpn", "proxy", "vault", "server"],
                     default="all", help="run just one section (wizard)")
     args = ap.parse_args()
@@ -1838,36 +2534,37 @@ def main():
 
     cmd = args.command
     if cmd is None:
-        # No subcommand: show the interactive menu on a real terminal; fall back
-        # to the wizard for piped / non-interactive / scripted runs so --defaults
-        # and answer-piping keep working unchanged.
+        # No subcommand: setup.py is the install tool, so a real terminal lands on
+        # the install flow (it asks before doing anything; `setup.py menu` lists
+        # every action). Piped / non-interactive / scripted runs fall back to the
+        # wizard so --defaults and answer-piping keep working unchanged.
         interactive = (sys.stdin.isatty() and sys.stdout.isatty()
                        and not ASSUME_DEFAULTS and not args.dry_run
                        and args.section == "all")
-        cmd = "menu" if interactive else "wizard"
+        cmd = "install" if interactive else "wizard"
 
     dispatch = {
-        "menu": cmd_menu, "deploy": cmd_deploy, "first-run": cmd_firstrun,
-        "doctor": cmd_doctor, "repair": cmd_repair, "install": cmd_install,
-        "creds": cmd_creds, "wizard": cmd_wizard,
+        "menu": cmd_menu, "install": cmd_install, "firstboot": cmd_firstboot,
+        "deploy": cmd_deploy, "first-run": cmd_firstrun, "doctor": cmd_doctor,
+        "repair": cmd_repair, "creds": cmd_creds, "wizard": cmd_wizard,
     }
     return dispatch[cmd](args)
 
 
 def cmd_wizard(args) -> int:
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = "pi"     # production-only: the wall always deploys to /etc/soc-display
     paths = resolve_paths(target)
 
     banner("SOC video-wall · interactive setup")
-    print(f"   target   : {bold(target)}  ({'Raspberry Pi / root' if target == 'pi' else 'dev workstation'})")
+    print(f"   target   : {bold(target)}  (Raspberry Pi / root)")
     print(f"   panels   : {paths['panels_out']}")
     print(f"   soc.env  : {paths['soc_env']}")
     print(f"   detected : root={env.is_root} apt={env.has_apt} pi={env.is_pi} venv={env.has_venv}")
     if args.dry_run:
         print(yellow("   mode     : DRY RUN — no files will be written"))
     if target == "pi" and not env.is_root:
-        warn("writing to /etc/soc-display needs root; re-run with sudo, or use --target dev")
+        warn("writing to /etc/soc-display needs root; re-run with sudo")
 
     prev = load_yaml(paths["panels_out"])
     if prev:
@@ -1894,8 +2591,15 @@ def cmd_wizard(args) -> int:
           f"VPN {'ON' if cfg['vpn'].get('enabled') else 'off'}; "
           f"proxy {'ON' if cfg.get('proxy', {}).get('enabled') else 'off'}")
     for p in cfg["panels"]:
-        tgt = p.get("url") or f"tunnel:{p.get('tunnel', {}).get('local_port')}"
-        print(dim(f"     - {p['id']} [{p['engine']}/{p['mode']}] {tgt}  <- {p['vault_item']}"))
+        if p.get("url"):
+            tgt = p["url"]
+        elif p.get("tunnel"):
+            tgt = f"tunnel:{p['tunnel'].get('local_port')}"
+        else:
+            tgt = "(blank tile — configure at the glass)"
+        vi = p.get("vault_item")
+        print(dim(f"     - {p['id']} [{p['engine']}/{p['mode']}] {tgt}"
+                  + (f"  <- {vi}" if vi else "")))
     if not ask_bool("Write these files now?", True):
         err("nothing written")
         return 1

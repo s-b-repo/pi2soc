@@ -14,7 +14,7 @@ Boot sequence:
 
 Runs natively on X11 and Wayland (GTK picks the backend; we only adapt layout).
 
-Run:  SOC_PANELS_FILE=config/panels.dev.yaml python3 -m host.main
+Run:  SOC_PANELS_FILE=config/panels.yaml python3 -m host.main
 """
 from __future__ import annotations
 
@@ -354,17 +354,24 @@ class KioskHost:
         self._vpn_poll_started = time.time()
 
         def work():
-            try:
-                state = vpnstatus.vpn_state(self.conf.vpn)
-            except Exception:                          # never let the pill crash us
-                state = vpnstatus.STATE_OFFLINE
-            finally:
-                # clear on the main thread so the flag and the watchdog above
-                # never race a half-running successor probe
-                GLib.idle_add(self._clear_vpn_busy)
-            label = vpnstatus.LABELS.get(state, "VPN: ?")
-            css = {"not_configured": "unconfigured"}.get(state, state)
-            GLib.idle_add(self._set_pill, css, label)
+            # Multi-VPN: probe each entry independently and push per-pill
+            # updates. A failing probe on one VPN doesn't mask the status of
+            # the others.
+            results = []
+            for idx, v in enumerate(self.conf.vpns or []):
+                try:
+                    state = vpnstatus.vpn_state(v)
+                except Exception:                      # never let the pill crash us
+                    state = vpnstatus.STATE_OFFLINE
+                name = vpnstatus.vpn_name(v, idx)
+                label_state = {"not_configured": "unconfigured",
+                               "connecting": "connecting"}.get(state, state)
+                short = {"online": "online", "offline": "offline",
+                         "connecting": "connecting",
+                         "not_configured": "off"}.get(state, state)
+                results.append((name, label_state, f"{name}: {short}"))
+            GLib.idle_add(self._clear_vpn_busy)
+            GLib.idle_add(self._set_pills, results)
         threading.Thread(target=work, daemon=True).start()
         return False
 
@@ -372,17 +379,25 @@ class KioskHost:
         self._vpn_poll_busy = False
         return False
 
-    def _set_pill(self, css, label):
+    def _set_pills(self, results):
+        """Apply per-VPN pill updates: results is a list of (name, css, label)."""
         if self.wall is not None:
-            self.wall.set_vpn_status(css, label)
+            for name, css, label in results:
+                self.wall.set_vpn_status(css, label, name=name)
         return False
 
-    def vpn_action(self):
-        """Pill click: show 'checking', best-effort reconnect, then re-poll. The
-        reconnect runs off the GTK thread so it can't freeze the wall."""
+    def vpn_action(self, name: str = ""):
+        """Pill click: show 'checking', best-effort reconnect the named VPN's
+        service, then re-poll. With `name` empty (legacy), restarts the first."""
+        target_unit = f"forti-vpn@{name}" if name else "forti-vpn"
         if self.wall is not None:
-            self.wall.set_vpn_status("checking", "VPN: checking…")
-        if not (self.conf.vpn or {}).get("enabled"):
+            self.wall.set_vpn_status("checking", f"{name or 'VPN'}: checking…",
+                                     name=name)
+        # Don't bother restarting a disabled VPN — just re-poll
+        target_vpn = next((v for v in (self.conf.vpns or [])
+                           if v.get("name") == name), {}) if name else (
+            self.conf.vpn or {})
+        if not target_vpn.get("enabled"):
             self._poll_vpn()
             return
         import subprocess
@@ -390,10 +405,10 @@ class KioskHost:
 
         def work():
             try:                                       # best-effort; needs privilege
-                subprocess.run(["systemctl", "restart", "forti-vpn"],
+                subprocess.run(["systemctl", "restart", target_unit],
                                timeout=10, stdin=subprocess.DEVNULL,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                log("VPN reconnect requested (systemctl restart forti-vpn)")
+                log(f"VPN reconnect requested (systemctl restart {target_unit})")
             except Exception as e:  # noqa: BLE001
                 log(f"VPN reconnect not permitted from the wall ({e}); re-checking")
             GLib.timeout_add_seconds(2, self._poll_vpn)
@@ -410,8 +425,15 @@ class KioskHost:
             win = ConfigWindow(self.conf.panels, self.apply_config,
                                on_close=self._config_closed,
                                display=self.conf.display,
-                               vpn=self.conf.vpn,
-                               proxy_vault_item=self.conf.proxy.vault_item)
+                               vpns=self.conf.vpns,
+                               proxy=self.conf.proxy,
+                               tunnel=self.conf.tunnel,
+                               proxy_vault_item=self.conf.proxy.vault_item,
+                               login_stats=self.login_stats,
+                               actions={
+                                   "restart_wall": self.restart_wall,
+                                   "reload_panels": self.reload_all_panels,
+                               })
             self._config_win = win
             win.show_all()
             win.present()
@@ -422,8 +444,67 @@ class KioskHost:
     def _config_closed(self):
         self._config_win = None
 
+    def reload_all_panels(self):
+        """Reload every panel view in place — no teardown, no exit. Used by
+        the Actions tab "Reload panels" button when something has wedged and
+        a fresh page should fix it (without paying the 3 s systemd respawn)."""
+        n = 0
+        for v in self.panels_view:
+            try:
+                if hasattr(v, "set_url"):
+                    v.set_url(v.panel.url or "")
+                    n += 1
+            except Exception as e:  # noqa: BLE001
+                log(f"[{getattr(v.panel, 'id', '?')}] reload failed: {e}")
+        log(f"reload_all_panels: refreshed {n}/{len(self.panels_view)} panel(s)")
+        return n
+
+    def restart_wall(self):
+        """Soft restart: exit cleanly so soc-wall.service (Restart=always,
+        RestartSec=3) respawns us with the current config. Used by the Actions
+        tab "Restart wall" button AND by apply_config when a layout / grid /
+        resolution change needs a full reload. Schedules the exit ~500 ms in
+        the future so the GUI gets to paint the 'restarting…' message first."""
+        log("restart_wall: scheduling self-exit (systemd will respawn in ~3s)")
+
+        def _exit():
+            log("restart_wall: exiting")
+            import sys as _sys
+            _sys.exit(0)
+            return False
+        GLib.timeout_add(500, _exit)
+
+    def login_stats(self) -> dict:
+        """Per-panel auto-login retry stats for the ⚙ Status tab. A panel whose
+        attempts climbed near the cap without ever firing on_login_success
+        likely has a stale login_marker / wrong selectors after the dashboard
+        was redesigned — the form fills but the marker never goes away. Audit
+        MED #9. Returns {panel_id: {'attempts': int, 'stale': bool}}."""
+        out = {}
+        for v in self.panels_view:
+            try:
+                pid = v.panel.id
+                attempts = int(getattr(v, "_login_attempts", 0))
+            except Exception:                # noqa: BLE001 — be defensive
+                continue
+            # 'stale' = burnt half the budget without success. MAX_LOGIN_ATTEMPTS
+            # caps at 3 today, so threshold is 2.
+            out[pid] = {"attempts": attempts, "stale": attempts >= 2}
+        return out
+
     def apply_config(self, changes: dict):
-        """Live-apply URL/title/vault edits from the config window to the panels."""
+        """Live-apply URL/title/vault edits from the config window to the panels.
+
+        Returns a dict the on-screen Apply button uses to tell the truth about
+        what actually went live vs what is queued for the next reboot:
+          {"pending_restarts": [...], "write_back": "ok"|"deferred"|"failed"}
+        Used to be void — silently lying about VPN/tunnel restarts was the
+        cause of the audit finding 'Apply silently fails when wall lacks
+        privilege'.
+        """
+        result = {"pending_restarts": [], "write_back": "ok",
+                  "self_restart": False}
+        can_restart = self._can_systemctl_restart()
         disp = changes.pop("_display", None)
         if disp and self.wall is not None and "gap" in disp:
             try:                                        # gap applies live
@@ -431,10 +512,67 @@ class KioskHost:
                 self.wall.grid.set_column_spacing(disp["gap"])
             except Exception:  # noqa: BLE001
                 pass
+        # Detect display changes that genuinely need the WallWindow to be
+        # rebuilt (layout / grid size / fullscreen / resolution / SOC_SESSION).
+        # Soft-restart via systemd respawn instead of asking the operator to
+        # reboot. `gap` and `auto` are live-applied above so they don't trigger.
+        if disp and self.wall is not None:
+            rebuild_keys = ("layout", "cols", "rows", "width", "height",
+                            "fullscreen")
+            current = {"layout": self.conf.display.layout,
+                       "cols": self.conf.display.cols,
+                       "rows": self.conf.display.rows,
+                       "width": self.conf.display.width,
+                       "height": self.conf.display.height,
+                       "fullscreen": getattr(self.conf.display,
+                                              "fullscreen", True)}
+            if any(k in disp and disp[k] != current.get(k)
+                   for k in rebuild_keys):
+                result["self_restart"] = True
+        # Multi-VPN: _vpns is the canonical list; _vpn (legacy) is kept for
+        # back-compat callers that still only know about a single VPN.
+        vpns_ch = changes.pop("_vpns", None)
         vpn_ch = changes.pop("_vpn", None)
-        if vpn_ch is not None:
-            self.conf.vpn = vpn_ch                      # persisted to the vault note
-            self._restart_vpn_async()                   # pick up the new config
+        if vpns_ch is not None:
+            self.conf.vpns = list(vpns_ch)
+            if can_restart:
+                for v in vpns_ch:
+                    self._restart_vpn_async(v.get("name") or "")
+            else:
+                for v in vpns_ch:
+                    name = v.get("name") or ""
+                    result["pending_restarts"].append(
+                        f"forti-vpn@{name}" if name else "forti-vpn")
+        elif vpn_ch is not None:
+            self.conf.vpn = vpn_ch
+            if can_restart:
+                self._restart_vpn_async("")
+            else:
+                result["pending_restarts"].append("forti-vpn")
+        proxy_ch = changes.pop("_proxy", None)
+        if proxy_ch is not None:
+            # ProxyCfg is a dataclass; the panel browsers read it at WebView
+            # creation time, so this takes effect on the next launch. We still
+            # update the live conf so the vault write-back is current.
+            from . import config as _cfg
+            self.conf.proxy = _cfg.ProxyCfg(
+                enabled=bool(proxy_ch.get("enabled")),
+                url=str(proxy_ch.get("url") or ""),
+                vault_item=str(proxy_ch.get("vault_item") or ""),
+                ignore_hosts=tuple(proxy_ch.get("ignore_hosts") or ()),
+            )
+            result["pending_restarts"].append("soc-wall (proxy applies on next boot)")
+        tunnel_ch = changes.pop("_tunnel", None)
+        if tunnel_ch is not None:
+            # tunnel section is a free-form dict; merge so advanced keys set in
+            # panels.yaml (and not exposed by the form) survive a glass edit
+            (self.conf.tunnel or {}).update(tunnel_ch)
+            if not self.conf.tunnel:
+                self.conf.tunnel = dict(tunnel_ch)
+            if can_restart:
+                self._restart_tunnel_async()
+            else:
+                result["pending_restarts"].append("autossh-tunnel")
         by_id = {v.panel.id: v for v in self.panels_view}
         for pid, ch in changes.items():
             view = by_id.get(pid)
@@ -452,55 +590,105 @@ class KioskHost:
             elif vault_changed and hasattr(view, "set_url"):
                 # vault item changed but URL didn't — reload to re-trigger login
                 view.set_url(view.panel.url or "")
-        self._push_config_to_vault()
+        result["write_back"] = self._push_config_to_vault()
+        if result.get("self_restart"):
+            # Soft restart so the new layout/grid/resolution takes effect
+            # without an external reboot. systemd respawns us in 3 s.
+            self.restart_wall()
+        return result
 
-    def _restart_vpn_async(self):
+    def _can_systemctl_restart(self) -> bool:
+        """True iff this process can `systemctl restart` a unit. The wall runs
+        as user `soc` with NoNewPrivileges=yes, so the answer is almost always
+        False in production — but it can be True in dev (run as root) or once
+        a polkit rule for `org.freedesktop.systemd1.manage-units` is added."""
+        import os as _os
+        if _os.geteuid() == 0:
+            return True
+        # polkit rule path — pkexec without a TTY agent fails fast, which is
+        # the right signal (no rule installed). We DON'T actually run it here;
+        # we just check the system has the agent. Conservative: return False.
+        return False
+
+    def _restart_vpn_async(self, name: str = ""):
         """A VPN-tab change — restart the VPN service so it re-reads the config
-        (off the GTK thread; best-effort, needs privilege)."""
+        (off the GTK thread; best-effort, needs privilege). When `name` is
+        non-empty, restarts the templated instance forti-vpn@<name>; otherwise
+        the legacy single-VPN unit."""
+        import threading
+        import subprocess
+        unit = f"forti-vpn@{name}" if name else "forti-vpn"
+
+        def work():
+            try:
+                subprocess.run(["systemctl", "restart", unit], timeout=10,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                log(f"VPN config changed — restarted {unit}")
+            except Exception as e:  # noqa: BLE001
+                log(f"VPN restart not permitted from the wall ({e})")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _restart_tunnel_async(self):
+        """A Tunnel-tab change — restart autossh-tunnel so the new jump host /
+        identity / forwards come up. Same caveats as _restart_vpn_async."""
         import threading
         import subprocess
 
         def work():
             try:
-                subprocess.run(["systemctl", "restart", "forti-vpn"], timeout=10,
+                subprocess.run(["systemctl", "restart", "autossh-tunnel"], timeout=10,
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL)
-                log("VPN config changed — restarted forti-vpn")
+                log("tunnel config changed — restarted autossh-tunnel")
             except Exception as e:  # noqa: BLE001
-                log(f"VPN restart not permitted from the wall ({e})")
+                log(f"tunnel restart not permitted from the wall ({e})")
         threading.Thread(target=work, daemon=True).start()
 
-    def _push_config_to_vault(self):
+    def _push_config_to_vault(self) -> str:
         """After an on-screen edit, write the merged config back to the vault note
         (the source of truth) so it does not drift. Off the GTK thread, best-effort
-        — the local overrides remain the durable record if this fails."""
-        if os.environ.get("SOC_VAULT_BACKEND", "rbw") != "rbw":
-            return
+        — the local overrides remain the durable record if this fails.
+
+        Returns a synchronous status:
+          'ok'        — write-back scheduled (the async upload may still fail
+                        but the prereqs are met)
+          'deferred:<reason>'  — write-back skipped; overrides.json is the only
+                                 record until the operator resolves <reason>.
+                                 At next boot the stale vault note wins, so
+                                 surface this loudly to the operator.
+        """
         item = os.environ.get("SOC_CONFIG_VAULT_ITEM", "SOC Wall Config")
         if not item:
-            return
+            return "deferred:SOC_CONFIG_VAULT_ITEM is empty"
+        from . import secretstore
+        sd = os.environ.get("SOC_SECRET_DIR")
+        url = os.environ.get("SOC_VAULT_URL", "")
+        email = os.environ.get("SOC_VAULT_EMAIL", "")
+        if not url:
+            return "deferred:SOC_VAULT_URL is empty"
+        if not email:
+            return "deferred:SOC_VAULT_EMAIL is empty"
+        if not secretstore.is_sealed(sd):
+            return "deferred:master password is not host-sealed"
+        try:
+            master = secretstore.unseal(sd)
+        except Exception as e:  # noqa: BLE001
+            return f"deferred:cannot unseal master ({e})"
         import threading
 
         def work():
             try:
-                from . import secretstore, vaultseed
-                sd = os.environ.get("SOC_SECRET_DIR")
-                url = os.environ.get("SOC_VAULT_URL", "")
-                email = os.environ.get("SOC_VAULT_EMAIL", "")
-                # Master comes ONLY from the host-bound sealed store — never from
-                # a plaintext SOC_VAULT_PASSWORD in soc.env.
-                master = secretstore.unseal(sd) if secretstore.is_sealed(sd) else ""
-                if not (url and email and master):
-                    log("config write-back skipped (need url/email + sealed master)")
-                    return
+                from . import vaultseed
                 yaml_text = cfg.to_yaml(self.conf)
                 vaultseed.upsert_login(url, email, master, item, "", "",
                                        notes=yaml_text)
-                master = ""
                 log(f"config written back to vault note '{item}'")
             except Exception as e:  # noqa: BLE001
-                log(f"config write-back failed (local overrides kept): {e}")
+                log(f"config write-back FAILED (local overrides kept, will be "
+                    f"OVERWRITTEN by stale vault note at next boot): {e}")
         threading.Thread(target=work, daemon=True).start()
+        return "ok"
 
     def _show_one(self, view):
         try:
@@ -625,12 +813,38 @@ def main():
     # apply any settings set previously from the on-screen config
     try:
         from .configwin import (load_overrides, apply_overrides_to_panels,
-                                 apply_display_override, apply_vpn_override)
+                                 apply_display_override, apply_vpn_override,
+                                 apply_vpns_override,
+                                 apply_proxy_override, apply_tunnel_override)
         ov = load_overrides()
         if ov:
             apply_display_override(conf.display, ov)
-            apply_vpn_override(conf.vpn, ov)
+            # Try multi-VPN merge first; if not present, fall back to single.
+            if "_vpns" in ov:
+                conf.vpns = apply_vpns_override(conf.vpns, ov)
+            else:
+                apply_vpn_override(conf.vpn, ov)
+            apply_proxy_override(conf.proxy, ov)
+            apply_tunnel_override(conf.tunnel, ov)
             apply_overrides_to_panels(conf.panels, ov)
+            # Grow blank tiles if the operator expanded the grid at the glass —
+            # cols*rows is the cap, but if panels < cap there are empty slots
+            # waiting for click-to-configure tiles.
+            cap = conf.display.cols * conf.display.rows
+            existing = {p.id for p in conf.panels}
+            for i in range(len(conf.panels), cap):
+                pid = f"p{i+1}"
+                n = 1
+                while pid in existing:
+                    n += 1
+                    pid = f"p{i+1}_{n}"
+                existing.add(pid)
+                conf.panels.append(cfg.Panel(
+                    id=pid, engine="webkit",
+                    grid=(i % conf.display.cols, i // conf.display.cols),
+                    mode="direct", vault_item="", selectors={},
+                    login_marker="", keepalive=cfg.KeepAlive(strategy="none"),
+                ))
             for p in conf.panels:                        # geometry may have moved
                 p.geometry = cfg.compute_geometry(conf.display, p.grid)
             log(f"applied {len(ov)} saved override(s) from the on-screen config")

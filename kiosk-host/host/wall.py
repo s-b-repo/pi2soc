@@ -26,8 +26,12 @@ class WallWindow:
         self.conf = conf
         self.log = log
         self.on_config = on_config        # callable() -> open the config window
-        self.on_vpn = on_vpn              # callable() -> re-check / reconnect VPN
-        self.vpn_pill = None
+        self.on_vpn = on_vpn              # callable(name) -> reconnect VPN named
+        # Multi-VPN: one pill per entry in conf.vpns (name + traffic-light
+        # colour). Falls back to a single "VPN: not configured" pill when
+        # vpns is empty so the toolbar isn't visually empty.
+        self.vpn_pills = []
+        self.vpn_pill = None              # back-compat alias = pills[0]
         win = Gtk.Window()
         win.set_title("soc-wall")
         try:
@@ -49,13 +53,24 @@ class WallWindow:
         # own region above the grid keeps them always visible + clickable.
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         toolbar.get_style_context().add_class("soc-toolbar")
-        pill = Gtk.Button(label="VPN: …")
-        pill.get_style_context().add_class("soc-vpn-pill")
-        pill.get_style_context().add_class("unconfigured")
-        pill.set_tooltip_text("VPN status — click to re-check / reconnect")
-        pill.connect("clicked", lambda *_: self.on_vpn and self.on_vpn())
-        self.vpn_pill = pill
-        toolbar.pack_start(pill, False, False, 0)
+        # One pill per configured VPN
+        from . import vpnstatus as _vs
+        vpns = conf.vpns or []
+        if not vpns:
+            vpns = [{}]                   # show a single "not configured" pill
+        for idx, v in enumerate(vpns):
+            name = _vs.vpn_name(v, idx)
+            pill = Gtk.Button(label=f"{name}: …")
+            pill.get_style_context().add_class("soc-vpn-pill")
+            pill.get_style_context().add_class("unconfigured")
+            pill.set_tooltip_text(f"VPN '{name}' status — click to re-check / reconnect")
+            # closure-by-default: capture name per pill
+            pill.connect("clicked", (lambda _b, n=name:
+                                     self.on_vpn and self.on_vpn(n)))
+            self.vpn_pills.append({"button": pill, "name": name})
+            toolbar.pack_start(pill, False, False, 0)
+        if self.vpn_pills:
+            self.vpn_pill = self.vpn_pills[0]["button"]   # back-compat
         toolbar.pack_start(Gtk.Box(), True, True, 0)        # spacer
         if on_config is not None:
             gear = Gtk.Button(label="⚙ Settings")
@@ -114,16 +129,27 @@ class WallWindow:
         else:
             self.window.unfullscreen()
 
-    def set_vpn_status(self, state: str, label: str):
-        """Update the pill. `state` in online|offline|unconfigured|checking."""
-        if self.vpn_pill is None:
+    def set_vpn_status(self, state: str, label: str, name: str = ""):
+        """Update a pill. With `name` empty, updates the first pill (back-compat
+        — what the old single-pill code calls). With `name` set, finds the pill
+        for that VPN. `state` in online|offline|unconfigured|checking|connecting."""
+        target = None
+        if name:
+            for p in self.vpn_pills:
+                if p["name"] == name:
+                    target = p["button"]
+                    break
+        elif self.vpn_pills:
+            target = self.vpn_pills[0]["button"]
+        if target is None:
             return
-        ctx = self.vpn_pill.get_style_context()
-        for c in ("online", "offline", "unconfigured", "checking"):
+        ctx = target.get_style_context()
+        for c in ("online", "offline", "unconfigured", "checking", "connecting"):
             ctx.remove_class(c)
         ctx.add_class(state)
-        dot = {"online": "● ", "offline": "● ", "checking": "… "}.get(state, "")
-        self.vpn_pill.set_label(f"{dot}{label}")
+        dot = {"online": "● ", "offline": "● ", "checking": "… ",
+               "connecting": "◐ "}.get(state, "○ ")
+        target.set_label(f"{dot}{label}")
 
     def attach(self, panel, widget):
         col, row = panel.grid
@@ -156,20 +182,39 @@ class WallWindow:
         return False
 
     def show(self):
-        self._fullscreen = True
-        w, h = self._screen_size()
+        # Windowed mode: opt-in via SOC_WINDOWED=1 OR display.fullscreen=false.
+        # Opens as a regular WM-managed window sized to display.width/height —
+        # the wall lives ON your desktop instead of taking over the screen.
+        # F11 still toggles fullscreen at runtime. Defaults to fullscreen so
+        # the production kiosk path on a Pi 5 is unchanged.
+        import os as _os
+        env_windowed = _os.environ.get("SOC_WINDOWED") == "1"
+        cfg_fullscreen = getattr(self.conf.display, "fullscreen", True)
+        self._fullscreen = not (env_windowed or not cfg_fullscreen)
+        w, h = (self.conf.display.width, self.conf.display.height) \
+            if not self._fullscreen else self._screen_size()
         self.window.set_default_size(w, h)
-        self.window.fullscreen()
+        if self._fullscreen:
+            self.window.fullscreen()
+        else:
+            # Stay decorated + resizable so the user can move/close it. Don't
+            # set keep-above; the wall is just another app.
+            try:
+                self.window.set_decorated(True)
+                self.window.set_resizable(True)
+            except Exception:  # noqa: BLE001
+                pass
         self.window.show_all()
-        self._fit_to_screen()
-        # keep filling the screen when it changes size under us: a resized
-        # nested window (Xephyr/cage), a monitor hotplug, or a mode switch.
-        scr = Gdk.Screen.get_default()
-        if scr is not None:
-            scr.connect("size-changed", self._fit_to_screen)
-            scr.connect("monitors-changed", self._fit_to_screen)
-        # also re-fit shortly after first map (some compositors settle late)
-        from gi.repository import GLib
-        GLib.timeout_add(400, self._fit_to_screen)
-        self.log(f"wall window shown (single-window layout, {w}x{h}; "
-                 f"F11 toggles fullscreen)")
+        if self._fullscreen:
+            self._fit_to_screen()
+            # keep filling the screen when it changes size under us: a resized
+            # nested window (Xephyr/cage), a monitor hotplug, or a mode switch.
+            scr = Gdk.Screen.get_default()
+            if scr is not None:
+                scr.connect("size-changed", self._fit_to_screen)
+                scr.connect("monitors-changed", self._fit_to_screen)
+            # also re-fit shortly after first map (some compositors settle late)
+            from gi.repository import GLib
+            GLib.timeout_add(400, self._fit_to_screen)
+        self.log(f"wall window shown ({'fullscreen' if self._fullscreen else 'windowed'}"
+                 f"; {w}x{h}; F11 toggles)")

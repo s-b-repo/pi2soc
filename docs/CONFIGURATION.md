@@ -175,9 +175,8 @@ vpn: { enabled: true, type: inode, gateway: "vpn.example.com", port: 3000,
 All four share the supervisor: backoff on drops, a long hold on auth/cert
 failures, the systemd watchdog, and the `ready_probe` health check (which forces
 a reconnect when the tunnel goes stale — for WireGuard it falls back to the
-peer's last handshake age when no `ready_probe` is set). `make vpn-check`
-dry-runs any type without connecting; `make verify-vpn` behaviorally tests all
-four with fake clients. iNode self-detects a dead tunnel via its keepalive
+peer's last handshake age when no `ready_probe` is set). Setting `SOC_VPN_DRY_RUN=1`
+resolves the creds and prints the command without connecting. iNode self-detects a dead tunnel via its keepalive
 heartbeat (~30 s × 5 misses), a forced log-off, or a socket close and exits, so
 the supervisor reconnects it automatically — no `ready_probe` required.
 
@@ -256,11 +255,13 @@ if the gateway pushes a default route it can pull *all* traffic (including your
 LAN SSH path) over the VPN. Use `half_internet_routes: true` or `set_routes: false`
 to keep your own default route, and `set_dns: false` to keep the local resolver.
 
-Verify the wiring without a real FortiGate (resolves the vault creds and prints
-the command it would run, but does not connect):
+Verify the wiring without a real FortiGate: set `SOC_VPN_DRY_RUN=1` and the VPN
+supervisor resolves the vault creds and prints the command it would run, then
+exits without connecting:
 
 ```bash
-make vpn-check
+SOC_VPN_DRY_RUN=1 PYTHONPATH=/opt/soc-display/kiosk-host \
+  /opt/soc-display/.venv/bin/python /opt/soc-display/scripts/forti-vpn-connect.py
 ```
 
 ## `proxy` (outbound HTTP(S)/SOCKS proxy)
@@ -295,13 +296,32 @@ a panel on the local LAN while the rest go through the proxy.
 
 ## Finding selectors
 
+> **A selector is not a credential.** `selectors` and `login_marker` are CSS
+> selectors — they point at *where* the username/password boxes are on the page.
+> They are **not** your username/password, which live only in the Vaultwarden
+> `vault_item`. (Typing a credential into a selector field is the most common
+> setup mistake; it breaks auto-login and leaks the password into plain config.)
+
+**The wizard auto-detects these for you.** When you enter a `direct` panel's
+login URL, `setup.py` fetches the page and derives the selectors + login type,
+then offers a single **“Use these detected selectors? [Y]”** — for most panels
+you never hand-write a selector. It recognises server-rendered forms (reads the
+real DOM), JavaScript/SPA logins (Grafana, Wazuh/Kibana, Keycloak — fills a
+known preset to **verify**), and HTTP Basic auth (flags it). See the
+[wizard walkthrough](WIZARD.md#auto-detect-the-happy-path).
+
+To find them **by hand** (auto-detect skipped for tunnels, or unreachable during
+setup):
+
 1. Open the panel's login page in a desktop browser.
 2. Right-click the username field → **Inspect**.
 3. Pick a stable CSS selector — prefer `#id`, then `input[name="…"]`, then a class.
-4. Do the same for the password field and the submit button.
+4. Do the same for the password field and the submit button (submit may be left
+   blank — the host then submits the form natively, i.e. presses Enter).
 5. Set `login_marker` to something that exists **only** on the login page (the
-   password field is usually perfect). It's how the host detects "logged out" and
-   re-logs-in.
+   password field is usually perfect). It is the wall's **"logged out?" detector**:
+   if the marker is present the host re-runs the login, otherwise it leaves the
+   panel alone. That's why the password selector is the safe default.
 
 Selectors are JSON-escaped before injection, so quotes are safe:
 `input[name="user"]` works verbatim.

@@ -1,10 +1,17 @@
 """
 On-screen configuration for the SOC wall.
 
-A floating, always-on-top window an operator opens *at the glass* — via the
-corner gear button or Ctrl+Shift+C — to set each tile's URL (and title) live,
+A floating, always-on-top hovering panel an operator opens *at the glass* — via
+the corner gear button or Ctrl+Shift+C — to set each tile's URL, vault login,
+selectors, VPN/proxy/tunnel/display settings, and Vaultwarden credentials live,
 with no SSH and no YAML editing. Changes apply immediately and are written to an
 overrides file so they survive a restart.
+
+The window is deliberately **non-modal** and tagged as a UTILITY window: it
+hovers above the wall without blocking the panels behind it, and a stray click
+elsewhere on the screen does not dismiss it. The only ways to close it are the
+title-bar × button or the Close button next to Apply. A focus-out handler
+re-presents the window so it cannot be visually buried by the kiosk.
 
 Optional PIN lock: once a PIN is set, the window demands it before showing the
 form, so a passer-by can't repoint the wall. The PIN is stored only as a salted
@@ -111,6 +118,31 @@ def verify_pin(pin: str) -> bool:
         return False
 
 
+def _totp_path() -> str:
+    return os.path.join(state_dir(), "config.totp")
+
+
+def totp_is_set() -> bool:
+    return os.path.exists(_totp_path())
+
+
+def verify_pin_or_totp(code: str) -> bool:
+    """Settings-gate verify: accepts either the saved PIN OR a current TOTP
+    code from the enrolled secret. Both paths use hmac.compare_digest /
+    constant-time comparisons internally."""
+    if not code or not code.strip():
+        return False
+    code = code.strip()
+    if pin_is_set() and verify_pin(code):
+        return True
+    if totp_is_set():
+        from . import totp as _t
+        secret = _t.load(_totp_path())
+        if secret and _t.verify(secret, code):
+            return True
+    return False
+
+
 def require_pin() -> bool:
     """SEC-7: in production the on-screen config must never open without a PIN.
     soc-wall.service bakes SOC_CONFIG_REQUIRE_PIN=1; dev leaves it unset."""
@@ -149,6 +181,31 @@ def apply_overrides_to_panels(panels, overrides: dict):
             p.selectors = {k: v for k, v in o["selectors"].items() if v}
         if "login_marker" in o:
             p.login_marker = o["login_marker"] or p.selectors.get("pass", "")
+        if isinstance(o.get("allow_insecure"), bool):
+            p.allow_insecure = o["allow_insecure"]
+        if isinstance(o.get("allow_media"), bool):
+            p.allow_media = o["allow_media"]
+        if isinstance(o.get("proxy"), bool):
+            p.proxy = o["proxy"]
+        if isinstance(o.get("keepalive"), dict):
+            ka = o["keepalive"]
+            strat = ka.get("strategy")
+            if strat in ("none", "reload", "click", "xhr", "mouse"):
+                p.keepalive.strategy = strat
+            iv = ka.get("intervalSec")
+            if isinstance(iv, int) and iv >= 0:
+                p.keepalive.intervalSec = iv
+        if "relogin_url" in o:
+            # Empty string -> clear; non-empty must look like an http URL,
+            # else silently drop (don't fight the operator's typo).
+            v = o["relogin_url"]
+            if not v:
+                p.relogin_url = None
+            elif valid_url(v) and v.startswith(("http://", "https://")):
+                p.relogin_url = v
+        if isinstance(o.get("blocked_url_patterns"), list):
+            p.blocked_url_patterns = [str(x) for x in o["blocked_url_patterns"]
+                                       if isinstance(x, str) and x.strip()]
 
 
 def apply_vpn_override(vpn: dict, overrides: dict):
@@ -160,6 +217,29 @@ def apply_vpn_override(vpn: dict, overrides: dict):
     if isinstance(o, dict):
         vpn.update(o)
     return vpn
+
+
+def apply_vpns_override(vpns: list, overrides: dict) -> list:
+    """Multi-VPN startup merge. The _vpns override is a list of dicts; each is
+    merged by name into the corresponding loaded VPN (preserving advanced fields
+    set in panels.yaml that the form doesn't expose). Entries in the override
+    that don't match any loaded VPN are appended. Returns the updated list."""
+    o = overrides.get("_vpns")
+    if not isinstance(o, list):
+        return vpns
+    by_name = {v.get("name"): i for i, v in enumerate(vpns) if v.get("name")}
+    for entry in o:
+        if not isinstance(entry, dict):
+            continue
+        n = entry.get("name")
+        if n and n in by_name:
+            vpns[by_name[n]].update(entry)
+        else:
+            # New VPN added at the glass that wasn't in the source config.
+            vpns.append(dict(entry))
+            if n:
+                by_name[n] = len(vpns) - 1
+    return vpns
 
 
 def vpn_form_to_dict(v: dict) -> dict:
@@ -187,7 +267,11 @@ def vpn_form_to_dict(v: dict) -> dict:
 
 
 def apply_display_override(display, overrides: dict):
-    """Apply a saved display override (layout/gap) to the DisplayCfg at startup."""
+    """Apply a saved display override to the DisplayCfg at startup. Covers
+    layout/gap (live-applied after the user clicks Apply) AND the grid+resolution
+    (cols/rows/width/height/auto, which take effect on next restart — changing
+    them while panels are mapped would require destroying and rebuilding the
+    whole wall)."""
     o = overrides.get("_display")
     if not isinstance(o, dict):
         return
@@ -195,6 +279,108 @@ def apply_display_override(display, overrides: dict):
         display.layout = o["layout"]
     if isinstance(o.get("gap"), int) and o["gap"] >= 0:
         display.gap = o["gap"]
+    if isinstance(o.get("auto"), bool):
+        display.auto = o["auto"]
+    if isinstance(o.get("fullscreen"), bool):
+        display.fullscreen = o["fullscreen"]
+    for k in ("cols", "rows"):
+        v = o.get(k)
+        if isinstance(v, int) and 1 <= v <= 8:
+            setattr(display, k, v)
+    for k in ("width", "height"):
+        v = o.get(k)
+        if isinstance(v, int) and 320 <= v <= 16384:
+            setattr(display, k, v)
+
+
+def proxy_form_to_dict(p: dict) -> dict:
+    """Build a clean proxy override dict from on-screen form values: drops empty
+    strings, coerces ignore_hosts (comma- or whitespace-separated) to a clean
+    list. The renderer re-validates the URL on next startup; an invalid URL
+    becomes 'proxy disabled' rather than crashing the wall."""
+    out = {"enabled": bool(p.get("enabled"))}
+    url = str(p.get("url") or "").strip()
+    if url:
+        out["url"] = url
+    vi = str(p.get("vault_item") or "").strip()
+    if vi:
+        out["vault_item"] = vi
+    raw = p.get("ignore_hosts")
+    if isinstance(raw, str):
+        items = [h.strip() for h in raw.replace("\n", ",").split(",")]
+    else:
+        items = list(raw or [])
+    items = [h for h in items if h]
+    if items:
+        out["ignore_hosts"] = items
+    return out
+
+
+def apply_proxy_override(proxy, overrides: dict):
+    """Merge a saved proxy override onto the loaded ProxyCfg at startup."""
+    o = overrides.get("_proxy")
+    if not isinstance(o, dict):
+        return
+    if isinstance(o.get("enabled"), bool):
+        proxy.enabled = o["enabled"]
+    if "url" in o:
+        proxy.url = str(o.get("url") or "")
+    if "vault_item" in o:
+        proxy.vault_item = str(o.get("vault_item") or "")
+    if "ignore_hosts" in o:
+        v = o.get("ignore_hosts") or []
+        proxy.ignore_hosts = tuple(str(h) for h in v if h)
+
+
+def tunnel_form_to_dict(t: dict) -> dict:
+    """Build a clean tunnel-section dict from on-screen form values. extra_forwards
+    is split per-line; host_key_checking is constrained to the values autossh
+    actually understands. Empty values are dropped so the override stays minimal."""
+    out = {"enabled": bool(t.get("enabled", True))}
+    for k in ("jump_host", "identity", "known_hosts"):
+        v = str(t.get(k) or "").strip()
+        if v:
+            out[k] = v
+    hkc = str(t.get("host_key_checking") or "").strip().lower()
+    if hkc in ("yes", "no", "accept-new"):
+        out["host_key_checking"] = hkc
+    raw = t.get("extra_forwards")
+    if isinstance(raw, str):
+        items = [ln.strip() for ln in raw.splitlines()]
+    else:
+        items = list(raw or [])
+    items = [ln for ln in items if ln]
+    if items:
+        out["extra_forwards"] = items
+    return out
+
+
+def apply_tunnel_override(tunnel: dict, overrides: dict):
+    """Merge a saved tunnel override onto the loaded tunnel dict at startup. As
+    with apply_vpn_override, advanced keys not exposed by the form (e.g. fields
+    the operator added by hand to panels.yaml) are preserved through update()."""
+    o = overrides.get("_tunnel")
+    if isinstance(o, dict):
+        tunnel.update(o)
+    return tunnel
+
+
+def _vw_reachable(url: str, timeout: float = 1.0) -> bool:
+    """Cheap TCP probe for the Vaultwarden listener — used by the Status tab to
+    flag a dead vault before the operator clicks Save on the Credentials tab
+    and gets a confusing 'login failed' error. Does NOT speak HTTP; a process
+    bound to the port (even if it's not Vaultwarden) reads as 'reachable',
+    which is good enough for the tab's purpose."""
+    import socket
+    import urllib.parse
+    try:
+        u = urllib.parse.urlparse(url)
+        host = u.hostname or "127.0.0.1"
+        port = u.port or (443 if u.scheme == "https" else 8222)
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -205,26 +391,68 @@ class ConfigWindow(Gtk.Window):
     after the overrides file has been saved; the host applies them live."""
 
     def __init__(self, panels, on_apply, on_close=None, display=None, vpn=None,
-                 proxy_vault_item=""):
+                 proxy=None, tunnel=None, proxy_vault_item="",
+                 login_stats=None, vpns=None, actions=None):
         super().__init__(title="SOC wall — settings")
         style.apply_css()
         self.panels = panels
         self.on_apply = on_apply
         self.on_close_cb = on_close
         self.display = display          # config.DisplayCfg | None (Display tab)
-        self._vpn = vpn                 # conf.vpn dict | None (VPN tab)
-        self._proxy_vault_item = proxy_vault_item
-        self._vpn_w = None
+        # Multi-VPN: `vpns` is the canonical list; `vpn` is the legacy single
+        # alias. Either gives us a VPN tab. Internally we always work with a
+        # list, padded to 2 entries so the GUI shows a placeholder "VPN 2"
+        # section on single-VPN configs — that's the operator's discovery
+        # surface for the new multi-VPN feature.
+        if vpns is not None:
+            self._vpns = [dict(v) for v in vpns]
+        elif vpn:
+            self._vpns = [dict(vpn)]
+        else:
+            self._vpns = []
+        while len(self._vpns) < 2:
+            i = len(self._vpns) + 1
+            self._vpns.append({"name": f"vpn-{i}", "enabled": False,
+                               "type": "fortinet"})
+        self._vpn = self._vpns[0] if (vpn or vpns) else None
+        self._proxy = proxy             # config.ProxyCfg | None (Proxy tab)
+        self._tunnel = tunnel           # conf.tunnel dict | None (Tunnel tab)
+        self._login_stats = login_stats # callable() -> {pid: {attempts, stale}}
+        self._actions = actions or {}   # {restart_wall, reload_panels, ...}
+        # Back-compat: callers that still pass only proxy_vault_item get a
+        # Credentials-tab row but no Proxy tab.
+        self._proxy_vault_item = (getattr(proxy, "vault_item", None)
+                                  or proxy_vault_item or "")
+        self._vpn_ws = []               # list of widget dicts, one per VPN
+        self._proxy_w = None
+        self._tunnel_w = None
         self._rows = {}
-        self._unlocked = gate_unlocked(require_pin(), pin_is_set())
+        # "Has any credential enrolled" = PIN OR TOTP (either gates the form).
+        self._unlocked = gate_unlocked(require_pin(),
+                                        pin_is_set() or totp_is_set())
 
         self.set_keep_above(True)
-        self.set_modal(True)
+        # A floating, always-on-top utility panel — NOT modal. On a full-screen
+        # kiosk the modal grab gets released by a stray click on a panel behind
+        # the window (some WMs treat the lost grab as a dismiss), which looked
+        # like the window had vanished. As a non-modal utility window it just
+        # hovers above the wall and the only way out is the title-bar × button
+        # (or the Close button next to Apply).
+        self.set_modal(False)
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_deletable(True)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_default_size(820, 600)
         self.set_resizable(True)
         self.get_style_context().add_class("soc-config")
-        self.connect("key-press-event", self._on_key)
+        # Re-assert always-on-top whenever focus is stolen, so clicking through
+        # to a panel underneath cannot bury the settings window. Cheap (no
+        # geometry change), only fires on focus changes.
+        self.connect("focus-out-event", self._on_focus_out)
+        # No Escape-closes-window — the operator must press × so the panel
+        # cannot be dismissed by reflex while typing into a URL field.
         self.connect("destroy", lambda *_: self.on_close_cb and self.on_close_cb())
 
         self._stack = Gtk.Stack()
@@ -261,7 +489,7 @@ class ConfigWindow(Gtk.Window):
         return box
 
     def _try_unlock(self):
-        if verify_pin(self._pin_entry.get_text()):
+        if verify_pin_or_totp(self._pin_entry.get_text()):
             self._unlocked = True
             self._pin_fails = 0
             self._pin_err.set_text("")
@@ -302,6 +530,12 @@ class ConfigWindow(Gtk.Window):
             nb.append_page(self._tab_display(), Gtk.Label(label="Display"))
         if self._vpn is not None:
             nb.append_page(self._tab_vpn(), Gtk.Label(label="VPN"))
+        if self._proxy is not None:
+            nb.append_page(self._tab_proxy(), Gtk.Label(label="Proxy"))
+        if self._tunnel is not None:
+            nb.append_page(self._tab_tunnel(), Gtk.Label(label="Tunnel"))
+        nb.append_page(self._tab_actions(), Gtk.Label(label="Actions"))
+        nb.append_page(self._tab_security(), Gtk.Label(label="Security"))
         nb.append_page(self._tab_status(), Gtk.Label(label="Status"))
         outer.pack_start(nb, True, True, 0)
 
@@ -310,7 +544,6 @@ class ConfigWindow(Gtk.Window):
         self._form_msg.set_xalign(0.0)
         self._form_msg.set_line_wrap(True)
         outer.pack_start(self._form_msg, False, False, 0)
-        outer.pack_start(self._build_security(), False, False, 0)
 
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         actions.set_halign(Gtk.Align.END)
@@ -369,9 +602,10 @@ class ConfigWindow(Gtk.Window):
             g.attach(w, col, 1, 1, 1)
         inner.pack_start(g, False, False, 0)
 
-        exp = Gtk.Expander(label="Advanced — auto-login selectors (apply on restart)")
+        exp = Gtk.Expander(label="Advanced — selectors + per-panel toggles (apply on restart)")
+        adv = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        adv.set_border_width(6)
         ag = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        ag.set_border_width(6)
         sel = p.selectors or {}
         user_e = Gtk.Entry(); user_e.set_text(sel.get("user", "")); user_e.set_placeholder_text("user CSS")
         pass_e = Gtk.Entry(); pass_e.set_text(sel.get("pass", "")); pass_e.set_placeholder_text("pass CSS")
@@ -380,12 +614,104 @@ class ConfigWindow(Gtk.Window):
         for w in (user_e, pass_e, sub_e, mark_e):
             w.set_width_chars(13)
             ag.pack_start(w, True, True, 0)
-        exp.add(ag)
+        adv.pack_start(ag, False, False, 0)
+
+        # Per-panel toggles that used to be YAML-only. Each is a real correctness
+        # / RAM / security knob the operator may need at the glass — exposing
+        # them removes "edit panels.yaml + restart" round-trips for the common
+        # cases (a panel with self-signed TLS, one that needs WebGL, or one that
+        # must bypass the global proxy).
+        tg = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        ai_c = Gtk.CheckButton(label="allow self-signed TLS")
+        ai_c.set_active(bool(getattr(p, "allow_insecure", False)))
+        ai_c.set_tooltip_text("Accept self-signed certs on this panel only "
+                              "(trusted LAN). Off by default — system CAs are "
+                              "enforced.")
+        am_c = Gtk.CheckButton(label="allow media (WebGL/audio/video)")
+        am_c.set_active(bool(getattr(p, "allow_media", False)))
+        am_c.set_tooltip_text("Re-enables WebGL/WebAudio/<video>. Off by "
+                              "default to save RAM/GPU on 1 GB boards. Enable "
+                              "if the dashboard uses WebGL Grafana or shows "
+                              "video.")
+        px_c = Gtk.CheckButton(label="use global proxy (if any)")
+        px_c.set_active(bool(getattr(p, "proxy", True)))
+        px_c.set_tooltip_text("Off = this panel ALWAYS hits the URL directly, "
+                              "bypassing the corporate proxy. Useful for an "
+                              "internal dashboard the proxy can't reach.")
+        for c in (ai_c, am_c, px_c):
+            tg.pack_start(c, False, False, 0)
+        adv.pack_start(tg, False, False, 0)
+
+        # Keepalive controls (strategy + interval). The wall's panel reloader
+        # nudges idle dashboards so they don't log themselves out / silently
+        # break their websockets — exposed here so an operator can change the
+        # cadence on a per-panel basis without editing YAML.
+        ka = (p.keepalive.__dict__
+              if hasattr(getattr(p, "keepalive", None), "__dict__")
+              else {})
+        kg = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        kg.pack_start(Gtk.Label(label="keepalive:"), False, False, 0)
+        ka_strat = Gtk.ComboBoxText()
+        # `mouse` = invisible synthetic in-DOM mousemove every interval —
+        # resets the dashboard's idle timer without disturbing the operator.
+        strats = ["none", "reload", "click", "xhr", "mouse"]
+        for s in strats:
+            ka_strat.append_text(s)
+        cur_strat = ka.get("strategy", "none")
+        ka_strat.set_active(strats.index(cur_strat) if cur_strat in strats else 0)
+        ka_int = Gtk.SpinButton.new_with_range(0, 86400, 30)
+        ka_int.set_value(int(ka.get("intervalSec", 600) or 600))
+        kg.pack_start(ka_strat, False, False, 0)
+        kg.pack_start(Gtk.Label(label="every (sec):"), False, False, 0)
+        kg.pack_start(ka_int, False, False, 0)
+        adv.pack_start(kg, False, False, 0)
+
+        # Post-login landing URL — wall navigates here ONCE after auto-login
+        # succeeds, so dashboards that log in to /login then need /dashboard
+        # don't sit on the login page forever. Validation: must be http(s)
+        # if non-empty; an empty entry just keeps the panel on `url`.
+        rg = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        rg.pack_start(Gtk.Label(label="relogin URL:"), False, False, 0)
+        relogin_e = Gtk.Entry()
+        relogin_e.set_text(getattr(p, "relogin_url", "") or "")
+        relogin_e.set_placeholder_text("https://host/dashboard  (after login)")
+        relogin_e.set_hexpand(True)
+        relogin_e.set_tooltip_text("Optional. After auto-login succeeds the "
+                                    "wall navigates here once (per page "
+                                    "load). Leave empty to stay on the URL.")
+        rg.pack_start(relogin_e, True, True, 0)
+        adv.pack_start(rg, False, False, 0)
+
+        # Blocked URL patterns — fnmatch-style, one per line. WebKit
+        # decide-policy + Chromium Fetch.requestPaused both enforce. Keeps
+        # the operator out of dashboard account-settings / change-password
+        # pages from the wall without hiding the dashboard itself.
+        bg_lbl = Gtk.Label(label="blocked URLs  (fnmatch, one per line — "
+                                  "e.g. */account/* or *change-password*)")
+        bg_lbl.get_style_context().add_class("soc-config-sub")
+        bg_lbl.set_xalign(0.0)
+        adv.pack_start(bg_lbl, False, False, 0)
+        blocked_tv = Gtk.TextView()
+        blocked_tv.set_monospace(True)
+        blocked_tv.set_wrap_mode(Gtk.WrapMode.NONE)
+        bbuf = blocked_tv.get_buffer()
+        bbuf.set_text("\n".join(getattr(p, "blocked_url_patterns", []) or []))
+        bsw = Gtk.ScrolledWindow()
+        bsw.set_min_content_height(54)
+        bsw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        bsw.add(blocked_tv)
+        adv.pack_start(bsw, False, False, 0)
+
+        exp.add(adv)
         inner.pack_start(exp, False, False, 0)
         frame.add(inner)
         self._rows[p.id] = {"url": url_e, "title": title_e, "vault": vault_e,
                             "engine": engine_c, "user": user_e, "pass": pass_e,
-                            "submit": sub_e, "marker": mark_e}
+                            "submit": sub_e, "marker": mark_e,
+                            "allow_insecure": ai_c, "allow_media": am_c,
+                            "proxy": px_c, "ka_strat": ka_strat,
+                            "ka_int": ka_int,
+                            "relogin": relogin_e, "blocked": blocked_tv}
         return frame
 
     def _tab_credentials(self):
@@ -509,8 +835,11 @@ class ConfigWindow(Gtk.Window):
     def _tab_display(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_border_width(12)
-        note = Gtk.Label(label="Layout + spacing. A layout change takes effect on "
-                               "the next restart; gap applies live.")
+        note = Gtk.Label(label="Layout, spacing, grid size, and resolution. Gap "
+                               "applies live; layout, grid size, and resolution "
+                               "take effect on the next restart. Growing the grid "
+                               "adds blank click-to-configure tiles for the new "
+                               "cells.")
         note.get_style_context().add_class("soc-config-sub")
         note.set_xalign(0.0)
         note.set_line_wrap(True)
@@ -526,31 +855,198 @@ class ConfigWindow(Gtk.Window):
         self._layout_c.set_active(opts.index(cur) if cur in opts else 0)
         self._gap_s = Gtk.SpinButton.new_with_range(0, 64, 1)
         self._gap_s.set_value(getattr(self.display, "gap", 0))
-        for r, (lbl, w) in enumerate((("layout", self._layout_c), ("gap (px)", self._gap_s))):
+        self._cols_s = Gtk.SpinButton.new_with_range(1, 8, 1)
+        self._cols_s.set_value(int(getattr(self.display, "cols", 2)))
+        self._rows_s = Gtk.SpinButton.new_with_range(1, 8, 1)
+        self._rows_s.set_value(int(getattr(self.display, "rows", 2)))
+        self._disp_auto = Gtk.CheckButton(label="auto-detect from the screen")
+        self._disp_auto.set_active(bool(getattr(self.display, "auto", True)))
+        self._w_s = Gtk.SpinButton.new_with_range(320, 16384, 16)
+        self._w_s.set_value(int(getattr(self.display, "width", 1920)))
+        self._h_s = Gtk.SpinButton.new_with_range(320, 16384, 16)
+        self._h_s.set_value(int(getattr(self.display, "height", 1080)))
+        # disable explicit width/height while auto-detect is on, so the UI matches
+        # the actual behaviour (width/height are only read when auto is False)
+        self._w_s.set_sensitive(not self._disp_auto.get_active())
+        self._h_s.set_sensitive(not self._disp_auto.get_active())
+        self._disp_auto.connect("toggled", lambda b: (
+            self._w_s.set_sensitive(not b.get_active()),
+            self._h_s.set_sensitive(not b.get_active())))
+        # Windowed-vs-fullscreen toggle (defaults fullscreen for kiosk; flip
+        # off to run as a normal desktop window — useful on a dev box or when
+        # the wall coexists with other apps on the operator's display).
+        self._fullscreen_c = Gtk.CheckButton(
+            label="fullscreen on start  (off = open as a windowed desktop app, "
+                  "F11 toggles)")
+        self._fullscreen_c.set_active(bool(getattr(self.display, "fullscreen",
+                                                    True)))
+        rows = [("layout", self._layout_c), ("gap (px)", self._gap_s),
+                ("cols", self._cols_s), ("rows", self._rows_s),
+                ("resolution", self._disp_auto),
+                ("width", self._w_s), ("height", self._h_s),
+                ("window", self._fullscreen_c)]
+        for r, (lbl, w) in enumerate(rows):
             h = Gtk.Label(label=lbl)
+            h.get_style_context().add_class("soc-config-sub")
             h.set_xalign(0.0)
             g.attach(h, 0, r, 1, 1)
             g.attach(w, 1, r, 1, 1)
         box.pack_start(g, False, False, 0)
         return box
 
-    def _tab_vpn(self):
+    def _tab_proxy(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_border_width(12)
-        note = Gtk.Label(label="The supervised VPN. Credentials live in the vault "
-                               "(set the username/password on the Credentials tab "
-                               "for this VPN's vault item). Apply pushes the config "
-                               "into the vault and restarts the VPN service.")
+        note = Gtk.Label(label="Outbound HTTP(S)/SOCKS proxy for the panel browsers. "
+                               "Credentials live in the vault (set username + "
+                               "password on the Credentials tab for this proxy's "
+                               "vault item). Changes apply on the next restart.")
         note.get_style_context().add_class("soc-config-sub")
         note.set_xalign(0.0)
         note.set_line_wrap(True)
         box.pack_start(note, False, False, 0)
 
-        v = self._vpn or {}
+        p = self._proxy
         w = {}
-        w["enabled"] = Gtk.CheckButton(label="VPN enabled")
-        w["enabled"].set_active(bool(v.get("enabled")))
+        w["enabled"] = Gtk.CheckButton(label="Proxy enabled")
+        w["enabled"].set_active(bool(getattr(p, "enabled", False)))
         box.pack_start(w["enabled"], False, False, 0)
+
+        g = Gtk.Grid()
+        g.set_column_spacing(8)
+        g.set_row_spacing(6)
+
+        def entry(val, hint, purpose=None):
+            e = Gtk.Entry()
+            e.set_text(str(val or ""))
+            e.set_hexpand(True)
+            e.set_placeholder_text(hint)
+            if purpose is not None:
+                e.set_input_purpose(purpose)
+            return e
+
+        w["url"] = entry(getattr(p, "url", ""),
+                         "http://host:port  (no embedded user:pass)",
+                         Gtk.InputPurpose.URL)
+        w["vault_item"] = entry(getattr(p, "vault_item", ""),
+                                "vault login holding the proxy creds (optional)")
+        ignore = ", ".join(getattr(p, "ignore_hosts", ()) or ())
+        w["ignore_hosts"] = entry(ignore,
+                                  "host1, host2  (loopback is always bypassed)")
+        rows = [("url", w["url"]), ("vault login", w["vault_item"]),
+                ("ignore hosts", w["ignore_hosts"])]
+        for r, (lbl, widget) in enumerate(rows, start=1):
+            h = Gtk.Label(label=lbl)
+            h.get_style_context().add_class("soc-config-sub")
+            h.set_xalign(0.0)
+            g.attach(h, 0, r, 1, 1)
+            g.attach(widget, 1, r, 1, 1)
+        box.pack_start(g, False, False, 0)
+        self._proxy_w = w
+        return box
+
+    def _tab_tunnel(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_border_width(12)
+        note = Gtk.Label(label="SSH jump host used by panels in 'tunnel' mode. The "
+                               "SSH key sits in the host's filesystem (the jump "
+                               "host trusts its public half). Apply pushes the "
+                               "change and restarts autossh-tunnel.")
+        note.get_style_context().add_class("soc-config-sub")
+        note.set_xalign(0.0)
+        note.set_line_wrap(True)
+        box.pack_start(note, False, False, 0)
+
+        t = self._tunnel or {}
+        w = {}
+        w["enabled"] = Gtk.CheckButton(label="Tunnel enabled")
+        w["enabled"].set_active(bool(t.get("enabled", True)))
+        box.pack_start(w["enabled"], False, False, 0)
+
+        g = Gtk.Grid()
+        g.set_column_spacing(8)
+        g.set_row_spacing(6)
+
+        def entry(val, hint):
+            e = Gtk.Entry()
+            e.set_text(str(val or ""))
+            e.set_hexpand(True)
+            e.set_placeholder_text(hint)
+            return e
+
+        w["jump_host"] = entry(t.get("jump_host"), "user@host  (the SSH jump box)")
+        w["identity"] = entry(t.get("identity"), "private key path on the wall")
+        w["known_hosts"] = entry(t.get("known_hosts"),
+                                 "known_hosts file pinning the jump box's key")
+        w["host_key_checking"] = Gtk.ComboBoxText()
+        hkc_opts = ["yes", "accept-new", "no"]
+        for o in hkc_opts:
+            w["host_key_checking"].append_text(o)
+        cur = str(t.get("host_key_checking", "yes"))
+        w["host_key_checking"].set_active(hkc_opts.index(cur) if cur in hkc_opts else 0)
+        rows = [("jump host", w["jump_host"]),
+                ("identity (key)", w["identity"]),
+                ("known_hosts", w["known_hosts"]),
+                ("host key check", w["host_key_checking"])]
+        for r, (lbl, widget) in enumerate(rows, start=1):
+            h = Gtk.Label(label=lbl)
+            h.get_style_context().add_class("soc-config-sub")
+            h.set_xalign(0.0)
+            g.attach(h, 0, r, 1, 1)
+            g.attach(widget, 1, r, 1, 1)
+        box.pack_start(g, False, False, 0)
+
+        ef_lbl = Gtk.Label(label="extra forwards  (one per line, "
+                                 "bindaddr:port:host:port)")
+        ef_lbl.get_style_context().add_class("soc-config-sub")
+        ef_lbl.set_xalign(0.0)
+        box.pack_start(ef_lbl, False, False, 0)
+        self._tunnel_ef = Gtk.TextView()
+        self._tunnel_ef.set_monospace(True)
+        self._tunnel_ef.set_wrap_mode(Gtk.WrapMode.NONE)
+        buf = self._tunnel_ef.get_buffer()
+        buf.set_text("\n".join(t.get("extra_forwards") or []))
+        sw = Gtk.ScrolledWindow()
+        sw.set_min_content_height(70)
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.add(self._tunnel_ef)
+        box.pack_start(sw, False, False, 0)
+
+        self._tunnel_w = w
+        return box
+
+    def _tab_vpn(self):
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        outer.set_border_width(12)
+        note = Gtk.Label(label="Two supervised VPNs. Each gets its own systemd "
+                               "service (forti-vpn@<name>) and its own top-bar "
+                               "pill (green=online · amber=connecting · "
+                               "red=offline). Credentials live in the vault — "
+                               "set them on the Credentials tab. Apply pushes "
+                               "the config back to the vault note and restarts "
+                               "the VPN service(s).")
+        note.get_style_context().add_class("soc-config-sub")
+        note.set_xalign(0.0)
+        note.set_line_wrap(True)
+        outer.pack_start(note, False, False, 0)
+
+        self._vpn_ws = []
+        for idx, v in enumerate(self._vpns):
+            outer.pack_start(self._vpn_section(v, idx), False, False, 0)
+        scroll.add(outer)
+        return scroll
+
+    def _vpn_section(self, v: dict, idx: int):
+        default_name = v.get("name") or f"vpn-{idx+1}"
+        frame = Gtk.Frame(label=f"  VPN {idx+1}: {default_name}  ")
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        inner.set_border_width(8)
+        w = {}
+        w["enabled"] = Gtk.CheckButton(label=f"enabled  (systemd unit: forti-vpn@{default_name})")
+        w["enabled"].set_active(bool(v.get("enabled")))
+        inner.pack_start(w["enabled"], False, False, 0)
 
         g = Gtk.Grid()
         g.set_column_spacing(8)
@@ -569,6 +1065,12 @@ class ConfigWindow(Gtk.Window):
             e.set_placeholder_text(hint)
             return e
 
+        w["name"] = entry(default_name, "name (top-bar pill label, systemd instance)")
+        # Live rename — the frame header updates as the operator types so the
+        # whole section reflects the chosen VPN identity (not stuck on
+        # "VPN 1" / "VPN 2"). Pass idx through the closure.
+        w["name"].connect("changed", lambda e, i=idx, fr=frame:
+            fr.set_label(f"  VPN {i+1}: {e.get_text().strip() or f'vpn-{i+1}'}  "))
         w["gateway"] = entry(v.get("gateway"), "gateway host (fortinet / inode)")
         w["port"] = Gtk.SpinButton.new_with_range(0, 65535, 1)
         w["port"].set_value(int(v.get("port", 443) or 0))
@@ -577,8 +1079,10 @@ class ConfigWindow(Gtk.Window):
         w["domain"] = entry(v.get("domain"), "auth domain (inode)")
         w["realm"] = entry(v.get("realm"), "realm (fortinet)")
         w["trusted_cert"] = entry(v.get("trusted_cert"), "gateway cert sha256 pin")
-        w["ready_probe"] = entry(v.get("ready_probe"), "host:port reachable only over the VPN")
-        rows = [("type", w["type"]), ("gateway", w["gateway"]), ("port", w["port"]),
+        w["ready_probe"] = entry(v.get("ready_probe"),
+                                 "host:port reachable only over the VPN (drives the pill)")
+        rows = [("name", w["name"]), ("type", w["type"]),
+                ("gateway", w["gateway"]), ("port", w["port"]),
                 ("vault login", w["vault_item"]), ("config", w["config"]),
                 ("domain", w["domain"]), ("realm", w["realm"]),
                 ("trusted_cert", w["trusted_cert"]), ("ready_probe", w["ready_probe"])]
@@ -588,32 +1092,363 @@ class ConfigWindow(Gtk.Window):
             h.set_xalign(0.0)
             g.attach(h, 0, r, 1, 1)
             g.attach(widget, 1, r, 1, 1)
-        box.pack_start(g, False, False, 0)
+        inner.pack_start(g, False, False, 0)
 
         w["insecure"] = Gtk.CheckButton(label="skip TLS verify (inode — trusted LAN only)")
         w["insecure"].set_active(bool(v.get("insecure")))
         w["config_from_vault"] = Gtk.CheckButton(
             label="config from the vault item's Notes (openvpn / wireguard)")
         w["config_from_vault"].set_active(bool(v.get("config_from_vault")))
-        box.pack_start(w["insecure"], False, False, 0)
-        box.pack_start(w["config_from_vault"], False, False, 0)
-        self._vpn_w = w
+        inner.pack_start(w["insecure"], False, False, 0)
+        inner.pack_start(w["config_from_vault"], False, False, 0)
+        frame.add(inner)
+        self._vpn_ws.append(w)
+        return frame
+
+    def _tab_security(self):
+        """PIN + TOTP enrollment for the Settings gate AND the panel lock.
+        Real-time complexity check on PIN entry."""
+        from . import totp as _totp
+        from . import complexity as _cx
+        from . import locker as _lk
+        sd = state_dir()
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_border_width(12)
+        note = Gtk.Label(label="PIN + TOTP gates: 'Settings' protects this "
+                               "configuration window; 'Panel lock' freezes "
+                               "the wall's input so a passer-by can't click "
+                               "around (display stays visible). Either or both "
+                               "may be enrolled; either unlocks.")
+        note.set_xalign(0.0); note.set_line_wrap(True)
+        note.get_style_context().add_class("soc-config-sub")
+        box.pack_start(note, False, False, 0)
+
+        def _section(title, on_set_pin, on_clr_pin, on_enroll_totp,
+                      on_clr_totp, has_pin, has_totp):
+            frame = Gtk.Frame(label=f"  {title}  ")
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            inner.set_border_width(8)
+            status = Gtk.Label(label="")
+            status.set_xalign(0.0); status.set_line_wrap(True)
+            status.get_style_context().add_class("soc-config-sub")
+            inner.pack_start(status, False, False, 0)
+
+            def _refresh():
+                bits = []
+                bits.append("PIN: SET ✓" if has_pin() else "PIN: (none)")
+                bits.append("TOTP: SET ✓" if has_totp() else "TOTP: (none)")
+                status.set_text("  ·  ".join(bits))
+            _refresh()
+
+            # PIN row + live complexity hint
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            pin_e = Gtk.Entry()
+            pin_e.set_visibility(False)
+            pin_e.set_input_purpose(Gtk.InputPurpose.PIN)
+            pin_e.set_placeholder_text("new PIN")
+            pin_e.set_hexpand(True)
+            cx_lbl = Gtk.Label(label="")
+            cx_lbl.set_xalign(0.0); cx_lbl.set_line_wrap(True)
+
+            def _on_change(_e):
+                v = pin_e.get_text()
+                if not v:
+                    cx_lbl.set_text("")
+                    return
+                r = _cx.check(v, kind="pin")
+                ctx = cx_lbl.get_style_context()
+                ctx.remove_class("soc-config-ok"); ctx.remove_class("soc-config-error")
+                ctx.add_class("soc-config-ok" if r.ok else "soc-config-error")
+                cx_lbl.set_text("✓ meets PIN policy" if r.ok
+                                else "✗ " + "; ".join(r.issues))
+            pin_e.connect("changed", _on_change)
+            set_b = Gtk.Button(label="Set PIN")
+            clr_b = Gtk.Button(label="Remove PIN")
+
+            def _set(_w):
+                v = pin_e.get_text()
+                r = _cx.check(v, kind="pin")
+                if not r.ok:
+                    status.set_text("PIN rejected — " + "; ".join(r.issues))
+                    return
+                try:
+                    on_set_pin(v)
+                    pin_e.set_text("")
+                    _refresh()
+                except Exception as e:                # noqa: BLE001
+                    status.set_text(f"could not set PIN: {e}")
+
+            def _clr(_w):
+                try:
+                    on_clr_pin()
+                    _refresh()
+                except Exception as e:                # noqa: BLE001
+                    status.set_text(f"could not remove PIN: {e}")
+            set_b.connect("clicked", _set)
+            clr_b.connect("clicked", _clr)
+            row.pack_start(pin_e, True, True, 0)
+            row.pack_start(set_b, False, False, 0)
+            row.pack_start(clr_b, False, False, 0)
+            inner.pack_start(row, False, False, 0)
+            inner.pack_start(cx_lbl, False, False, 0)
+
+            # TOTP row — Enroll generates a fresh secret, shows the otpauth://
+            # URI (which the operator pastes into their authenticator OR scans
+            # via a separate qr-render tool; we don't pull qrencode in to keep
+            # this stdlib).
+            trow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            enroll_b = Gtk.Button(label="Enroll TOTP")
+            unenroll_b = Gtk.Button(label="Remove TOTP")
+            uri_e = Gtk.Entry()
+            uri_e.set_editable(False)
+            uri_e.set_hexpand(True)
+            uri_e.set_placeholder_text("otpauth://... (appears after Enroll)")
+
+            def _enroll(_w):
+                try:
+                    s = _totp.generate_secret()
+                    on_enroll_totp(s)
+                    uri = _totp.provision_uri(s, "kiosk@soc.local",
+                                                issuer=f"SOC Wall — {title}")
+                    uri_e.set_text(uri)
+                    _refresh()
+                    status.set_text("TOTP enrolled — paste the URI into your "
+                                     "authenticator app (or scan after `qrencode "
+                                     "-t ANSIUTF8 '<uri>'`).")
+                except Exception as e:                # noqa: BLE001
+                    status.set_text(f"could not enroll TOTP: {e}")
+
+            def _unenroll(_w):
+                try:
+                    on_clr_totp()
+                    uri_e.set_text("")
+                    _refresh()
+                except Exception as e:                # noqa: BLE001
+                    status.set_text(f"could not remove TOTP: {e}")
+            enroll_b.connect("clicked", _enroll)
+            unenroll_b.connect("clicked", _unenroll)
+            trow.pack_start(uri_e, True, True, 0)
+            trow.pack_start(enroll_b, False, False, 0)
+            trow.pack_start(unenroll_b, False, False, 0)
+            inner.pack_start(trow, False, False, 0)
+            frame.add(inner)
+            return frame
+
+        # ⚙ Settings PIN/TOTP (the gate that opens this very window)
+        box.pack_start(_section(
+            title="Settings access (this window)",
+            on_set_pin=set_pin, on_clr_pin=clear_pin,
+            on_enroll_totp=lambda s: _totp.save(_totp_path(), s),
+            on_clr_totp=lambda: _totp.clear(_totp_path()),
+            has_pin=pin_is_set, has_totp=totp_is_set,
+        ), False, False, 0)
+
+        # Panel-lock PIN/TOTP (the input-firewall over the wall)
+        box.pack_start(_section(
+            title="Panel lock (input firewall over the wall)",
+            on_set_pin=lambda v: _lk.set_pin(sd, v),
+            on_clr_pin=lambda: _lk.clear_pin(sd),
+            on_enroll_totp=lambda s: _totp.save(_lk._totp_path(sd), s),
+            on_clr_totp=lambda: _totp.clear(_lk._totp_path(sd)),
+            has_pin=lambda: _lk.pin_is_set(sd),
+            has_totp=lambda: _lk.totp_is_set(sd),
+        ), False, False, 0)
+        return box
+
+    def _tab_actions(self):
+        """Operator actions that aren't config edits — recover from a wedged
+        panel, soft-restart the wall to pick up new layout/grid/resolution,
+        reboot the box, or run setup.py repair without a shell."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_border_width(12)
+        note = Gtk.Label(label="Operator actions. The wall service has "
+                               "Restart=always (RestartSec=3), so 'Restart "
+                               "wall' is a 3-second blip — used to apply "
+                               "layout / grid / resolution changes live.")
+        note.get_style_context().add_class("soc-config-sub")
+        note.set_xalign(0.0)
+        note.set_line_wrap(True)
+        box.pack_start(note, False, False, 0)
+
+        msg = Gtk.Label(label="")
+        msg.get_style_context().add_class("soc-config-ok")
+        msg.set_xalign(0.0)
+        msg.set_line_wrap(True)
+
+        def _confirm_and_run(label, callable_):
+            # Two-click confirmation: first click changes button text, second
+            # actually fires. Prevents an accidental "Reboot" from a fat-finger.
+            state = {"armed": False}
+
+            def cb(btn):
+                if not state["armed"]:
+                    state["armed"] = True
+                    btn.set_label(f"Confirm: {label}")
+                    GLib.timeout_add_seconds(4, _disarm, btn)
+                    return
+                state["armed"] = False
+                btn.set_label(label)
+                try:
+                    callable_()
+                    msg.set_text(f"{label} ✓")
+                except Exception as e:  # noqa: BLE001
+                    msg.set_text(f"{label} failed: {e}")
+
+            def _disarm(btn):
+                if state["armed"]:
+                    state["armed"] = False
+                    btn.set_label(label)
+                return False
+            return cb
+
+        def _reboot_machine():
+            import subprocess
+            try:
+                subprocess.run(["systemctl", "reboot"], timeout=10,
+                               stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, check=True)
+            except Exception:                          # noqa: BLE001
+                raise RuntimeError(
+                    "needs root — run: sudo systemctl reboot")
+
+        def _repair_install():
+            import subprocess
+            try:
+                subprocess.Popen(
+                    ["sudo", "-n", "/opt/soc-display/.venv/bin/python",
+                     "/opt/soc-display/setup.py", "repair"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:                          # noqa: BLE001
+                raise RuntimeError(
+                    "needs root — run: sudo python3 /opt/soc-display/setup.py repair")
+
+        grid = Gtk.Grid()
+        grid.set_column_spacing(10)
+        grid.set_row_spacing(10)
+        rows = []
+
+        if self._actions.get("reload_panels"):
+            b = Gtk.Button(label="Reload panels")
+            b.set_tooltip_text("Refresh every panel in place (no restart). "
+                               "Use when a panel is stuck or a dashboard "
+                               "rotation is needed.")
+            b.connect("clicked", _confirm_and_run(
+                "Reload panels", self._actions["reload_panels"]))
+            rows.append(("Reload panels (in-place)", b))
+
+        if self._actions.get("restart_wall"):
+            b = Gtk.Button(label="Restart wall")
+            b.get_style_context().add_class("soc-config-primary")
+            b.set_tooltip_text("Soft-restart the wall process — systemd "
+                               "respawns it in ~3 s. Use this to apply "
+                               "layout / grid / resolution / SOC_SESSION "
+                               "changes without rebooting the box.")
+            b.connect("clicked", _confirm_and_run(
+                "Restart wall", self._actions["restart_wall"]))
+            rows.append(("Restart wall (systemd respawn)", b))
+
+        b = Gtk.Button(label="Repair install")
+        b.set_tooltip_text("Run setup.py repair as root. Fixes perms, "
+                           "re-seeds rbw config, re-ensures /run/user/<soc>.")
+        b.connect("clicked", _confirm_and_run("Repair install", _repair_install))
+        rows.append(("Repair install (setup.py repair)", b))
+
+        b = Gtk.Button(label="Reboot machine")
+        b.set_tooltip_text("systemctl reboot — needs root.")
+        b.connect("clicked", _confirm_and_run("Reboot", _reboot_machine))
+        rows.append(("Reboot machine", b))
+
+        for r, (lbl, w) in enumerate(rows):
+            h = Gtk.Label(label=lbl)
+            h.get_style_context().add_class("soc-config-sub")
+            h.set_xalign(0.0)
+            grid.attach(h, 0, r, 1, 1)
+            grid.attach(w, 1, r, 1, 1)
+        box.pack_start(grid, False, False, 0)
+        box.pack_start(msg, False, False, 0)
         return box
 
     def _tab_status(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.set_border_width(12)
+        panels_total = len(self.panels)
         configured = sum(1 for p in self.panels if getattr(p, "configured", False))
+        with_creds = sum(1 for p in self.panels if p.vault_item)
+        vw_url = os.environ.get("SOC_VAULT_URL", "http://127.0.0.1:8222")
+        vw_email = os.environ.get("SOC_VAULT_EMAIL", "")
+        vw_reachable = _vw_reachable(vw_url)
+        from . import secretstore
+        sealed = secretstore.is_sealed(os.environ.get("SOC_SECRET_DIR"))
+
         lines = [
-            f"vault backend : {os.environ.get('SOC_VAULT_BACKEND', 'rbw')}",
-            f"panels        : {configured}/{len(self.panels)} configured",
-            f"auto-login    : {sum(1 for p in self.panels if p.vault_item)} panel(s)",
-            "VPN status    : shown in the top bar (click the pill to re-check)",
+            f"vault backend  : {os.environ.get('SOC_VAULT_BACKEND', 'rbw')}",
+            f"vault server   : {vw_url}  "
+            f"({'reachable ✓' if vw_reachable else 'NOT REACHABLE ✗'})",
+            f"vault account  : {vw_email or '(SOC_VAULT_EMAIL is empty)'}",
+            f"master sealed  : "
+            f"{'yes ✓' if sealed else 'NO ✗ — run sudo python3 setup.py first-run'}",
+            f"panels         : {configured}/{panels_total} configured "
+            f"({panels_total - configured} blank click-to-configure)",
+            f"auto-login     : {with_creds}/{panels_total} panel(s) have a vault item set",
+            "VPN status     : shown in the top bar (click the pill to re-check)",
         ]
         for ln in lines:
             lbl = Gtk.Label(label=ln)
             lbl.get_style_context().add_class("soc-config-sub")
             lbl.set_xalign(0.0)
+            box.pack_start(lbl, False, False, 0)
+
+        # Loud warnings — what the audit asked for. The operator opens this tab
+        # when something feels off, so each warning is a one-line "you have a
+        # silent failure waiting for you" with the fix hint inline.
+        warnings = []
+        if not vw_reachable:
+            warnings.append(f"⚠ Vaultwarden at {vw_url} is NOT reachable — "
+                            f"auto-login and the Credentials tab will fail. "
+                            f"Check 'systemctl status vaultwarden'.")
+        if not sealed:
+            warnings.append("⚠ Master password is NOT host-sealed — the wall "
+                            "cannot self-unlock the vault at boot, so "
+                            "auto-login is dead until you run "
+                            "'sudo python3 setup.py first-run'.")
+        if vw_reachable and not vw_email:
+            warnings.append("⚠ SOC_VAULT_EMAIL is empty in soc.env — register "
+                            "an account and set the email via setup.py "
+                            "wizard, then re-run first-run.")
+        if configured > 0 and with_creds == 0:
+            warnings.append(f"⚠ {configured} panel(s) have a URL but NO vault "
+                            f"item — those panels will show the login page "
+                            f"without auto-filling. Set a vault item on the "
+                            f"Panels tab and store the login on Credentials.")
+        if with_creds > 0 and not vw_reachable:
+            warnings.append(f"⚠ {with_creds} panel(s) depend on the vault for "
+                            f"auto-login but the vault is unreachable — fix "
+                            f"vaultwarden first.")
+        # Selector-staleness — a panel that has burnt most of its login retry
+        # budget without ever firing on_login_success usually means the
+        # dashboard was redesigned and the selectors / login_marker no longer
+        # match. Audit MED #9.
+        if callable(self._login_stats):
+            try:
+                stats = self._login_stats() or {}
+            except Exception:                # noqa: BLE001
+                stats = {}
+            stale = [pid for pid, s in stats.items()
+                     if isinstance(s, dict) and s.get("stale")]
+            if stale:
+                warnings.append(
+                    f"⚠ selectors may be stale on {len(stale)} panel(s): "
+                    f"{', '.join(sorted(stale))}. The dashboard probably "
+                    f"changed; update the user/pass/submit selectors and "
+                    f"login_marker on the Panels tab > Advanced.")
+        for w in warnings:
+            lbl = Gtk.Label(label=w)
+            lbl.get_style_context().add_class("soc-config-error")
+            lbl.set_xalign(0.0)
+            lbl.set_line_wrap(True)
             box.pack_start(lbl, False, False, 0)
         return box
 
@@ -690,45 +1525,124 @@ class ConfigWindow(Gtk.Window):
             # only url/title/vault apply live; the rest persist for next restart
             changes[pid] = {"url": url, "title": title, "vault_item": vault_item}
             entry = overrides.get(pid, {}) if isinstance(overrides.get(pid), dict) else {}
+            relogin = w["relogin"].get_text().strip()
+            bbuf = w["blocked"].get_buffer()
+            blocked = [ln.strip() for ln in bbuf.get_text(
+                bbuf.get_start_iter(), bbuf.get_end_iter(), False).splitlines()
+                if ln.strip()]
             entry.update({"url": url, "title": title, "vault_item": vault_item,
-                          "engine": engine, "selectors": sel, "login_marker": marker})
+                          "engine": engine, "selectors": sel, "login_marker": marker,
+                          "allow_insecure": bool(w["allow_insecure"].get_active()),
+                          "allow_media": bool(w["allow_media"].get_active()),
+                          "proxy": bool(w["proxy"].get_active()),
+                          "keepalive": {
+                              "strategy": w["ka_strat"].get_active_text() or "none",
+                              "intervalSec": int(w["ka_int"].get_value())},
+                          "relogin_url": relogin,
+                          "blocked_url_patterns": blocked})
             overrides[pid] = entry
 
         if self.display is not None:
             disp = {"layout": self._layout_c.get_active_text() or "auto",
-                    "gap": int(self._gap_s.get_value())}
+                    "gap": int(self._gap_s.get_value()),
+                    "cols": int(self._cols_s.get_value()),
+                    "rows": int(self._rows_s.get_value()),
+                    "auto": bool(self._disp_auto.get_active()),
+                    "width": int(self._w_s.get_value()),
+                    "height": int(self._h_s.get_value()),
+                    "fullscreen": bool(self._fullscreen_c.get_active())}
             overrides["_display"] = disp
             changes["_display"] = disp
 
-        if self._vpn is not None and self._vpn_w:
-            w = self._vpn_w
-            vpncfg = vpn_form_to_dict({
+        if self._vpn is not None and self._vpn_ws:
+            vpns_out = []
+            for idx, w in enumerate(self._vpn_ws):
+                cfg = vpn_form_to_dict({
+                    "enabled": w["enabled"].get_active(),
+                    "type": w["type"].get_active_text() or "fortinet",
+                    "gateway": w["gateway"].get_text(),
+                    "port": int(w["port"].get_value()),
+                    "vault_item": w["vault_item"].get_text(),
+                    "config": w["config"].get_text(),
+                    "domain": w["domain"].get_text(),
+                    "realm": w["realm"].get_text(),
+                    "trusted_cert": w["trusted_cert"].get_text(),
+                    "ready_probe": w["ready_probe"].get_text(),
+                    "insecure": w["insecure"].get_active(),
+                    "config_from_vault": w["config_from_vault"].get_active(),
+                })
+                cfg["name"] = (w["name"].get_text().strip()
+                               or f"vpn-{idx+1}")
+                vpns_out.append(cfg)
+            overrides["_vpns"] = vpns_out
+            changes["_vpns"] = vpns_out
+            # back-compat: first entry under the legacy key
+            overrides["_vpn"] = vpns_out[0] if vpns_out else {}
+            changes["_vpn"] = vpns_out[0] if vpns_out else {}
+
+        if self._proxy is not None and self._proxy_w:
+            w = self._proxy_w
+            pcfg = proxy_form_to_dict({
                 "enabled": w["enabled"].get_active(),
-                "type": w["type"].get_active_text() or "fortinet",
-                "gateway": w["gateway"].get_text(),
-                "port": int(w["port"].get_value()),
+                "url": w["url"].get_text(),
                 "vault_item": w["vault_item"].get_text(),
-                "config": w["config"].get_text(),
-                "domain": w["domain"].get_text(),
-                "realm": w["realm"].get_text(),
-                "trusted_cert": w["trusted_cert"].get_text(),
-                "ready_probe": w["ready_probe"].get_text(),
-                "insecure": w["insecure"].get_active(),
-                "config_from_vault": w["config_from_vault"].get_active(),
+                "ignore_hosts": w["ignore_hosts"].get_text(),
             })
-            overrides["_vpn"] = vpncfg
-            changes["_vpn"] = vpncfg
+            overrides["_proxy"] = pcfg
+            changes["_proxy"] = pcfg
+
+        if self._tunnel is not None and self._tunnel_w:
+            w = self._tunnel_w
+            buf = self._tunnel_ef.get_buffer()
+            ef = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+            tcfg = tunnel_form_to_dict({
+                "enabled": w["enabled"].get_active(),
+                "jump_host": w["jump_host"].get_text(),
+                "identity": w["identity"].get_text(),
+                "known_hosts": w["known_hosts"].get_text(),
+                "host_key_checking": w["host_key_checking"].get_active_text() or "yes",
+                "extra_forwards": ef,
+            })
+            overrides["_tunnel"] = tcfg
+            changes["_tunnel"] = tcfg
 
         save_overrides(overrides)
         try:
-            self.on_apply(changes)
+            result = self.on_apply(changes) or {}
         except Exception as e:  # noqa: BLE001 — never let a bad apply kill the window
             self._msg(f"apply error: {e}", error=True)
             return
-        self._msg("Applied ✓  — URL/title/vault live; engine/selectors/layout on restart")
+        # Tell the truth: pending_restarts (the wall can't restart units when it
+        # runs as `soc` with NoNewPrivileges) and write_back ('deferred:<reason>'
+        # when overrides.json was saved but the vault note can't be updated —
+        # next boot's stale vault note will silently win otherwise).
+        pending = result.get("pending_restarts") or []
+        write_back = result.get("write_back", "ok")
+        self_restart = bool(result.get("self_restart"))
+        bits = ["Saved ✓ — overrides.json updated"]
+        if self_restart:
+            bits.append("restarting wall to apply layout/grid/resolution "
+                        "(systemd respawns in ~3s)")
+        if pending:
+            bits.append("⚠ PENDING restart (reboot the wall, or `sudo "
+                        f"systemctl restart {' '.join(pending)}` as root): "
+                        f"{', '.join(pending)}")
+        if isinstance(write_back, str) and write_back.startswith("deferred:"):
+            bits.append(f"⚠ vault config-note NOT written ({write_back[9:]}) — "
+                        "your changes will be lost at the next boot unless you "
+                        "fix this. Local overrides remain in effect for now.")
+        elif write_back == "ok":
+            bits.append("vault note write-back scheduled")
+        self._msg("  ·  ".join(bits), error=bool(pending) or (
+                  isinstance(write_back, str) and write_back.startswith("deferred:")))
 
-    def _on_key(self, _w, event):
-        if event.keyval == Gdk.KEY_Escape:
-            self.close()
-            return True
+    def _on_focus_out(self, *_):
+        # Pull the window back to the front whenever the kiosk steals focus.
+        # set_keep_above() handles stacking, present() re-marks it as the
+        # active window so a click on a panel underneath doesn't visually
+        # bury us. Returning False lets other handlers run normally.
+        try:
+            self.present()
+        except Exception:  # noqa: BLE001 — never let UX polish kill the wall
+            pass
         return False

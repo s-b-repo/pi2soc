@@ -341,6 +341,14 @@ class ChromiumPanel:
             "--disable-pinch", "--overscroll-history-navigation=0",
             "--disable-features=Translate,OptimizationHints",
             f"--ozone-platform={_ozone_platform()}",
+            # Anti-fingerprinting: pin a generic Chrome UA so a passing scanner
+            # / MITM reading wall traffic can't read the exact Chromium build +
+            # Pi kernel signature. SOC_BROWSER_UA overrides if a specific
+            # dashboard insists on a non-Chrome UA.
+            "--user-agent=" + os.environ.get(
+                "SOC_BROWSER_UA",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
             # sandbox stays ON in production. Some restricted CI/containers can't
             # init Chromium's namespace sandbox; SOC_CHROMIUM_NO_SANDBOX=1 is a
             # DEV-ONLY escape hatch (never set it on the Pi).
@@ -367,12 +375,28 @@ class ChromiumPanel:
                                      stderr=subprocess.DEVNULL,
                                      start_new_session=True, close_fds=True)
 
-    # ---- proxy auth over CDP ------------------------------------------------
+    # ---- proxy auth + blocked-URL filter over CDP ---------------------------
     def _on_cdp_event(self, method, params):
         self._last_fetch_event = time.time()
         if method == "Fetch.requestPaused":
-            self.cdp.send_nowait("Fetch.continueRequest",
-                                 {"requestId": params["requestId"]})
+            rid = params.get("requestId")
+            req_url = (params.get("request") or {}).get("url") or ""
+            # Blocked-URL filter — same semantics as the WebKit decide-policy
+            # hook. fnmatch against panel.blocked_url_patterns; on match, fail
+            # the request with BlockedByClient so Chromium renders its standard
+            # ERR_BLOCKED_BY_CLIENT page and the operator sees they hit a wall.
+            patterns = getattr(self.panel, "blocked_url_patterns", None) or []
+            if patterns and req_url:
+                import fnmatch
+                for pat in patterns:
+                    if fnmatch.fnmatch(req_url, pat):
+                        self.cdp.send_nowait("Fetch.failRequest", {
+                            "requestId": rid,
+                            "errorReason": "BlockedByClient"})
+                        self.log(f"[{self.panel.id}] blocked navigation to "
+                                 f"{req_url} (matches blocked_url_pattern {pat!r})")
+                        return
+            self.cdp.send_nowait("Fetch.continueRequest", {"requestId": rid})
             return
         if method != "Fetch.authRequired":
             return
@@ -417,8 +441,13 @@ class ChromiumPanel:
     def _proxy_auth_phase(self):
         """Brief window after attach where the Fetch domain is enabled and
         pumped fast, so the proxy's 407 gets answered without slowing the wall
-        long-term. Chromium caches the proxy session afterwards."""
-        if not self._needs_proxy_auth():
+        long-term. Chromium caches the proxy session afterwards.
+
+        Also the install point for the per-panel blocked-URL filter: if
+        `blocked_url_patterns` is set, we keep Fetch.enable on FOREVER so the
+        same handler can intercept every navigation."""
+        wants_block = bool(getattr(self.panel, "blocked_url_patterns", None))
+        if not self._needs_proxy_auth() and not wants_block:
             return
         self._auth_attempts = 0
         self._auth_failed = False
@@ -437,15 +466,29 @@ class ChromiumPanel:
                     break
                 # page settled (no paused requests for 2s after the initial
                 # burst) -> auth is done, stop intercepting
+                # If this panel has a blocked-URL list, we MUST keep Fetch on
+                # for the lifetime of the panel so we can intercept every
+                # subsequent navigation. Skip the "auth done, settle down"
+                # exit and run until proxy auth has succeeded once.
+                if getattr(self.panel, "blocked_url_patterns", None):
+                    if self._auth_attempts == 0 and time.time() - start > 1.0:
+                        break
+                    continue
                 if (time.time() - start > 3.0
                         and time.time() - self._last_fetch_event > 2.0):
                     break
-            self.cdp.rpc("Fetch.disable")
+            # Leave Fetch.enable ON if the panel has a blocked-URL list —
+            # the same handler that answered the proxy auth challenge will
+            # keep enforcing the blocklist for every subsequent navigation.
+            if not (getattr(self.panel, "blocked_url_patterns", None)):
+                self.cdp.rpc("Fetch.disable")
         except Exception as e:  # noqa: BLE001
             self.log(f"[{self.panel.id}] proxy auth phase: {e}")
         finally:
             if self.cdp:
-                self.cdp.on_event = None
+                # Keep the event handler live for the blocked-URL filter.
+                if not (getattr(self.panel, "blocked_url_patterns", None)):
+                    self.cdp.on_event = None
 
     def _attach_cdp(self) -> bool:
         p = self.panel
@@ -546,6 +589,18 @@ class ChromiumPanel:
                             self.on_login_success(p)
                         except Exception:        # noqa: BLE001
                             pass
+                    # Post-login landing (per panel) — navigate to the
+                    # dashboard's real "home" once per page load. Same guard
+                    # as the WebKit path so a relogin URL that itself bounces
+                    # back to login can't loop the wall.
+                    relogin = getattr(p, "relogin_url", None)
+                    if relogin and not getattr(self, "_relogin_landed", False):
+                        try:
+                            self._relogin_landed = True
+                            self.log(f"[{p.id}] post-login -> relogin_url {relogin}")
+                            self.cdp.send_nowait("Page.navigate", {"url": relogin})
+                        except Exception as e:                 # noqa: BLE001
+                            self.log(f"[{p.id}] relogin nav failed: {e}")
                 if need:
                     self._login_attempts += 1
                     if self._login_attempts > MAX_LOGIN_ATTEMPTS:
@@ -598,6 +653,7 @@ class ChromiumPanel:
         # the control loop will try the new URL.
         self._fail_streak = 0
         self._parked = False
+        self._relogin_landed = False     # fresh URL → allow relogin nav again
         if self.cdp:
             self.cdp.close()
             self.cdp = None

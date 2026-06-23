@@ -1,9 +1,9 @@
 # Full setup guide
 
 This is the single, start-to-finish walkthrough for bringing up the SOC video
-wall — on a **Raspberry Pi** (production) or on a **dev workstation** (no Pi
-needed). It ties together the interactive wizard (`setup.py`) and the manual
-steps, and covers the autossh **tunnel** and the Fortinet **VPN**.
+wall on a **Raspberry Pi** (production). It ties together the `setup.py` installer,
+the first-launch setup page, and the manual steps, and covers the autossh
+**tunnel** and the Fortinet **VPN**.
 
 For deep dives see [ARCHITECTURE](ARCHITECTURE.md), [CONFIGURATION](CONFIGURATION.md),
 [INSTALL](INSTALL.md), and [SECURITY](SECURITY.md). This page is the map.
@@ -35,94 +35,102 @@ host-bound under `/etc/soc-display/secret/` (`setup.py first-run`, no plaintext
 
 ---
 
-## 1. The fast path: `setup.py`
+## 1. The fast path: two tools
 
-`setup.py` is a pure-stdlib, re-runnable wizard. It detects your environment,
-asks one section at a time, validates the result, and offers to run the installer
-or the dev harness at the end.
+There are two tools. **`setup.py` installs** (OS packages + services, via `install.sh`,
+plus an optional PIN seal). **`launch.sh` is the app** — it runs the wall, and the very
+first run walks through a one-time **setup page** (screen preset + panels, and the vault
+PIN if it was not sealed at install). After that the wall launches straight away; the page
+is gated by the marker `/etc/soc-display/.configured` and re-run with `launch.sh --reconfigure`.
 
 ```bash
-python3 setup.py              # interactive menu (Deploy / Configure / First-time setup / …)
-python3 setup.py deploy       # end-to-end: install → configure → seal PIN → creds → check
-python3 setup.py deploy --clean  # wipe generated config/state first, then deploy fresh
-python3 setup.py deploy --fresh   # force a full OS reinstall (deploy skips it if already installed)
-python3 setup.py first-run    # generate the one-time PIN + seal the master password
-python3 setup.py wizard       # just the configuration wizard
-python3 setup.py --dry-run    # show what it would write, write nothing
-python3 setup.py --defaults   # accept every default (non-interactive wizard)
-python3 setup.py --target dev # force dev output (config/panels.local.yaml, .env)
-python3 setup.py --target pi  # force Pi output (/etc/soc-display/...)  [needs sudo]
-python3 setup.py --section vpn   # one section: display|panels|tunnel|vpn|proxy|vault|server
+# Install (once, as root) — OS packages + services; the wall configures itself on first launch
+sudo python3 setup.py             # the install tool (asks before doing anything)
+sudo python3 setup.py --fresh     # force a full OS package reinstall
+
+# Run the wall (the app)
+./launch.sh                       # run; the FIRST run shows the setup page once, then launches
+./launch.sh --setup               # run the first-time setup page now, then exit
+./launch.sh --reconfigure         # re-run the setup page, then launch
+./launch.sh --repair              # diagnose + fix this install (setup.py doctor/repair)
+
+# setup.py subcommands (also via `python3 setup.py menu`)
+python3 setup.py firstboot        # the once-only first-launch setup page (screen + panels + seal-if-needed)
+python3 setup.py deploy           # all-in-one: install → configure → seal PIN → creds → check
+python3 setup.py deploy --clean   # wipe generated config/state first, then deploy fresh
+python3 setup.py wizard           # just the configuration wizard
+python3 setup.py first-run        # generate the one-time PIN + seal the master password
+python3 setup.py doctor           # diagnose            python3 setup.py repair   # fix what doctor flags
+python3 setup.py --dry-run        # show what it would write, write nothing
+python3 setup.py --defaults       # accept every default (non-interactive)
+python3 setup.py --section vpn    # one section: display|panels|tunnel|vpn|proxy|vault|server
 ```
 
-It chooses the target automatically: **root → Pi**, otherwise **dev**. Re-running
+It writes to `/etc/soc-display` (needs root/sudo). Re-running
 loads your previous answers as the defaults, and every file is backed up
 (`*.bak.<timestamp>`) before it's overwritten.
 
 The seven sections:
 
-1. **Display** — resolution (auto/manual), the grid (cols × rows, gap), and the
+1. **Display** — screen size as a **preset** (1080p / 1440p / 4K / 720p), **auto**-detect
+   at launch, or a **custom** width × height; the grid (cols × rows, gap); and the
    `layout` (auto/windows/single).
 2. **Panels** — per panel: id, engine (`webkit`/`chromium`), grid cell, `direct`
    vs `tunnel`, URL or tunnel forward, `vault_item`, login **selectors**,
-   `login_marker`, keep-alive.
+   `login_marker`, keep-alive. For `direct` panels the wizard **probes the URL
+   and auto-detects the selectors + login type**, so you usually just confirm
+   *“Use these detected selectors? [Y]”*. See the
+   [wizard walkthrough](WIZARD.md) for every prompt, with examples.
 3. **Tunnel** — autossh jump host + identity key (asked when any panel is tunneled).
 4. **VPN** — Fortinet gateway, `vault_item`, cert pinning (can fetch the digest
    for you), routing/DNS, supervisor reconnect + liveness check, optional TOTP.
 5. **Proxy** — optional outbound HTTP(S)/SOCKS proxy: URL, the vault login holding
    its credentials (in-memory auth), and hosts to bypass.
-6. **Vault** — backend (`rbw` prod / `dev` JSON), account email/URL, the secret
-   dir + config-note name, and the session backend. The master password is **not**
+6. **Vault** — account email/URL, the secret dir + config-note name, and the
+   session backend (rbw → Vaultwarden). The master password is **not**
    entered here — it is sealed later by `first-run` (one-time PIN).
 7. **Server** — Vaultwarden bind + admin token (can generate the argon2 hash).
 
-> **Selectors tip:** open the panel's login page in a browser, right-click the
-> username field → Inspect, and copy a stable CSS selector (prefer `#id`). Do the
-> same for the password field and submit button. `login_marker` should exist
-> **only** on the login page (the password field is usually perfect) — it's how
-> the host detects "logged out" and re-logs-in. See
-> [CONFIGURATION.md](CONFIGURATION.md#finding-selectors).
+> **Selectors are not credentials.** The selector prompts ask *where* the login
+> boxes are on the page (`#name`, `#password`) — **not** your username/password,
+> which go into the Vaultwarden `vault_item` (stored with `setup.py creds`).
+> The wizard auto-detects the selectors from the URL, so usually you just press
+> Enter at *“Use these detected selectors?”*. `login_marker` is the wall's
+> "logged out?" detector — a selector seen **only** on the login page (the
+> password box is perfect, and the suggested default). Full prompt-by-prompt
+> detail with examples: **[the wizard walkthrough](WIZARD.md)** (see also
+> [CONFIGURATION.md](CONFIGURATION.md#finding-selectors)).
+
+> **Don't have the panel details yet? Skip them.** Answer **n** to *“Configure
+> panels now?”* (or per panel) to install with blank *click-to-configure* tiles,
+> then set each tile's **URL, vault login _and_ credentials** — plus the
+> **VPN**, **proxy**, **SSH tunnel jump host**, **grid size**, and
+> **resolution** — from the running wall's **⚙ settings window** (corner gear /
+> **Ctrl+Shift+C**). No SSH, no file editing. See
+> [Configure at the glass](WIZARD.md#configure-at-the-glass-no-wizard-needed).
 
 After it writes the files it runs a parse + geometry check, so you'll know
 immediately if anything is off.
 
-For production, follow the wizard with **`setup.py first-run`** (generates the
-one-time PIN and seals the master password — no plaintext `.env`) and let it push
-the config into the Vaultwarden `SOC Wall Config` note (the boot source of truth).
-**`setup.py deploy`** chains the installer, the wizard, sealing, and credential
-storage in one go.
+For production the order is: **`sudo python3 setup.py`** (install) → first boot (or
+`./launch.sh`), which runs the **first-time setup page** once — the wizard, the one-time
+PIN seal if it was not done at install, and the push of the config into the Vaultwarden
+`SOC Wall Config` note (the boot source of truth). On the Pi the page runs automatically
+on tty1 the first time (`soc-firstboot.service`) and never again. **`setup.py deploy`**
+still chains the installer, wizard, sealing, and credential storage in one pass for a
+hands-on, all-at-once install.
 
 ---
 
-## 2. Dev workstation walkthrough (no Pi)
+## 2. Testing the tooling (any Linux box)
 
-Try the whole wall on x86 against bundled dummy panels.
-
-**Prereqs:** `python3`, `python3-gi`, `gir1.2-webkit2-4.x`, `Xvfb`/`Xephyr`,
-`chromium`, ImageMagick (`import`). Optional for the real vault path: `rbw`,
-Docker.
+The unit tests run anywhere — no Pi, no display, no Vaultwarden (they use a fake
+in-memory vault, `kiosk-host/tests/conftest.py`):
 
 ```bash
-make venv                 # build .venv (PyYAML, websocket-client, pytest)
-python3 setup.py --target dev    # (optional) generate config/panels.local.yaml + .env
-make dev-vault            # write dev/run/dev-vault.json (the dev vault backend)
-make verify               # headless end-to-end: 4 logins + tunnel gate + screenshot
-make verify-single        # headless: the single-window (Wayland) layout
-make verify-proxy         # headless: authenticated-proxy path (WebKit + Chromium)
-make dev                  # interactive: the wall in a Xephyr window (Ctrl-C to stop)
-make test                 # unit tests (config, injection, vault, VPN, proxy, perf)
-```
-
-The dev run uses `config/panels.dev.yaml` and the **dev vault backend** (a JSON
-file), so no Vaultwarden is needed. To exercise the real **rbw → Vaultwarden**
-path: `make vault` (starts Vaultwarden in Docker, registers an account, seeds 4
-logins, verifies `rbw` reads them).
-
-**Try the VPN wiring without a FortiGate:**
-
-```bash
-make vpn-check            # resolves VPN creds from the dev vault and prints the
-                          # openfortivpn command it WOULD run — no connection
+make venv     # build .venv (PyYAML, websocket-client, pytest, cryptography)
+make test     # unit tests (config, injection, vault facade, VPN supervisor, proxy, perf)
+make lint     # shell + python syntax check
 ```
 
 ---

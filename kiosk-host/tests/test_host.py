@@ -120,14 +120,8 @@ def test_inject_substitution_and_escaping():
     assert "socLogin(" in call
 
 
-def test_vault_dev_backend(monkeypatch):
-    data = {"Item 1": {"username": "u1", "password": "s3cr3t"}}
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
-        json.dump(data, fh)
-        path = fh.name
-    monkeypatch.setenv("SOC_VAULT_BACKEND", "dev")
-    monkeypatch.setenv("SOC_DEV_VAULT", path)
-    v = vault.Vault()
+def test_vault_backend(fake_vault):
+    v = fake_vault({"Item 1": {"username": "u1", "password": "s3cr3t"}})
     v.open()
     c = v.creds("Item 1")
     assert c == {"user": "u1", "pass": "s3cr3t"}
@@ -135,13 +129,8 @@ def test_vault_dev_backend(monkeypatch):
     assert v.creds("Item 1")["pass"] == "s3cr3t"
 
 
-def test_vault_dev_missing_item(monkeypatch):
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
-        json.dump({}, fh)
-        path = fh.name
-    monkeypatch.setenv("SOC_VAULT_BACKEND", "dev")
-    monkeypatch.setenv("SOC_DEV_VAULT", path)
-    v = vault.Vault()
+def test_vault_missing_item(fake_vault):
+    v = fake_vault({})
     v.open()
     try:
         v.creds("nope")
@@ -428,7 +417,7 @@ _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 def _run_gen(script, template, out, extra=()):
     r = subprocess.run(
         [sys.executable, os.path.join(_REPO, "scripts", script),
-         "--panels", os.path.join(_REPO, "config", "panels.dev.yaml"),
+         "--panels", os.path.join(os.path.dirname(__file__), "data", "panels.test.yaml"),
          "--template", os.path.join(_REPO, template), "--out", out, *extra],
         capture_output=True, text=True,
         env={**os.environ, "PYTHONPATH": os.path.join(_REPO, "kiosk-host")})
@@ -454,7 +443,7 @@ def test_gen_labwc_rules(tmp_path):
 
 
 def test_gen_openbox_if_auto(tmp_path):
-    # panels.dev.yaml has auto: true -> --if-auto applies the override
+    # panels.test.yaml has auto: true -> --if-auto applies the override
     out = _run_gen("gen-openbox-rc.py", "openbox/rc.xml.tmpl",
                    str(tmp_path / "rc.xml"),
                    extra=("--width", "1280", "--height", "720", "--if-auto"))
@@ -641,10 +630,9 @@ def test_probe_tcp_rejects_malformed():
         assert fortivpn.probe_tcp(bad) is False
 
 
-def test_vault_cache_evicts_expired(monkeypatch):
+def test_vault_cache_evicts_expired(fake_vault):
     import time as _t
-    monkeypatch.setenv("SOC_VAULT_BACKEND", "dev")
-    v = vault.Vault(ttl=30.0)
+    v = fake_vault(ttl=30.0)
     v._cache["stale"] = (_t.time() - 60.0, ("u", "p"))       # older than ttl
     v._cache["fresh"] = (_t.time(), ("u", "p"))
     assert v.cached("fresh") is True                          # sweeps on access
@@ -891,12 +879,9 @@ vpn: {enabled: true, type: wireguard, config_from_vault: true}
 """, "config_from_vault needs 'vault_item'")
 
 
-def test_vpn_materialize_config_from_vault(tmp_path, monkeypatch):
-    monkeypatch.setenv("SOC_VAULT_BACKEND", "dev")
-    vfile = tmp_path / "vault.json"
-    vfile.write_text(json.dumps({"WG": {"username": "", "password": "x",
-                                        "notes": "[Interface]\nPrivateKey=SECRET\n"}}))
-    monkeypatch.setenv("SOC_DEV_VAULT", str(vfile))
+def test_vpn_materialize_config_from_vault(tmp_path, monkeypatch, use_fake_backend):
+    use_fake_backend({"WG": {"username": "", "password": "x",
+                             "notes": "[Interface]\nPrivateKey=SECRET\n"}})
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
     from host import fortivpn
     vpn = {"enabled": True, "type": "wireguard", "config": "wg0",
@@ -910,6 +895,32 @@ def test_vpn_materialize_config_from_vault(tmp_path, monkeypatch):
     assert (os.stat(path).st_mode & 0o777) == 0o600     # transient + owner-only
     sup._cleanup_materialized()
     assert not os.path.exists(path)                     # removed on disconnect
+
+
+def test_vpn_materialize_fortinet_kv_from_vault_notes(use_fake_backend):
+    """Fortinet config_from_vault overlays a KEY=VALUE notes block onto the
+    vpn dict in-memory (never written to disk)."""
+    use_fake_backend({"VPN HQ": {"username": "alice", "password": "x",
+                                  "notes": (
+                                      "# the production HQ fortigate\n"
+                                      "gateway = vpn.hq.acme.com\n"
+                                      "port=443\n"
+                                      "realm = staff\n"
+                                      "trusted_cert=" + "a"*64 + "\n"
+                                      "set_routes = true\n"
+                                      "bogus_field = nope\n")}})
+    from host import fortivpn
+    vpn = {"enabled": True, "type": "fortinet", "vault_item": "VPN HQ",
+           "config_from_vault": True}
+    sup = fortivpn.Supervisor(vpn, "", log=lambda m: None)
+    assert sup._materialize_config() is True
+    assert vpn["gateway"] == "vpn.hq.acme.com"          # overlay applied
+    assert vpn["port"] == 443                           # coerced to int
+    assert vpn["realm"] == "staff"
+    assert vpn["set_routes"] is True                    # coerced to bool
+    assert vpn["trusted_cert"] == "a"*64
+    assert "bogus_field" not in vpn                     # allowlist refused it
+    assert sup._materialized is None                    # NEVER on disk
 
 
 def test_vpn_state_indicator():
@@ -978,14 +989,9 @@ def test_vaultseed_crypto_roundtrip():
         pass
 
 
-def test_vault_prewarm_and_threadsafe_cache(monkeypatch, tmp_path):
-    data = {"A": {"username": "ua", "password": "pa"},
-            "B": {"username": "ub", "password": "pb"}}
-    f = tmp_path / "v.json"
-    f.write_text(json.dumps(data))
-    monkeypatch.setenv("SOC_VAULT_BACKEND", "dev")
-    monkeypatch.setenv("SOC_DEV_VAULT", str(f))
-    v = vault.Vault(ttl=60)
+def test_vault_prewarm_and_threadsafe_cache(fake_vault):
+    v = fake_vault({"A": {"username": "ua", "password": "pa"},
+                    "B": {"username": "ub", "password": "pb"}}, ttl=60)
     v.open()
     assert v.cached("A") is False
     # prewarm dedups + skips empties and populates the cache

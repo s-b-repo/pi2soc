@@ -163,26 +163,29 @@ def _host_port(host: str, port: int) -> str:
 
 
 VALID_LAYOUTS = {"auto", "windows", "single"}
-VALID_KEEPALIVE = {"reload", "click", "xhr", "none"}
+VALID_KEEPALIVE = {"reload", "click", "xhr", "mouse", "none"}
 VALID_SCHEMES = {"http", "https"}
 VALID_PROXY_SCHEMES = {"http", "https", "socks", "socks4", "socks5"}
 VALID_VPN_TYPES = {"fortinet", "openvpn", "wireguard", "inode"}
 
-_TOP_KEYS = {"display", "panels", "tunnel", "vpn", "proxy"}
-_DISPLAY_KEYS = {"auto", "width", "height", "cols", "rows", "gap", "layout"}
+_TOP_KEYS = {"display", "panels", "tunnel", "vpn", "vpns", "proxy"}
+_DISPLAY_KEYS = {"auto", "width", "height", "cols", "rows", "gap", "layout",
+                 "fullscreen"}
 _PANEL_KEYS = {"id", "engine", "grid", "mode", "url", "tunnel", "path", "scheme",
                "vault_item", "selectors", "login_marker", "keepalive", "proxy",
-               "title", "allow_insecure", "allow_media"}
+               "title", "allow_insecure", "allow_media",
+               "relogin_url", "blocked_url_patterns"}
 _PROXY_KEYS = {"enabled", "url", "vault_item", "ignore_hosts"}
 _TUNNEL_PANEL_KEYS = {"local_port", "remote_host", "remote_port"}
 _KEEPALIVE_KEYS = {"strategy", "intervalSec", "url", "target"}
 _TUNNEL_KEYS = {"enabled", "jump_host", "identity", "extra_forwards",
                 "host_key_checking", "known_hosts"}
-_VPN_KEYS = {"enabled", "type", "config", "config_from_vault", "gateway", "port",
-             "vault_item", "trusted_cert", "ca_file", "realm", "set_routes",
-             "set_dns", "half_internet_routes", "persistent", "otp_from_vault",
-             "ready_probe", "extra_args", "health_check_interval",
-             "health_check_failures", "domain", "insecure"}
+_VPN_KEYS = {"enabled", "name", "type", "config", "config_from_vault", "gateway",
+             "port", "vault_item", "trusted_cert", "ca_file", "realm",
+             "set_routes", "set_dns", "half_internet_routes", "persistent",
+             "otp_from_vault", "ready_probe", "extra_args",
+             "health_check_interval", "health_check_failures", "domain",
+             "insecure"}
 
 
 @dataclass
@@ -221,6 +224,16 @@ class Panel:
     allow_insecure: bool = False    # accept self-signed TLS (trusted LAN only)
     allow_media: bool = False       # keep WebGL/WebAudio/<video> (off by default
                                     # to save RAM/GPU on 1 GB boards)
+    # Optional URL to navigate to *after* on_login_success fires (i.e. the
+    # dashboard's "post-login landing" — e.g. /dashboard or /home — distinct
+    # from the login page itself that `url` points to). The wall navigates
+    # here exactly once per page load, guarded so a relogin URL that bounces
+    # back to a login page doesn't loop.
+    relogin_url: Optional[str] = None
+    # fnmatch-style URL patterns this panel must NEVER navigate to (e.g.
+    # `*/account/settings*`, `*change-password*`). Enforced by the WebKit
+    # decide-policy hook and the Chromium Fetch.requestPaused interceptor.
+    blocked_url_patterns: list = field(default_factory=list)
     geometry: Optional[Geometry] = None
 
     @property
@@ -292,6 +305,9 @@ class DisplayCfg:
     rows: int = 2
     gap: int = 0
     layout: str = "auto"            # auto | windows | single
+    fullscreen: bool = True         # false → windowed (lives on the desktop,
+                                    # plays nice with other WMs/Plasma); env
+                                    # SOC_WINDOWED=1 also forces windowed
 
 
 @dataclass
@@ -299,9 +315,28 @@ class Config:
     display: DisplayCfg
     panels: list = field(default_factory=list)
     tunnel: dict = field(default_factory=dict)
-    vpn: dict = field(default_factory=dict)
+    # vpns is the source of truth — a list of VPN dicts. The legacy single
+    # `vpn:` key is normalised into a one-entry list at load time, and the
+    # `.vpn` property below gives existing code the first entry so this is a
+    # backwards-compatible widening.
+    vpns: list = field(default_factory=list)
     proxy: ProxyCfg = field(default_factory=ProxyCfg)
     warnings: list = field(default_factory=list)
+
+    @property
+    def vpn(self) -> dict:
+        """Back-compat shim: the first VPN (or empty dict)."""
+        return self.vpns[0] if self.vpns else {}
+
+    @vpn.setter
+    def vpn(self, v: dict):
+        """Back-compat shim: writes to vpns[0]."""
+        if not isinstance(v, dict):
+            v = {}
+        if self.vpns:
+            self.vpns[0] = v
+        else:
+            self.vpns = [v]
 
 
 def _keepalive(d: dict) -> KeepAlive:
@@ -569,6 +604,17 @@ def _validate_panel(i: int, p: dict, disp: DisplayCfg, errs: list, warns: list):
         errs.append(f"{where}: allow_media must be true or false, "
                     f"got {p['allow_media']!r}")
 
+    if p.get("relogin_url") is not None:
+        if not valid_http_url(str(p["relogin_url"]), allow_empty=False):
+            errs.append(f"{where}: relogin_url must be a valid http(s) URL, "
+                        f"got {p['relogin_url']!r}")
+
+    bps = p.get("blocked_url_patterns")
+    if bps is not None:
+        if not isinstance(bps, list) or not all(isinstance(b, str) for b in bps):
+            errs.append(f"{where}: blocked_url_patterns must be a list of "
+                        f"fnmatch-style strings (e.g. '*account/settings*')")
+
     # Auto-login is optional: a panel with a vault_item logs itself in (and then
     # needs selectors); a panel without one is display-only (the page just shows,
     # an operator logs in once if needed). This makes the wall usable as a pure
@@ -685,11 +731,46 @@ def _validate_proxy(proxy: dict, errs: list, warns: list):
         errs.append("proxy.ignore_hosts: must be a list of hostnames/patterns")
 
 
-def _validate_vpn(vpn: dict, errs: list, warns: list):
+def _collect_vpns(raw: dict, errs: list, warns: list) -> list:
+    """Normalise the VPN section into a list of dicts.
+
+    Three input shapes, in priority order:
+      vpns: [ {...}, {...} ]      — list form (multi-VPN, preferred)
+      vpn:  { ... }                — legacy single-VPN mapping
+      both — list wins; the legacy mapping is appended only if its `name` (or
+             gateway) doesn't collide with an entry already in the list.
+
+    Names default to vpn-1, vpn-2 ... in order, so the GUI / top-bar pill /
+    systemd template all have something stable to key off.
+    """
+    out = []
+    vpns = raw.get("vpns")
+    if vpns is not None:
+        if not isinstance(vpns, list):
+            errs.append("vpns: must be a list of mappings (use 'vpn:' for a "
+                        "single VPN, or 'vpns: [...]' for multiple)")
+            vpns = []
+        for v in vpns:
+            if isinstance(v, dict):
+                out.append(dict(v))
+    legacy = raw.get("vpn")
+    if isinstance(legacy, dict) and legacy:
+        keys_seen = {(v.get("name") or v.get("gateway") or "") for v in out}
+        legacy_key = legacy.get("name") or legacy.get("gateway") or ""
+        if legacy_key not in keys_seen:
+            out.append(dict(legacy))
+    # Auto-name unnamed entries so the GUI / top-bar never shows a bare 'VPN'.
+    for i, v in enumerate(out):
+        if not v.get("name"):
+            v["name"] = f"vpn-{i+1}"
+    return out
+
+
+def _validate_vpn(vpn: dict, errs: list, warns: list, label: str = "vpn"):
     if not isinstance(vpn, dict):
-        errs.append("vpn: must be a mapping")
+        errs.append(f"{label}: must be a mapping")
         return
-    _unknown_keys(vpn, _VPN_KEYS, "vpn", warns)
+    _unknown_keys(vpn, _VPN_KEYS, label, warns)
     if not vpn.get("enabled"):
         return
 
@@ -713,8 +794,15 @@ def _validate_vpn(vpn: dict, errs: list, warns: list):
                     "the health check needs a host:port to probe")
 
     if kind == "fortinet":
-        if not vpn.get("gateway"):
-            errs.append("vpn: type 'fortinet' but 'gateway' is not set")
+        from_vault = bool(vpn.get("config_from_vault"))
+        if from_vault and not vpn.get("vault_item"):
+            errs.append("vpn: fortinet with config_from_vault needs 'vault_item' "
+                        "(its Notes hold the KEY=VALUE block — gateway=, port=, "
+                        "realm=, trusted_cert=, etc.)")
+        elif not from_vault and not vpn.get("gateway"):
+            errs.append("vpn: type 'fortinet' but 'gateway' is not set "
+                        "(or set config_from_vault: true to load it from the "
+                        "vault item's Notes)")
         if not vpn.get("vault_item"):
             errs.append("vpn: type 'fortinet' but 'vault_item' is not set "
                         "(the vault login holding the FortiGate credentials)")
@@ -754,9 +842,11 @@ def _validate_vpn(vpn: dict, errs: list, warns: list):
             warns.append("vpn: wireguard ignores vault_item unless config_from_vault "
                          "is set — otherwise its keys live in the .conf file (0600)")
     elif kind == "inode":
-        if not vpn.get("gateway"):
+        from_vault = bool(vpn.get("config_from_vault"))
+        if not from_vault and not vpn.get("gateway"):
             errs.append("vpn: type 'inode' but 'gateway' is not set (the H3C "
-                        "SSL-VPN gateway host)")
+                        "SSL-VPN gateway host; or set config_from_vault: true "
+                        "to load it from the vault item's Notes)")
         if not vpn.get("vault_item"):
             errs.append("vpn: type 'inode' but 'vault_item' is not set (the vault "
                         "login holding the SSL-VPN username + password)")
@@ -818,6 +908,7 @@ def _parse(raw, path: str) -> Config:
         rows=int(d.get("rows", 2) or 2),
         gap=int(d.get("gap", 0) or 0),
         layout=str(d.get("layout", "auto")),
+        fullscreen=bool(d.get("fullscreen", True)),
     ) if not errs or all("display." not in e for e in errs) else DisplayCfg()
 
     panels_raw = raw.get("panels", []) or []
@@ -827,7 +918,12 @@ def _parse(raw, path: str) -> Config:
     for i, p in enumerate(panels_raw):
         _validate_panel(i, p if isinstance(p, dict) else {}, disp, errs, warns)
     _validate_cross(raw, disp, panels_raw, errs, warns)
-    _validate_vpn(raw.get("vpn", {}) or {}, errs, warns)
+    # Multi-VPN: `vpns:` is the new top-level list; the legacy `vpn:` mapping
+    # is normalised to a single-entry list. Both can coexist (vpns wins; vpn
+    # is appended only if vpns doesn't already include it by name).
+    vpns_raw = _collect_vpns(raw, errs, warns)
+    for i, v in enumerate(vpns_raw):
+        _validate_vpn(v, errs, warns, label=f"vpns[{i}]")
     _validate_proxy(raw.get("proxy", {}) or {}, errs, warns)
 
     if errs:
@@ -854,6 +950,8 @@ def _parse(raw, path: str) -> Config:
             title=str(p.get("title", "") or ""),
             allow_insecure=bool(p.get("allow_insecure", False)),
             allow_media=bool(p.get("allow_media", False)),
+            relogin_url=(p.get("relogin_url") or None),
+            blocked_url_patterns=list(p.get("blocked_url_patterns") or []),
         )
         panel.geometry = compute_geometry(disp, panel.grid)
         panels.append(panel)
@@ -868,7 +966,7 @@ def _parse(raw, path: str) -> Config:
 
     return Config(display=disp, panels=panels,
                   tunnel=raw.get("tunnel", {}) or {},
-                  vpn=raw.get("vpn", {}) or {},
+                  vpns=vpns_raw,
                   proxy=proxy,
                   warnings=warns)
 
@@ -880,7 +978,9 @@ def to_yaml(conf: "Config") -> str:
     d = conf.display
     out = {
         "display": {"auto": bool(d.auto), "width": d.width, "height": d.height,
-                    "cols": d.cols, "rows": d.rows, "gap": d.gap, "layout": d.layout},
+                    "cols": d.cols, "rows": d.rows, "gap": d.gap,
+                    "layout": d.layout,
+                    "fullscreen": bool(getattr(d, "fullscreen", True))},
         "panels": [],
     }
     for p in conf.panels:
@@ -915,11 +1015,19 @@ def to_yaml(conf: "Config") -> str:
             pd["allow_insecure"] = True
         if p.allow_media:
             pd["allow_media"] = True
+        if getattr(p, "relogin_url", None):
+            pd["relogin_url"] = p.relogin_url
+        if getattr(p, "blocked_url_patterns", None):
+            pd["blocked_url_patterns"] = list(p.blocked_url_patterns)
         out["panels"].append(pd)
     if conf.tunnel:
         out["tunnel"] = conf.tunnel
-    if conf.vpn:
-        out["vpn"] = conf.vpn
+    if conf.vpns:
+        # Write `vpns:` always (the new shape). Drop the legacy `vpn:` key —
+        # the loader still accepts it as input, but on write-back we
+        # consolidate to one shape so the vault note doesn't accumulate two
+        # representations of the same data.
+        out["vpns"] = [dict(v) for v in conf.vpns]
     pr = conf.proxy
     if pr.enabled:
         out["proxy"] = {"enabled": True, "url": pr.url}

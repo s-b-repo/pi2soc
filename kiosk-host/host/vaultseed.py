@@ -119,13 +119,30 @@ class Session:
         senc = _hkdf_expand(master_key, b"enc")
         smac = _hkdf_expand(master_key, b"mac")
 
-        tok = _req(self.base + "/identity/connect/token", data={
-            "grant_type": "password", "username": email, "password": master_hash,
-            "scope": "api offline_access", "client_id": "cli", "deviceType": "8",
-            "deviceIdentifier": "soc-setup-0001", "deviceName": "soc-setup",
-        }, method="POST", form=True)
+        try:
+            tok = _req(self.base + "/identity/connect/token", data={
+                "grant_type": "password", "username": email, "password": master_hash,
+                "scope": "api offline_access", "client_id": "cli", "deviceType": "8",
+                "deviceIdentifier": "soc-setup-0001", "deviceName": "soc-setup",
+            }, method="POST", form=True)
+        except VaultSeedError as e:
+            # Vaultwarden returns the same 400 invalid_grant for "no such account"
+            # AND for "wrong password" (anti-enumeration). We can't tell from the
+            # response which it is — so the operator gets BOTH options, including
+            # the URL they need to register at if it's the missing-account case.
+            if "HTTP 400" in str(e) or "HTTP 401" in str(e):
+                raise VaultSeedError(
+                    f"Vaultwarden rejected the login for '{email}'. Either the "
+                    f"master password is wrong, or no account exists for that "
+                    f"email — register at {self.base}/#/login (a kiosk install "
+                    f"typically uses setup.py first-run, which can register the "
+                    f"account for you).")
+            raise
         if "Key" not in tok or "access_token" not in tok:
-            raise VaultSeedError("login failed — check the email/master password")
+            raise VaultSeedError(
+                f"Vaultwarden login for '{email}' returned an unexpected response. "
+                f"If this is a fresh install with no account yet, register at "
+                f"{self.base}/#/login or re-run setup.py first-run.")
         sym = _dec(tok["Key"], senc, smac)              # 64-byte account key
         self.ek, self.mk = sym[:32], sym[32:]
         self.auth = {"Authorization": f"Bearer {tok['access_token']}"}
@@ -173,6 +190,95 @@ def upsert_login(url, email, master_password, name, username, password,
     """One-shot: log in and create/update a Vaultwarden login. Returns the action."""
     return Session(url, email, master_password).upsert_login(
         name, username, password, notes=notes, uri=uri)
+
+
+def account_exists(url: str, email: str, master_password: str) -> bool:
+    """True if `email` + `master_password` opens a session against the vault at
+    `url`. False on a 400/401 invalid_grant (no account OR wrong password — the
+    API hides which). Other errors (vault unreachable, Argon2, network) propagate
+    so the caller distinguishes 'no account' from 'cannot reach the vault'."""
+    try:
+        Session(url, email, master_password)
+        return True
+    except VaultSeedError as e:
+        msg = str(e)
+        # Session() wraps the invalid_grant into the long actionable message; the
+        # token endpoint itself returns HTTP 400.
+        if ("rejected the login" in msg or "no account exists" in msg
+                or "HTTP 400" in msg or "HTTP 401" in msg):
+            return False
+        raise
+
+
+def register_account(url: str, email: str, master_password: str,
+                     kdf_iterations: int = 600000) -> None:
+    """Create a Vaultwarden account at `url` for `email`/`master_password`.
+
+    Requires `SIGNUPS_ALLOWED=true` to be set on the running Vaultwarden — the
+    setup.py wrapper flips it on transiently via a systemd drop-in. Raises
+    VaultSeedError on any failure; idempotent insofar as the caller should
+    `account_exists()` first.
+
+    Builds a minimal but spec-compliant Bitwarden registration payload:
+      * sym key: 64 random bytes (32 enc + 32 mac), encrypted with the
+        HKDF-stretched master_key — this is the user's account key.
+      * RSA-2048 keypair for the org/share crypto, encrypted with sym.
+      * masterPasswordHash: PBKDF2(master_key, password, 1).
+    PBKDF2 KDF only (kdf=0) — Argon2 is not handled here.
+    """
+    Cipher, algorithms, modes = _aes()              # also raises if crypto missing
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import serialization
+
+    email = email.lower()
+    pw = master_password.encode()
+    master_key = hashlib.pbkdf2_hmac("sha256", pw, email.encode(), kdf_iterations, 32)
+    master_hash = _b64(hashlib.pbkdf2_hmac("sha256", master_key, pw, 1, 32))
+    senc = _hkdf_expand(master_key, b"enc")
+    smac = _hkdf_expand(master_key, b"mac")
+
+    sym = os.urandom(64)
+    sym_enc = _enc(sym, senc, smac)
+
+    rk = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pub_der = rk.public_key().public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo)
+    priv_der = rk.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption())
+    priv_enc = _enc(priv_der, sym[:32], sym[32:])
+
+    body = {
+        "email": email,
+        "name": None,
+        "masterPasswordHash": master_hash,
+        "masterPasswordHint": None,
+        "key": sym_enc,
+        "kdf": 0,
+        "kdfIterations": kdf_iterations,
+        "keys": {
+            "publicKey": _b64(pub_der),
+            "encryptedPrivateKey": priv_enc,
+        },
+    }
+    try:
+        _req(url.rstrip("/") + "/identity/accounts/register",
+             data=body, method="POST")
+    except VaultSeedError as e:
+        msg = str(e)
+        if "HTTP 400" in msg and "Registration not allowed" in msg:
+            raise VaultSeedError(
+                "Vaultwarden refused registration — SIGNUPS_ALLOWED is not "
+                "true. Drop in [Service] Environment=SIGNUPS_ALLOWED=true, "
+                "restart vaultwarden, then retry. (setup.py first-run handles "
+                "this automatically.)")
+        if "HTTP 400" in msg and "already in use" in msg.lower():
+            raise VaultSeedError(
+                f"an account for '{email}' already exists in this vault — "
+                f"use the existing master password, or remove the account.")
+        raise
 
 
 def available() -> bool:
