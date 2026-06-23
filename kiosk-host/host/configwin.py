@@ -2438,6 +2438,16 @@ class ConfigWindow(Gtk.Window):
             b.connect("clicked", lambda _b: self._actions["lock_wall"]())
             rows.append(("Lock the wall now", b))
 
+        if self._actions.get("show_vpn_log"):
+            b = Gtk.Button(label="Show VPN log (live)")
+            b.set_tooltip_text("Opens the live VPN log viewer — one tab per "
+                               "VPN streaming journalctl. Reconnect button "
+                               "per tab. Collapse-to-bar mode for keeping "
+                               "an eye on it while you work.")
+            b.connect("clicked",
+                       lambda _b: self._actions["show_vpn_log"]())
+            rows.append(("Show VPN log (live)", b))
+
         b = Gtk.Button(label="Repair install")
         b.set_tooltip_text("Run setup.py repair as root. Fixes perms, "
                            "re-seeds rbw config, re-ensures /run/user/<soc>.")

@@ -489,9 +489,41 @@ class KioskHost:
                 self.wall.set_vpn_status(css, label, name=name)
         return False
 
+    def open_vpn_log_viewer(self, focus_name: "str | None" = None):
+        """Open (or present) the live VPN log viewer — one tab per VPN
+        streaming `journalctl -u forti-vpn[@<name>]` so the operator sees
+        every supervisor step + error as it lands. The window is single-
+        instance; subsequent calls present() it (and focus a tab via
+        focus_name)."""
+        try:
+            from . import vpn_log_viewer as _vlv
+        except Exception as e:                          # noqa: BLE001
+            log(f"vpn-log-viewer module unavailable: {e}")
+            return
+
+        def _on_reconnect(name):
+            # Pill click in the viewer → fire the existing per-VPN
+            # restart path so it shares back-off / privileges logic.
+            self.vpn_action(name)
+
+        if getattr(self, "_vpn_log_viewer", None) is None:
+            self._vpn_log_viewer = _vlv.VpnLogViewer(
+                on_reconnect=_on_reconnect,
+                on_close=lambda: setattr(self, "_vpn_log_viewer", None))
+        self._vpn_log_viewer.show(self.conf.vpns or [],
+                                    focus_name=focus_name)
+
     def vpn_action(self, name: str = ""):
         """Pill click: show 'checking', best-effort reconnect the named VPN's
-        service, then re-poll. With `name` empty (legacy), restarts the first."""
+        service, then re-poll. With `name` empty (legacy), restarts the first.
+        ALSO auto-opens the live VPN log viewer focused on this VPN — that
+        way 'click pill to reconnect' is also 'click pill to see what
+        happens' (the user's ask: 'when iNode reconnect it should open
+        up a small box printing every step and error for all VPNs')."""
+        try:
+            self.open_vpn_log_viewer(focus_name=name)
+        except Exception as e:                          # noqa: BLE001
+            log(f"could not open VPN log viewer: {e}")
         target_unit = f"forti-vpn@{name}" if name else "forti-vpn"
         if self.wall is not None:
             self.wall.set_vpn_status("checking", f"{name or 'VPN'}: checking…",
@@ -540,6 +572,7 @@ class KioskHost:
                                    "lock_wall": self._lock_wall,
                                    "calibrate_panel": self.calibrate_panel,
                                    "stop_vpn_unit": self._stop_vpn_unit,
+                                   "show_vpn_log": self.open_vpn_log_viewer,
                                })
             self._config_win = win
             win.show_all()
@@ -568,6 +601,7 @@ class KioskHost:
             ("Lock panel",        self._lock_wall),
             None,
             ("Open Settings",     self.open_config),
+            ("Show VPN log",      self.open_vpn_log_viewer),
             ("Restart wall",      self.restart_wall),
             None,
             ("Reboot machine",    self._tray_reboot),

@@ -28,4 +28,8 @@ soc ALL=(root) NOPASSWD: /usr/bin/systemctl restart forti-vpn.service, \
                          /usr/bin/systemctl status  forti-vpn.service, \
                          /usr/bin/systemctl status  forti-vpn@*.service, \
                          /usr/bin/systemctl status  autossh-tunnel.service, \
-                         /usr/bin/systemctl status  soc-tarpit.service
+                         /usr/bin/systemctl status  soc-tarpit.service, \
+                         /usr/bin/journalctl -u forti-vpn.service *, \
+                         /usr/bin/journalctl -u forti-vpn@*.service *, \
+                         /usr/bin/journalctl -u autossh-tunnel.service *, \
+                         /usr/bin/journalctl -u soc-tarpit.service *
