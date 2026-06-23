@@ -137,17 +137,26 @@ All green on an x86 Xvfb host (2026-06-23):
 - `make verify-proxy` — authenticated proxy for both WebKit and Chromium, loopback bypass: **VERIFY-PROXY OK**
 - `make verify-single` — Wayland/single-window layout, all panels login: **VERIFY-SINGLE OK**
 
-**Live Fortinet backend validation (2026-06-23):** the openfortivpn path was tested against a
-real FortiGate (`…:10443`). Both the raw invocation and the **project code path**
-(`config.openfortivpn_args` + `FortinetDriver.build_cmd` + `forti-pinentry.sh`, password via
-`$SOC_VPN_PASSWORD`, never on argv) authenticated and reached *"Tunnel is up and running"*
-(`ppp0` UP, VPN address allocated); `--trusted-cert` pinning matched; clean teardown left no
-routes/DNS/interfaces (`--set-routes=0 --set-dns=0`). The log classifier matched the real
-gateway output. **openfortivpn backend: validated live.**
+**Live VPN backend validation (2026-06-23):**
+- *Fortinet (openfortivpn)* — tested against a real FortiGate. Both the raw invocation and the
+  **project code path** (`config.openfortivpn_args` + `FortinetDriver.build_cmd` +
+  `forti-pinentry.sh`, password via `$SOC_VPN_PASSWORD`, never on argv) authenticated and
+  reached *"Tunnel is up and running"* (`ppp0` UP, VPN address allocated); `--trusted-cert`
+  pinning matched; clean teardown (`--set-routes=0 --set-dns=0`). Classifier matched real output.
+- *H3C iNode SSL-VPN* — tested against a real H3C gateway via the bundled client. `--auth-only`
+  authenticated with a **pinned cert** (`--pin-sha256`, not `--insecure`); the full tunnel came
+  up (`tunnel up: ip=… routes=5 keepalive=30s`, `inode0` interface), captcha auto-solved by the
+  client, and the `INodeDriver` classifier pattern (`"tunnel up:"`) matched. Teardown via the
+  helper's `stop` removed the TUN and left routing intact.
+- *Observation (minor):* the standalone `svpn-connect.sh` CLI wrapper's `timeout`/SIGTERM
+  teardown is unreliable when its internal `sudo` needs to re-auth (the privileged helper can be
+  orphaned). The production kiosk runs the iNode backend under the root `fortivpn.py` supervisor
+  (systemd), not this CLI+sudo path, so it's largely a test-harness artifact; the wrapper could
+  still be hardened to always `stop` by name on exit.
 
-Still recommended on the **target Pi** before cutover (hardware-specific): re-run the four
-`verify*` suites on-device, plus the remaining §4 items (openvpn/wireguard/iNode backends on
-real gateways, on-device RSS reclaim).
+**Fortinet + iNode backends: validated live.** Still recommended on the **target Pi** before
+cutover: re-run the four `verify*` suites on-device, plus the remaining §4 items
+(openvpn/wireguard backends on real gateways, on-device RSS reclaim).
 
 ## 6. Recommended pre-deployment checklist
 
