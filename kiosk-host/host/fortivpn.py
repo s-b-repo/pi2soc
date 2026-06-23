@@ -66,6 +66,47 @@ def classify(line: str):
     return None
 
 
+def _mgmt_sanitize(value: str) -> str:
+    """Strip CR/LF from a value before it is written to the OpenVPN management
+    socket. A vault username/password containing a newline could otherwise
+    inject extra management-protocol commands onto the control channel."""
+    return (value or "").replace("\r", "").replace("\n", "")
+
+
+def _split_host_port(target: str):
+    """Split a 'host:port' target into (host, port_str), bracket-aware so IPv6
+    literals are not mangled (RFC 3986). Returns ('', '') when there is no
+    parseable trailing ':port'.
+
+      host:443              -> ('host', '443')
+      [2001:db8::1]:443     -> ('2001:db8::1', '443')
+      2001:db8::1:443       -> ('2001:db8::1', '443')   (bare IPv6 + port)
+      [2001:db8::1]         -> ('2001:db8::1', '')      (no port)
+    """
+    s = (target or "").strip()
+    if not s:
+        return "", ""
+    if s.startswith("["):
+        # Bracketed IPv6 literal: host is inside [...], port (if any) follows ']'.
+        end = s.find("]")
+        if end == -1:
+            return "", ""               # malformed: unterminated bracket
+        host = s[1:end]
+        rest = s[end + 1:]
+        if not rest:
+            return host, ""             # "[..]" with no :port
+        if rest.startswith(":"):
+            return host, rest[1:]
+        return "", ""                   # junk after ']'
+    # Unbracketed: the final ':' separates the port only if what follows is a
+    # port (all digits). For a bare IPv6 literal (multiple colons) the address
+    # itself contains colons, so split off only the last segment when numeric.
+    host, sep, port = s.rpartition(":")
+    if not sep:
+        return s, ""                    # no ':' at all -> host only
+    return host, port
+
+
 class Backoff:
     """Exponential backoff: initial, initial*factor, ... capped at maximum."""
 
@@ -116,20 +157,27 @@ class SdWatchdog:
 
 # --- command assembly ---------------------------------------------------------
 def build_cmd(vpn: dict, user: str, pinentry: str, otp: str = "") -> list:
-    """Full openfortivpn argv. Only non-secrets: the password travels via the
-    pinentry helper (environment), never argv."""
+    """Full openfortivpn argv. The password travels via the pinentry helper
+    (environment), never argv. The ONE secret still placed on argv is the
+    single-use OTP (--otp=...): openfortivpn 1.24 takes the OTP only on argv,
+    and it is short-lived (single-use, regenerated every attempt), so its brief
+    visibility via ps/proc is an accepted residual rather than a standing leak.
+    Moving it off argv needs hardware validation of stdin/pinentry OTP behavior
+    that cannot be done here, so it is intentionally left as-is."""
     cmd = ["openfortivpn", *cfg.openfortivpn_args(vpn),
            "-u", user, f"--pinentry={pinentry}"]
     if otp:
-        cmd.append(f"--otp={otp}")
+        cmd.append(f"--otp={otp}")   # KNOWN RESIDUAL: single-use OTP on argv
     return cmd
 
 
 def probe_tcp(probe: str, timeout: float = 3.0) -> bool:
-    host, sep, port = (probe or "").rpartition(":")
+    host, port = _split_host_port(probe)
     # Validate host:port up front: a malformed ready_probe must return False,
     # not raise ValueError inside the health-check loop and kill it silently.
-    if not (sep and host and port.isdigit() and 0 < int(port) < 65536):
+    # _split_host_port is bracket-aware so IPv6 literals ([2001:db8::1]:443 or a
+    # bare 2001:db8::1:443) are not mis-split by a naive rpartition(":").
+    if not (host and port.isdigit() and 0 < int(port) < 65536):
         return False
     try:
         with socket.create_connection((host, int(port)), timeout=timeout):
@@ -291,10 +339,13 @@ class Supervisor:
         return True
 
     def _cleanup_materialized(self):
+        # Idempotent: safe to call more than once. After the first call
+        # self._materialized is None, so a second call is a no-op; a missing
+        # file (already removed) is ignored.
         if self._materialized:
             try:
                 os.unlink(self._materialized)
-            except OSError:
+            except OSError:               # already gone / unreadable — ignore
                 pass
             self._materialized = None
 
@@ -315,7 +366,11 @@ class Supervisor:
         """Answer OpenVPN's password query over its management socket, so the
         username/password never appears on argv or disk."""
         user, password = creds
-        password = password.replace("\n", "")
+        # Strip CR and LF from BOTH the username and the password: a value with
+        # an embedded newline would otherwise inject extra commands onto the
+        # OpenVPN management control channel (line-oriented protocol).
+        user = _mgmt_sanitize(user)
+        password = _mgmt_sanitize(password)
         deadline = time.monotonic() + 30
         s = None
         while time.monotonic() < deadline and not self.stop_event.is_set():
@@ -472,7 +527,17 @@ class Supervisor:
             sd_notify("STATUS=could not load VPN config from the vault")
             return self.idle()
 
+        # From here on a 0600 .ovpn/.conf (private keys) may sit in /run/soc-vpn;
+        # guarantee it is removed even if the loop raises or returns early.
+        try:
+            return self._run_loop()
+        finally:
+            self._cleanup_materialized()
+
+    def _run_loop(self) -> int:
         target = self._target()
+        timeout = cfg.env_float("SOC_READY_TIMEOUT", 120.0, lo=0.0, hi=3600.0)
+        needs = self.driver.needs_creds(self.vpn)
         attempt = 0
 
         while not self.stop_event.is_set():
@@ -546,7 +611,6 @@ class Supervisor:
                 self._sleep(delay)
 
         self._terminate_child()
-        self._cleanup_materialized()
         self.log("stopped")
         sd_notify("STATUS=stopped")
         return 0
@@ -592,6 +656,19 @@ class Supervisor:
         if not self._materialize_config():      # may rewrite vpn['config']
             sd_notify("STATUS=could not load WireGuard config from the vault")
             return self.idle()
+
+        # Materialized 0600 WireGuard .conf holds a private key; tear the
+        # interface down and remove the file even if the loop raises.
+        try:
+            return self._run_interface_loop()
+        finally:
+            self._run_oneshot(self.driver.down_cmd(self.vpn))
+            self._cleanup_materialized()
+
+    def _run_interface_loop(self) -> int:
+        probe = (self.vpn.get("ready_probe") or "").strip()
+        interval = int(self.vpn.get("health_check_interval", 0) or 0) or 30
+        threshold = int(self.vpn.get("health_check_failures", 3) or 3)
         target = cfg.wireguard_target(self.vpn)
         iface = self.driver.iface(self.vpn)
 
@@ -632,8 +709,6 @@ class Supervisor:
             if self.stop_event.is_set():
                 break
 
-        self._run_oneshot(self.driver.down_cmd(self.vpn))
-        self._cleanup_materialized()
         self.log("stopped")
         sd_notify("STATUS=stopped")
         return 0

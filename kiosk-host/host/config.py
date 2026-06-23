@@ -13,6 +13,7 @@ them, which catches typos like `vault_iten:` before they bite at 3 AM.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
@@ -57,6 +58,10 @@ class ConfigError(Exception):
 VALID_ENGINES = {"webkit", "chromium"}
 VALID_MODES = {"direct", "tunnel"}
 VALID_URL_SCHEMES = ("http", "https")
+# A panel id is later substituted verbatim into Openbox/labwc rc.xml (as a window
+# wm-class / title) by the WM-config generators, so keep it to characters that
+# cannot break out of an XML attribute / inject markup.
+_PANEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def valid_http_url(url, *, allow_empty: bool = True) -> bool:
@@ -85,6 +90,77 @@ def valid_http_url(url, *, allow_empty: bool = True) -> bool:
     if "@" in parts.netloc:                 # no userinfo (user:pass@host)
         return False
     return True
+
+def _has_ctrl_or_space(s: str) -> bool:
+    """True if s holds a control char (incl. \\n / \\r / \\t / NUL / DEL) or any
+    whitespace. These enable argv smuggling / request splitting / log injection."""
+    return any(ord(c) < 0x20 or ord(c) == 0x7f or c.isspace() for c in s)
+
+
+def _safe_host(v, what: str = "host") -> str:
+    """Validate a hostname/IP destined for a VPN/tunnel argv slot and return it
+    stripped. Rejects values that are empty, carry whitespace/control chars, or
+    begin with '-' (which a downstream binary would parse as an OPTION, not a
+    host — classic argv option-injection). Raises ValueError on bad input so the
+    existing caller surfaces it rather than building a poisoned command line."""
+    s = str(v if v is not None else "").strip()
+    if not s:
+        raise ValueError(f"{what} is empty")
+    if _has_ctrl_or_space(s):
+        raise ValueError(f"{what} {s!r} contains whitespace/control characters")
+    if s.startswith("-"):
+        raise ValueError(f"{what} {s!r} may not begin with '-' (option injection)")
+    return s
+
+
+def _safe_port(v, what: str = "port") -> int:
+    """Validate an int port in 1..65535. Raises ValueError otherwise."""
+    try:
+        p = int(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"{what} {v!r} is not an integer")
+    if not (0 < p < 65536):
+        raise ValueError(f"{what} {p} is out of range 1..65535")
+    return p
+
+
+def _safe_word(v, what: str) -> str:
+    """Validate a free-text argv token (realm / domain / user). Rejects newlines
+    (log/arg injection) and a leading '-' (option injection). Returns it
+    stripped. Raises ValueError on bad input."""
+    s = str(v if v is not None else "")
+    if "\n" in s or "\r" in s:
+        raise ValueError(f"{what} must not contain newlines")
+    s = s.strip()
+    if s.startswith("-"):
+        raise ValueError(f"{what} {s!r} may not begin with '-' (option injection)")
+    return s
+
+
+def _safe_extra_args(v) -> list:
+    """Validate the pass-through `extra_args` list. extra_args is operator-trusted
+    (it lives in the same config file as the gateway), so we deliberately do NOT
+    reject a leading '-' here — those ARE legitimate flags (e.g. '-v',
+    '--trace'). We only strip values that carry newlines/NUL/control characters,
+    which can never be a valid single argv token and would otherwise smuggle
+    extra lines into logs or the command. Raises ValueError on such input."""
+    out = []
+    for a in (v or []):
+        s = str(a)
+        if _has_ctrl_or_space(s) and any(ord(c) < 0x20 or ord(c) == 0x7f for c in s):
+            raise ValueError(f"extra_args item {s!r} contains control characters")
+        out.append(s)
+    return out
+
+
+def _host_port(host: str, port: int) -> str:
+    """Format 'host:port', bracketing a bare IPv6 literal per RFC 3986 so a value
+    like 'fd00::1' becomes '[fd00::1]:443' instead of an ambiguous/malformed
+    'fd00::1:443'. Already-bracketed hosts are left as-is."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
 
 VALID_LAYOUTS = {"auto", "windows", "single"}
 VALID_KEEPALIVE = {"reload", "click", "xhr", "none"}
@@ -250,13 +326,15 @@ def openfortivpn_args(vpn: dict) -> list:
     gateway = vpn.get("gateway")
     if not gateway:
         return []
-    args = [f"{gateway}:{int(vpn.get('port', 443))}"]
+    host = _safe_host(gateway, "vpn.gateway")
+    port = _safe_port(vpn.get("port", 443), "vpn.port")
+    args = [_host_port(host, port)]
     if vpn.get("trusted_cert"):
         args.append(f"--trusted-cert={vpn['trusted_cert']}")
     if vpn.get("ca_file"):
         args.append(f"--ca-file={vpn['ca_file']}")
     if vpn.get("realm"):
-        args.append(f"--realm={vpn['realm']}")
+        args.append(f"--realm={_safe_word(vpn['realm'], 'vpn.realm')}")
     # Routing / DNS: emit explicit 0/1 so the gateway can't silently change them.
     if "set_routes" in vpn:
         args.append(f"--set-routes={1 if vpn['set_routes'] else 0}")
@@ -267,7 +345,7 @@ def openfortivpn_args(vpn: dict) -> list:
     persistent = int(vpn.get("persistent", 0) or 0)
     if persistent > 0:
         args.append(f"--persistent={persistent}")
-    args += [str(a) for a in (vpn.get("extra_args") or [])]
+    args += _safe_extra_args(vpn.get("extra_args"))
     return args
 
 
@@ -290,7 +368,7 @@ def openvpn_args(vpn: dict) -> list:
     # routing/DNS hints map onto OpenVPN where they have an equivalent
     if vpn.get("set_routes") is False:
         args += ["--route-nopull"]            # ignore server-pushed routes
-    args += [str(a) for a in (vpn.get("extra_args") or [])]
+    args += _safe_extra_args(vpn.get("extra_args"))
     return args
 
 
@@ -304,8 +382,12 @@ def inode_gateway(vpn: dict) -> str:
     """'host:port' for the H3C iNode SSL-VPN gateway (default port 443). '' when
     no gateway is configured."""
     vpn = vpn or {}
-    host = str(vpn.get("gateway", "") or "").strip()
-    return f"{host}:{int(vpn.get('port', 443) or 443)}" if host else ""
+    raw = str(vpn.get("gateway", "") or "").strip()
+    if not raw:
+        return ""
+    host = _safe_host(raw, "vpn.gateway")
+    port = _safe_port(vpn.get("port", 443) or 443, "vpn.port")
+    return _host_port(host, port)
 
 
 def _bundled_inode_dir() -> str:
@@ -337,16 +419,26 @@ def inode_extra_args(vpn: dict) -> list:
         tail += ["--pin-sha256", pin]
     elif vpn.get("insecure"):
         tail += ["--insecure"]
-    tail += [str(a) for a in (vpn.get("extra_args") or [])]
+    tail += _safe_extra_args(vpn.get("extra_args"))
     return ["--"] + tail if tail else []
 
 
 def compute_geometry(disp: DisplayCfg, grid) -> Geometry:
     """Map a (col,row) grid cell to an on-screen rectangle."""
     col, row = grid
-    gap = disp.gap
-    cell_w = (disp.width - gap * (disp.cols - 1)) // disp.cols
-    cell_h = (disp.height - gap * (disp.rows - 1)) // disp.rows
+    # Cap the gap so the grid always fits the resolution: an unbounded gap from a
+    # config file/note could otherwise drive the cell size to zero/negative and
+    # produce invalid (or off-screen) window geometry. Leave >=1px per cell.
+    gap = max(0, disp.gap)
+    if disp.cols > 1:
+        gap = min(gap, (disp.width - disp.cols) // (disp.cols - 1))
+    if disp.rows > 1:
+        gap = min(gap, (disp.height - disp.rows) // (disp.rows - 1))
+    gap = max(0, gap)
+    # Clamp the cell dims to a sane minimum so a pathological width/height/gap
+    # never yields a zero/negative-sized window (which crashes the WM/compositor).
+    cell_w = max(1, (disp.width - gap * (disp.cols - 1)) // disp.cols)
+    cell_h = max(1, (disp.height - gap * (disp.rows - 1)) // disp.rows)
     x = col * (cell_w + gap)
     y = row * (cell_h + gap)
     return Geometry(x=x, y=y, w=cell_w, h=cell_h)
@@ -407,6 +499,9 @@ def _validate_panel(i: int, p: dict, disp: DisplayCfg, errs: list, warns: list):
 
     if not p.get("id"):
         errs.append(f"panel #{i + 1}: missing required key 'id'")
+    elif not _PANEL_ID_RE.match(str(p["id"])):
+        errs.append(f"panel #{i + 1}: id {p['id']!r} must match [A-Za-z0-9_-]+ "
+                    f"(it is substituted into the WM rc.xml — no spaces/markup)")
 
     engine = p.get("engine", "webkit")
     if engine not in VALID_ENGINES:
@@ -445,8 +540,19 @@ def _validate_panel(i: int, p: dict, disp: DisplayCfg, errs: list, warns: list):
             if not _is_int(lp) or not (0 < lp < 65536):
                 errs.append(f"{where}: tunnel.local_port must be a port number "
                             f"(1-65535), got {lp!r}")
-            if not t.get("remote_host"):
+            rh = t.get("remote_host")
+            if not rh:
                 errs.append(f"{where}: tunnel.remote_host is required")
+            else:
+                try:
+                    _safe_host(rh, "tunnel.remote_host")
+                except ValueError as e:
+                    errs.append(f"{where}: {e}")
+            if "remote_port" in t:
+                rp = t.get("remote_port")
+                if not _is_int(rp) or not (0 < rp < 65536):
+                    errs.append(f"{where}: tunnel.remote_port must be a port number "
+                                f"(1-65535), got {rp!r}")
 
     if p.get("scheme", "http") not in VALID_SCHEMES:
         errs.append(f"{where}: scheme must be http or https, got {p['scheme']!r}")

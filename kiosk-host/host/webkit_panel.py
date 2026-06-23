@@ -171,6 +171,8 @@ class WebKitPanel:
         self.status = None
         self._retry_delay = RETRY_INITIAL
         self._retry_pending = False
+        self._retry_id = 0                   # GLib source id of a pending retry, 0=none
+        self._stopped = False                # set by stop(): torn down, ignore callbacks
         self._ever_loaded = False
         self._load_failed = False
         self._proxy_auth_attempts = 0
@@ -185,8 +187,11 @@ class WebKitPanel:
         ucm.register_script_message_handler("socCreds")
         ucm.connect("script-message-received::socCreds", self._on_message)
 
-        # credential-free bootstrap, injected at document start
-        boot = inject.bootstrap_js(p, mode="webkit")
+        # credential-free bootstrap, injected at document start. The origin gate
+        # ({{ALLOWED_ORIGIN}}) is filled from the panel's configured origin so
+        # socLogin refuses to fill creds on an off-origin (redirect) page.
+        from .chromium_panel import bootstrap_with_origin
+        boot = bootstrap_with_origin(p, "webkit", self.log)
         script = WebKit2.UserScript(
             boot,
             WebKit2.UserContentInjectedFrames.TOP_FRAME,
@@ -230,14 +235,20 @@ class WebKitPanel:
         # ---- self-healing ----------------------------------------------------
         # 4.0 has web-process-crashed; >= 2.20 (both 4.0 and 4.1 builds we
         # target) has web-process-terminated. Connect whichever exists.
+        # Track handler ids so stop() can disconnect them at shutdown.
+        self._handler_ids = []
         if GObject.signal_lookup("web-process-terminated", WebKit2.WebView):
-            self.webview.connect("web-process-terminated", self._on_terminated)
+            self._handler_ids.append(
+                self.webview.connect("web-process-terminated", self._on_terminated))
         elif GObject.signal_lookup("web-process-crashed", WebKit2.WebView):
-            self.webview.connect("web-process-crashed",
-                                 lambda *_: self._on_terminated(None, None))
-        self.webview.connect("load-failed", self._on_load_failed)
-        self.webview.connect("load-changed", self._on_load_changed)
-        self.webview.connect("authenticate", self._on_authenticate)
+            self._handler_ids.append(self.webview.connect(
+                "web-process-crashed", lambda *_: self._on_terminated(None, None)))
+        self._handler_ids.append(
+            self.webview.connect("load-failed", self._on_load_failed))
+        self._handler_ids.append(
+            self.webview.connect("load-changed", self._on_load_changed))
+        self._handler_ids.append(
+            self.webview.connect("authenticate", self._on_authenticate))
 
         # match the wall background so navigations never flash white
         rgba = Gdk.RGBA()
@@ -313,15 +324,83 @@ class WebKitPanel:
         self.webview.load_uri(url)
         self.log(f"[{self.panel.id}] webkit loading {url}")
 
+    def _web_process_pid(self):
+        """Best-effort PID of this view's WebKitWebProcess, or None. The pid is
+        not exposed by a single stable API across webkit2gtk-4.0/4.1, so probe a
+        few known accessors and fall back to None (watchdog then recycles us
+        round-robin). Never raises."""
+        wv = self.webview
+        if wv is None:
+            return None
+        for attr in ("get_web_process_identifier",
+                     "get_web_process_id", "get_pid"):
+            fn = getattr(wv, attr, None)
+            if callable(fn):
+                try:
+                    pid = fn()
+                    if pid and int(pid) > 0:
+                        return int(pid)
+                except Exception:          # noqa: BLE001 — API drift / not connected
+                    pass
+        return None
+
     def mem_rss_kb(self):
-        # WebKit's renderer runs in a separate WebKitWebProcess we can't attribute
-        # per-panel, so the watchdog can't measure it — it recycles us round-robin.
+        """Best-effort RSS (KiB) of this view's WebKitWebProcess, or None if the
+        pid can't be discovered on this build (the watchdog then recycles webkit
+        panels round-robin). Recycle frees memory regardless of this signal."""
+        try:
+            pid = self._web_process_pid()
+            if pid:
+                return perf.proc_rss_kb(pid)
+        except Exception:                  # noqa: BLE001 — never crash the watchdog
+            pass
         return None
 
     def recycle(self):
-        """Reclaim accumulated renderer memory by reloading the page."""
+        """Actually reclaim a leaking renderer (a no-op reload does NOT free a
+        leaked web process). Prefer terminate_web_process() — the kernel reclaims
+        the killed renderer's RSS — then reload. If that API is absent (very old
+        4.0), fall back to a plain reload. Best-effort: any failure falls back to
+        a reload so a recycle can never crash the wall."""
+        if self._stopped:
+            return
+        wv = self.webview
+        if wv is not None and hasattr(wv, "terminate_web_process"):
+            try:
+                self.log(f"[{self.panel.id}] recycling webkit "
+                         f"(terminate web process) to reclaim memory")
+                self._maybe_clear_website_data()
+                wv.terminate_web_process()
+                # the web-process-terminated signal would normally schedule a
+                # backoff reload; reload now (fresh renderer) and reset backoff.
+                self._cancel_retry()
+                self._retry_delay = RETRY_INITIAL
+                self._load_failed = False
+                self.load()
+                return
+            except Exception as e:         # noqa: BLE001
+                self.log(f"[{self.panel.id}] terminate_web_process failed "
+                         f"({e}); falling back to reload")
+        # Fallback for builds without terminate_web_process() (very old 4.0): a
+        # reload frees the page/JS heap. (Recreating the WebView would free a
+        # leaked renderer but needs a frame widget-swap not available here, so we
+        # keep the safe reload rather than risk a half-swapped live panel.)
         self.log(f"[{self.panel.id}] recycling webkit (reload) to reclaim memory")
         self.load()
+
+    def _maybe_clear_website_data(self):
+        """Best-effort: drop this context's HTTP/memory caches on recycle (extra
+        RAM back on a 1 GB Pi). Guarded — the API/signatures vary by version."""
+        try:
+            ctx = self.webview.get_context() if hasattr(self.webview, "get_context") else None
+            mgr = (ctx.get_website_data_manager()
+                   if ctx and hasattr(ctx, "get_website_data_manager") else None)
+            if mgr and hasattr(mgr, "clear") and hasattr(WebKit2, "WebsiteDataTypes"):
+                mgr.clear(WebKit2.WebsiteDataTypes.MEMORY_CACHE
+                          | WebKit2.WebsiteDataTypes.DISK_CACHE,
+                          0, None, None, None)
+        except Exception:                  # noqa: BLE001 — best-effort only
+            pass
 
     def set_url(self, url: str):
         """Repoint this panel live (from the on-screen config)."""
@@ -335,8 +414,8 @@ class WebKitPanel:
         self.panel.url = url or None
         if url:
             self.panel.mode = "direct"
+        self._cancel_retry()               # drop any stale retry on the old URL
         self._retry_delay = RETRY_INITIAL
-        self._retry_pending = False
         self._load_failed = False
         self._ever_loaded = False
         self.log(f"[{self.panel.id}] reconfigured -> {url or '(cleared)'}")
@@ -344,6 +423,8 @@ class WebKitPanel:
 
     # ---- self-healing ------------------------------------------------------
     def _on_terminated(self, _wv, reason):
+        if self._stopped:
+            return
         why = reason.value_nick if hasattr(reason, "value_nick") else "crashed"
         # Use the same exponential backoff as load failures. On a 1 GB Pi a
         # web-process termination is usually the memory-pressure killer; a fixed
@@ -360,6 +441,8 @@ class WebKitPanel:
         self._retry_delay = min(self._retry_delay * 2, RETRY_MAX)
 
     def _on_load_failed(self, _wv, _event, uri, error):
+        if self._stopped:
+            return False
         # CANCELLED fires on perfectly normal in-page navigation; not a failure.
         if error.matches(WebKit2.NetworkError.quark(),
                          WebKit2.NetworkError.CANCELLED):
@@ -394,16 +477,30 @@ class WebKitPanel:
             self._proxy_auth_attempts = 0
             self.status.clear()
 
+    def _cancel_retry(self):
+        """Remove any pending retry source so a stale _go can't fire after a
+        reconfigure/recycle/stop (which would stack retries on the old URL)."""
+        if self._retry_id:
+            try:
+                GLib.source_remove(self._retry_id)
+            except Exception:              # noqa: BLE001 — already fired/removed
+                pass
+            self._retry_id = 0
+        self._retry_pending = False
+
     def _schedule_retry(self, delay: float):
-        if self._retry_pending:
+        if self._retry_pending or self._stopped:
             return
         self._retry_pending = True
 
         def _go():
+            self._retry_id = 0
             self._retry_pending = False
+            if self._stopped:              # torn down between scheduling and firing
+                return False
             self.load()
             return False                   # one-shot
-        GLib.timeout_add_seconds(int(delay), _go)
+        self._retry_id = GLib.timeout_add_seconds(int(delay), _go)
 
     # ---- proxy auth ---------------------------------------------------------
     def _on_authenticate(self, _wv, request):
@@ -507,3 +604,33 @@ class WebKitPanel:
 
     def _on_destroy(self, *_):
         self.log(f"[{self.panel.id}] window closed")
+
+    def stop(self):
+        """Tear down on shutdown so web processes / retry timers don't leak:
+        cancel the pending retry, disconnect tracked signals, kill the web
+        process if the API exists, and destroy our window. Mirrors
+        ChromiumPanel.stop() so main.shutdown() tears WebKit down the same way.
+        Idempotent and fully guarded — shutdown must never raise."""
+        if self._stopped:
+            return
+        self._stopped = True
+        self._cancel_retry()
+        wv = self.webview
+        for hid in getattr(self, "_handler_ids", []):
+            try:
+                if wv is not None and hid:
+                    wv.disconnect(hid)
+            except Exception:              # noqa: BLE001
+                pass
+        self._handler_ids = []
+        if wv is not None and hasattr(wv, "terminate_web_process"):
+            try:
+                wv.terminate_web_process()
+            except Exception:              # noqa: BLE001
+                pass
+        if self.window is not None:
+            try:
+                self.window.destroy()
+            except Exception:              # noqa: BLE001
+                pass
+        self.log(f"[{self.panel.id}] webkit panel stopped")

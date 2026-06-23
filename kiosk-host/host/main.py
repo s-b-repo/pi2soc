@@ -338,10 +338,20 @@ class KioskHost:
         from . import vpnstatus
 
         # Skip this tick if the previous probe is still running, so a slow/hung
-        # connect near the poll interval can't pile up daemon threads.
+        # connect near the poll interval can't pile up daemon threads. But a
+        # daemon thread that is killed (interpreter teardown) or wedges before
+        # its finally: would clear the flag never — wedging the pill forever — so
+        # force-clear it once the in-flight probe is grossly overdue (> interval*3
+        # since it started) and proceed with a fresh probe.
+        interval = cfg.env_int("SOC_VPN_STATUS_INTERVAL", 10, lo=1, hi=3600)
         if getattr(self, "_vpn_poll_busy", False):
-            return False
+            started = getattr(self, "_vpn_poll_started", 0.0)
+            if time.time() - started < interval * 3:
+                return False
+            log("[vpn] previous status probe overdue — force-clearing the busy "
+                "flag (probe thread may have died)")
         self._vpn_poll_busy = True
+        self._vpn_poll_started = time.time()
 
         def work():
             try:
@@ -349,11 +359,17 @@ class KioskHost:
             except Exception:                          # never let the pill crash us
                 state = vpnstatus.STATE_OFFLINE
             finally:
-                self._vpn_poll_busy = False
+                # clear on the main thread so the flag and the watchdog above
+                # never race a half-running successor probe
+                GLib.idle_add(self._clear_vpn_busy)
             label = vpnstatus.LABELS.get(state, "VPN: ?")
             css = {"not_configured": "unconfigured"}.get(state, state)
             GLib.idle_add(self._set_pill, css, label)
         threading.Thread(target=work, daemon=True).start()
+        return False
+
+    def _clear_vpn_busy(self):
+        self._vpn_poll_busy = False
         return False
 
     def _set_pill(self, css, label):

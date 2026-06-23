@@ -1604,9 +1604,39 @@ def clean_state(paths, args) -> None:
                paths["secret_dir"], state]
     if paths["mode"] == "dev":
         targets.append(os.path.join(REPO, "dev", "run"))
+    # Path-prefix allowlist: clean_state derives `state` (and friends) partly from
+    # the environment (SOC_STATE_DIR), so an env-poisoned SOC_STATE_DIR=/etc could
+    # otherwise offer a destructive rmtree of a system dir. Only ever touch paths
+    # under a known-safe root; reject "/", $HOME, and suspiciously short paths.
+    safe_roots = [os.path.realpath(p) for p in (
+        paths.get("soc_root", ""),
+        os.path.dirname(paths.get("soc_env", "")),
+        os.path.dirname(paths.get("panels_out", "")),
+        paths.get("secret_dir", ""),
+        "/var/lib/soc-wall",
+        os.path.join(REPO, "dev"),
+        os.path.join(REPO, "config"),
+    ) if p]
+
+    def _is_safe(target: str) -> bool:
+        rp = os.path.realpath(target)
+        if rp in ("/", os.path.realpath(os.path.expanduser("~"))) or rp.count(os.sep) < 2:
+            return False
+        return any(rp == root or rp.startswith(root + os.sep) for root in safe_roots)
+
+    safe_targets, unsafe = [], []
+    for t in targets:
+        (safe_targets if _is_safe(t) else unsafe).append(t)
+    for t in unsafe:
+        warn(f"refusing to remove {t}: outside the known-safe roots (path guard)")
+    targets = safe_targets
+
     note("will remove (files are backed up first):")
     for t in targets:
         print(dim(f"     - {t}" + ("  (exists)" if os.path.exists(t) else "  (absent)")))
+    if not targets:
+        note("nothing safe to remove.")
+        return
     if args.dry_run:
         print(yellow("   [dry-run] nothing removed"))
         return
@@ -1876,11 +1906,15 @@ def cmd_wizard(args) -> int:
     if soc_env is not None:
         write_file(paths["soc_env"], render_soc_env(soc_env), paths["env_mode"], args.dry_run)
         # The supervised session unit with the same config baked in as
-        # Environment= (no soc.env at runtime) + Restart=always.
+        # Environment= (no soc.env at runtime) + Restart=always. Write it 0640
+        # (not the systemd-default 0644): the Environment= lines carry
+        # SOC_VAULT_EMAIL, so a world-readable unit would leak the kiosk vault
+        # account via the file and `systemctl show`. It is owned by root (deploy
+        # runs as root); systemd reads it as root, so 0640 root:root is enough.
         if paths.get("wall_unit"):
             write_file(paths["wall_unit"],
                        render_wall_unit(soc_env, soc_root=paths["soc_root"]),
-                       0o644, args.dry_run)
+                       0o640, args.dry_run)
 
     if not args.dry_run:
         validate_panels(paths["panels_out"])

@@ -11,8 +11,10 @@ Two shapes:
   * "interface" drivers (WireGuard) configure a kernel interface with a one-shot
     `wg-quick up` and are supervised purely by health probing + up/down.
 
-Credentials never touch argv or disk:
-  * Fortinet — password via the pinentry helper (child environment).
+Credentials never touch argv or disk, with one documented exception:
+  * Fortinet — password via the pinentry helper (child environment). The only
+    secret still on argv is the single-use OTP (--otp): openfortivpn 1.24 takes
+    it only on argv; it is short-lived/single-use (KNOWN RESIDUAL).
   * OpenVPN  — username/password answered over a local management socket.
   * WireGuard — no interactive creds (keys live in the .conf, protect it 0600).
 """
@@ -71,10 +73,16 @@ class FortinetDriver(Driver):
         return True
 
     def build_cmd(self, vpn, user, pinentry, otp=""):
+        # The password is fed via the pinentry helper (child env), never argv.
+        # The single-use OTP is the one short-lived secret still passed on argv:
+        # openfortivpn 1.24 accepts the OTP only via --otp, and moving it off
+        # argv safely needs hardware validation of stdin/pinentry OTP behavior
+        # we cannot do here. It is regenerated and single-use every attempt, so
+        # its brief ps/proc visibility is an accepted residual (KNOWN RESIDUAL).
         cmd = ["openfortivpn", *cfg.openfortivpn_args(vpn),
                "-u", user, f"--pinentry={pinentry}"]
         if otp:
-            cmd.append(f"--otp={otp}")
+            cmd.append(f"--otp={otp}")   # KNOWN RESIDUAL: single-use OTP on argv
         return cmd
 
     def classify(self, line):

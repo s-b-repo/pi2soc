@@ -20,7 +20,12 @@
     passSel:     "{{PASS_SEL}}",
     submitSel:   "{{SUBMIT_SEL}}",
     loginMarker: "{{LOGIN_MARKER}}",   // selector present ONLY on the login page
-    keepalive:   {{KEEPALIVE_JSON}}    // {strategy,intervalSec,url?,target?}
+    keepalive:   {{KEEPALIVE_JSON}},   // {strategy,intervalSec,url?,target?}
+    // Origin (scheme://host[:non-default-port]) this panel is configured for.
+    // socLogin refuses to fill credentials on any other origin, so an open
+    // redirect / compromised dashboard can't autofill SOC creds into an
+    // attacker page. Empty string = unset = legacy behaviour (no gate).
+    allowedOrigin: "{{ALLOWED_ORIGIN}}"
   };
 
   window.__SOC = { installed: true, cfg: CFG, needLogin: false,
@@ -102,6 +107,16 @@
   // Called by the host with real creds. Returns true if it submitted.
   window.socLogin = function (creds) {
     try {
+      // Origin gate: never fill credentials on a page that is not the panel's
+      // configured origin (defends against open redirects / compromised
+      // dashboards navigating off-site). Unset allowedOrigin = legacy behaviour.
+      if (CFG.allowedOrigin && location.origin !== CFG.allowedOrigin) {
+        try {
+          console.warn("SOC: refusing credential injection — origin " +
+                       location.origin + " != allowed " + CFG.allowedOrigin);
+        } catch (e) {}
+        return false;
+      }
       var p = passField();
       if (!p) return false;
       var u = userField(p);

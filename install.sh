@@ -424,10 +424,15 @@ mkdir -p "$ETC/secret"; chmod 0700 "$ETC/secret"; chown "$KIOSK_USER:$KIOSK_USER
 # unavailable, fall back to a shared group (add the service user to the kiosk
 # user's group). The sealed-secret dir stays 0700, so this grants soc.env only.
 if ! setfacl -m u:"$SVC_USER":r "$ETC/soc.env" 2>/dev/null; then
-  warn "setfacl unavailable — granting $SVC_USER read on soc.env via group membership (not world-readable)"
-  usermod -aG "$KIOSK_USER" "$SVC_USER" 2>/dev/null \
-    || warn "could not add $SVC_USER to group $KIOSK_USER; autossh may not read soc.env"
-  chown "root:$KIOSK_USER" "$ETC/soc.env"; chmod 0640 "$ETC/soc.env"
+  warn "setfacl unavailable — granting $SVC_USER read on soc.env via a dedicated group (not world-readable)"
+  # Use a dedicated 'socenv' group scoped to soc.env ONLY. Adding $SVC_USER to
+  # the kiosk LOGIN group would grant it read on every group-readable file the
+  # kiosk user owns; a single-purpose group keeps the grant to this one file.
+  getent group socenv >/dev/null 2>&1 || groupadd -r socenv 2>/dev/null \
+    || warn "could not create group socenv"
+  usermod -aG socenv "$SVC_USER" 2>/dev/null \
+    || warn "could not add $SVC_USER to group socenv; autossh may not read soc.env"
+  chown "root:socenv" "$ETC/soc.env"; chmod 0640 "$ETC/soc.env"
 fi
 
 # record the chosen session in soc.env — only override a manual edit when the
@@ -562,9 +567,11 @@ else
   warn "  Its login runs ~$KIOSK_USER/.bash_profile, which execs the SOC session."
 fi
 
-# kernel console blanking off (Raspberry Pi)
+# kernel console blanking off (Raspberry Pi). cmdline.txt is a single boot line;
+# append only to line 1 ('1 s') so a stray trailing newline can't spawn a second,
+# malformed boot line (a plain 's' would append to every line).
 if [ -f /boot/firmware/cmdline.txt ] && ! grep -q consoleblank /boot/firmware/cmdline.txt; then
-  sed -i 's/$/ consoleblank=0/' /boot/firmware/cmdline.txt
+  sed -i '1 s/$/ consoleblank=0/' /boot/firmware/cmdline.txt
 fi
 
 # --------------------------------------------------------------------------- #

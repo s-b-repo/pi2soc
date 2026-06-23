@@ -9,11 +9,36 @@ tunnels (the wrapper then idles).
   autossh $(this script) ==> persistent jump-host tunnel
 """
 import os
+import re
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "kiosk-host"))
 from host import config as cfg  # noqa: E402
+
+# A user-supplied extra_forward is spliced straight into ssh's `-L` argument. It
+# MUST be a plain bindaddr:port:host:port spec — never an option-looking token
+# ("-D ...", "-o ...") or anything with whitespace, which ssh could mis-parse as
+# a second option (e.g. -L "x -o ProxyCommand=...").
+_FWD_RE = re.compile(
+    r"^[A-Za-z0-9_.:\[\]-]+:[0-9]+:[A-Za-z0-9_.:\[\]-]+:[0-9]+$")
+
+
+def _validate_extra_forward(entry):
+    """Return a vetted bindaddr:port:host:port forward, or raise ValueError.
+
+    Rejects option injection into ssh's -L: any leading '-', embedded
+    whitespace, or anything not matching the strict forward shape.
+    """
+    s = str(entry)
+    if s != s.strip() or any(c.isspace() for c in s):
+        raise ValueError(f"extra_forward contains whitespace: {entry!r}")
+    if s.startswith("-"):
+        raise ValueError(f"extra_forward looks like an option: {entry!r}")
+    if not _FWD_RE.match(s):
+        raise ValueError(
+            f"extra_forward must be bindaddr:port:host:port, got: {entry!r}")
+    return s
 
 
 def main():
@@ -27,7 +52,8 @@ def main():
             tn = p.tunnel
             forwards.append(
                 f"127.0.0.1:{tn['local_port']}:{tn['remote_host']}:{tn['remote_port']}")
-    forwards += list(t.get("extra_forwards", []) or [])
+    forwards += [_validate_extra_forward(f)
+                 for f in (t.get("extra_forwards", []) or [])]
 
     if not t.get("enabled", True) or not forwards or not t.get("jump_host"):
         return  # nothing to tunnel
@@ -41,13 +67,24 @@ def main():
     if hkc not in ("yes", "accept-new"):
         hkc = "yes"
 
+    # With anything weaker than strict 'yes' (e.g. 'accept-new' TOFU), require an
+    # explicit known_hosts path. Otherwise ssh would write trust-on-first-use
+    # keys into a default/ambient file we don't control — a silent MITM window.
+    # The operator must pin a dedicated, provisioned known_hosts in that mode.
+    known = t.get("known_hosts")
+    if hkc != "yes" and not known:
+        raise ValueError(
+            "host_key_checking={!r} requires an explicit 'known_hosts' path "
+            "(set tunnel.known_hosts) so first-connect keys are pinned to a "
+            "controlled file; refusing to weaken host-key verification without "
+            "it.".format(t.get("host_key_checking")))
+
     args = ["-M", "0", "-N",
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
             "-o", "ExitOnForwardFailure=yes",
             "-o", f"StrictHostKeyChecking={hkc}",
             "-o", "BatchMode=yes"]
-    known = t.get("known_hosts")
     if known:
         args += ["-o", f"UserKnownHostsFile={os.path.expanduser(known)}"]
     ident = t.get("identity")

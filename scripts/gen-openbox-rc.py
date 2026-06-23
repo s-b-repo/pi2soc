@@ -14,6 +14,7 @@ Usage:
 import argparse
 import os
 import sys
+from xml.sax.saxutils import escape as _xml_escape
 
 # make host.config importable regardless of CWD
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,7 +52,11 @@ def main():
     rules = []
     for p in conf.panels:
         g = p.geometry
-        rules.append(APP_RULE.format(cls=p.wmclass, x=g.x, y=g.y, w=g.w, h=g.h))
+        # Defense-in-depth: p.wmclass embeds the panel id into an XML attribute
+        # value here; escape it so a crafted id cannot break out of the quotes
+        # and inject markup. (config.py also restricts the id charset.)
+        cls = _xml_escape(p.wmclass, {'"': "&quot;", "'": "&apos;"})
+        rules.append(APP_RULE.format(cls=cls, x=g.x, y=g.y, w=g.w, h=g.h))
     block = "\n".join(rules)
 
     with open(args.template, encoding="utf-8") as fh:

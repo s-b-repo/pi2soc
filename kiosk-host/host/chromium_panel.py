@@ -33,6 +33,7 @@ import subprocess
 import threading
 import time
 import urllib.request
+from urllib.parse import urlsplit
 
 from websocket import create_connection
 from websocket import WebSocketTimeoutException
@@ -44,6 +45,39 @@ from . import perf
 RESPAWN_INITIAL = 5.0    # seconds; doubled up to RESPAWN_MAX after each death
 RESPAWN_MAX = 60.0
 RPC_TIMEOUT = 30.0       # hard ceiling on a single CDP round-trip (anti-wedge)
+# Consecutive (re)spawn/attach failures before a panel parks (stops respawning
+# Chromium forever — saves RAM/CPU/SD churn). Re-armed by set_url / config change.
+MAX_RESPAWNS = cfg.env_int("SOC_MAX_RESPAWNS", 20, lo=1, hi=100000)
+
+
+def panel_origin(url: str) -> str:
+    """Browser-style origin (scheme://host[:port], default ports omitted) for a
+    panel's effective_url — matches JS `location.origin`. '' if not derivable.
+    Used to gate credential injection to the configured origin (see login.js)."""
+    try:
+        u = urlsplit(url or "")
+        if u.scheme not in ("http", "https") or not u.hostname:
+            return ""
+        host = u.hostname
+        default = 443 if u.scheme == "https" else 80
+        port = u.port
+        if port and port != default:
+            return f"{u.scheme}://{host}:{port}"
+        return f"{u.scheme}://{host}"
+    except ValueError:
+        return ""
+
+
+def bootstrap_with_origin(panel, mode: str, log=None) -> str:
+    """inject.bootstrap_js + fill the {{ALLOWED_ORIGIN}} gate from the panel's
+    effective_url. Backward-compatible: an unresolvable origin yields '' (legacy
+    fill-anywhere behaviour) and logs a warning."""
+    boot = inject.bootstrap_js(panel, mode=mode)
+    origin = panel_origin(getattr(panel, "effective_url", "") or "")
+    if not origin and log is not None:
+        log(f"[{getattr(panel, 'id', '?')}] no allowed-origin for credential "
+            f"gate (url not http(s)); creds may fill on any page")
+    return boot.replace("{{ALLOWED_ORIGIN}}", origin)
 
 
 def cdp_allowed_origin(port: int) -> str:
@@ -155,15 +189,34 @@ class _CDP:
         # returning before its socket timeout) can never starve the matching
         # reply and wedge the panel's control loop forever.
         deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg = json.loads(self.ws.recv())
-            if self._dispatch(msg):
-                continue
-            if msg.get("id") == mid:
-                if "error" in msg:
-                    raise CDPError(msg["error"])
-                return msg.get("result", {})
-            # response to a stale call — drop it
+        # Per-recv socket timeout (mirrors pump()): a wedged Chromium that stops
+        # sending entirely would otherwise block recv() forever — the deadline
+        # below only advances between recvs, so without this a silent socket
+        # never self-heals. A recv timeout is treated as wedged -> we let it
+        # raise (WebSocketTimeoutException) so the control loop respawns.
+        has_to = hasattr(self.ws, "settimeout") and hasattr(self.ws, "gettimeout")
+        old = self.ws.gettimeout() if has_to else None
+        try:
+            while time.time() < deadline:
+                if has_to:
+                    remaining = deadline - time.time()
+                    self.ws.settimeout(min(max(0.05, remaining), RPC_TIMEOUT))
+                try:
+                    msg = json.loads(self.ws.recv())
+                except WebSocketTimeoutException as e:
+                    # the socket went silent (wedged Chromium) — surface as a
+                    # CDPError so the control loop closes + respawns the panel
+                    raise CDPError(f"CDP rpc {method} recv timed out (wedged)") from e
+                if self._dispatch(msg):
+                    continue
+                if msg.get("id") == mid:
+                    if "error" in msg:
+                        raise CDPError(msg["error"])
+                    return msg.get("result", {})
+                # response to a stale call — drop it
+        finally:
+            if has_to:
+                self.ws.settimeout(old)
         raise CDPError(f"CDP rpc {method} timed out after {timeout:.0f}s")
 
     def pump(self, duration: float):
@@ -225,6 +278,8 @@ class ChromiumPanel:
         self._auth_attempts = 0
         self._auth_failed = False
         self._last_fetch_event = 0.0
+        self._fail_streak = 0          # consecutive spawn/attach failures
+        self._parked = False           # terminal: stop respawning until re-armed
 
     def _uses_proxy(self) -> bool:
         return bool(self.proxy and self.proxy.enabled and self.panel.proxy)
@@ -304,8 +359,13 @@ class ChromiumPanel:
             args.append("--no-sandbox")
         self.log(f"[{p.id}] chromium spawning (CDP :{self.cdp_port}, "
                  f"ozone {_ozone_platform()})")
+        # start_new_session: put chromium (and its helper children) in its own
+        # process group/session so a SIGTERM to the host on systemd restart does
+        # not race-kill chromium mid-respawn; we reap it explicitly via _reap().
+        # close_fds: don't leak the host's fds (incl. the CDP listen socket) in.
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL)
+                                     stderr=subprocess.DEVNULL,
+                                     start_new_session=True, close_fds=True)
 
     # ---- proxy auth over CDP ------------------------------------------------
     def _on_cdp_event(self, method, params):
@@ -397,7 +457,7 @@ class ChromiumPanel:
             cdp.connect()
             cdp.rpc("Page.enable")
             cdp.rpc("Runtime.enable")
-            boot = inject.bootstrap_js(p, mode="chromium")
+            boot = bootstrap_with_origin(p, "chromium", self.log)
             # future documents:
             cdp.rpc("Page.addScriptToEvaluateOnNewDocument", {"source": boot})
             # already-loaded document (bootstrap is idempotent):
@@ -413,10 +473,33 @@ class ChromiumPanel:
                 self.proc.terminate()
             return False
 
+    def _park(self, why: str):
+        """Enter the terminal 'parked' state: stop respawning chromium so a
+        permanently-broken panel can't churn RAM/CPU/SD forever. Logged once;
+        set_url() re-arms it. Best-effort error card via CDP if one is attached."""
+        if self._parked:
+            return
+        self._parked = True
+        self.log(f"[{self.panel.id}] chromium parked after {self._fail_streak} "
+                 f"consecutive failures ({why}); not respawning until "
+                 f"reconfigured (set a URL in Settings)")
+        try:                                   # best-effort error card (no-op if no CDP)
+            if self.cdp:
+                self.cdp.evaluate(inject.prompt_call(
+                    "This panel could not start — open Settings (⚙ top bar) to "
+                    "fix its URL or login."))
+        except Exception:  # noqa: BLE001
+            pass
+
     def _control_loop(self):
         p = self.panel
         respawn_delay = RESPAWN_INITIAL
         while not self._stop.is_set():
+            # A permanently-broken panel parks: stop respawning until re-armed by
+            # set_url(). Idle-wait so the loop stays responsive to stop()/re-arm.
+            if self._parked:
+                self._stop.wait(self.poll_interval)
+                continue
             # (re)spawn + (re)attach when the process is missing or dead
             if self.proc is None or self.proc.poll() is not None:
                 if self.proc is not None:
@@ -430,13 +513,22 @@ class ChromiumPanel:
                 try:
                     self._spawn()
                 except Exception as e:  # noqa: BLE001
+                    self._fail_streak += 1
                     self.log(f"[{p.id}] chromium spawn failed: {e}; "
-                             f"retrying in {respawn_delay:.0f}s")
+                             f"retrying in {respawn_delay:.0f}s "
+                             f"({self._fail_streak}/{MAX_RESPAWNS})")
+                    if self._fail_streak >= MAX_RESPAWNS:
+                        self._park("spawn keeps failing")
+                        continue
                     self._stop.wait(respawn_delay)
                     respawn_delay = min(respawn_delay * 2, RESPAWN_MAX)
                     continue
                 if not self._attach_cdp():
+                    self._fail_streak += 1
+                    if self._fail_streak >= MAX_RESPAWNS:
+                        self._park("CDP attach keeps failing")
                     continue
+                self._fail_streak = 0          # a full spawn+attach succeeded
 
             try:
                 # one round-trip for both flags
@@ -472,6 +564,16 @@ class ChromiumPanel:
                                 "Sign-in needed — no saved login for this page. "
                                 "Open Settings (⚙ top bar) to add one, or log in here."))
                 respawn_delay = RESPAWN_INITIAL      # healthy again
+            except CDPError as e:
+                # a CDP round-trip wedged (recv timeout / protocol error): the
+                # process is alive but undriveable — close + terminate so the
+                # respawn branch re-attaches instead of spinning on a dead socket.
+                self.log(f"[{p.id}] chromium CDP wedged: {e}; recycling")
+                if self.cdp:
+                    self.cdp.close()
+                    self.cdp = None
+                if self.proc and self.proc.poll() is None:
+                    self.proc.terminate()
             except Exception as e:  # noqa: BLE001
                 if self.proc and self.proc.poll() is not None:
                     continue        # process died — handled by the respawn branch
@@ -492,6 +594,10 @@ class ChromiumPanel:
             self.panel.mode = "direct"
         self.log(f"[{self.panel.id}] reconfigured -> {url or '(cleared)'}; "
                  f"restarting chromium")
+        # re-arm: a reconfigure clears a parked panel and its failure streak so
+        # the control loop will try the new URL.
+        self._fail_streak = 0
+        self._parked = False
         if self.cdp:
             self.cdp.close()
             self.cdp = None
