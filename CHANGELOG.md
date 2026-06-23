@@ -30,6 +30,15 @@ findings and deferred items: `docs/MERGE_AUDIT_REPORT.md`.
 - **VPN/RFC:** OpenVPN management-socket username/password are CR/LF-sanitized
   (line-injection); materialized vault keys are cleaned via `try/finally` on every
   exit path; IPv6 `host:port` parsing is bracket-aware (RFC 3986).
+- **iNode (H3C) SSL-VPN client updated to the audited upstream** (`vendor/iNode-VPN-Client`,
+  clean-room backend only — no proprietary binaries). Fixes a **Critical pre-auth CAPTCHA
+  BMP-decoder OOM** (`decode_bmp` now bounds attacker-declared dimensions before allocating —
+  this was the `Killed`/137 crash), caps the tunnel frame-reassembly buffer (slow-OOM DoS),
+  hardens `inode-svpn-helper` against root code-exec via an unvalidated `--backend`
+  (rejects transient/world/group-writable dirs), and makes the cert-pin compare constant-time.
+  The CAPTCHA solver needs far fewer retries (**15 → 3** live). See
+  `vendor/iNode-VPN-Client/docs/SECURITY-FINDINGS.md`. Validated live: auth succeeds with a
+  pinned self-signed cert; full tunnel comes up on `inode0` (split-tunnel preserves routing).
 - **Config validation:** VPN/tunnel argv values (`gateway`/`remote_host`/`realm`/…)
   reject leading-dash/control/whitespace (argv option-injection); `remote_port` is
   range-checked; grid geometry clamps to ≥1 cell for an oversized `gap`; panel `id`
