@@ -5,8 +5,8 @@
 # One command from a fresh checkout to a running wall. Idempotent: it sets up
 # only what is missing (Python venv, dev vault), then launches. Safe to re-run.
 #
-#   ./launch.sh              # DEV: set up + show the wall in a window (Xephyr),
-#                            #      or the headless check if there is no display
+#   ./launch.sh              # in a terminal: menu -> Dev sim / Configure / Production deploy.
+#                            #   piped/non-interactive: DEV wall (Xephyr) or headless check.
 #   ./launch.sh --headless   # DEV: set up + headless end-to-end check (Xvfb + screenshot)
 #   ./launch.sh --setup      # run the guided setup.py menu, then exit (no launch)
 #   ./launch.sh --pi         # PRODUCTION: hand off to `sudo python3 setup.py deploy`
@@ -35,6 +35,25 @@ done
 
 log(){  printf '\033[36m==>\033[0m %s\n' "$*"; }
 warn(){ printf '\033[33m!!\033[0m %s\n' "$*"; }
+
+# ---- no-arg interactive chooser (terminal only) ----------------------------
+# Bare `./launch.sh` in a TTY asks which mode to run, so the dev simulation is
+# never a surprise. Piped/non-interactive runs keep the dev default; any flag
+# skips the menu entirely.
+if [ $# -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+  printf '\n\033[36mSOC video wall\033[0m — choose a mode:\n'
+  printf '  1) Dev simulation    (dummy panels + JSON dev vault, no root)\n'
+  printf '  2) Configure         (setup.py menu: panels, VPN, proxy, display, vault)\n'
+  printf '  3) Production deploy  (sudo setup.py deploy: install -> configure -> seal -> doctor)\n'
+  printf 'Selection [1]: '
+  read -r _choice || _choice=1
+  case "${_choice:-1}" in
+    1|"") MODE="dev-window" ;;
+    2)    MODE="setup" ;;
+    3)    MODE="pi" ;;
+    *)    warn "invalid selection '${_choice}' — using Dev simulation"; MODE="dev-window" ;;
+  esac
+fi
 
 # ---- production: delegate to the full deploy flow --------------------------
 if [ "$MODE" = "pi" ]; then
