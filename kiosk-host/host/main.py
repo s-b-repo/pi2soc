@@ -111,12 +111,14 @@ def heaviest_panel(views):
 
 def wait_for_vpn(vpn: dict, timeout: float):
     """Best-effort gate: if a VPN is enabled with a `ready_probe`
-    (host:port reachable only once the VPN is up), wait for it before opening
-    VPN-side panels. The VPN itself is brought up by forti-vpn.service; this
-    only avoids loading those panels into a dead route. Non-fatal — wrapped
-    in a top-level catch so a probe error CANNOT kill the wall during startup
-    (a transient gaierror / DNS hiccup / KeyboardInterrupt on a long sleep
-    would otherwise propagate out and tear down the host before GTK ran)."""
+    (host:port reachable only once the VPN is up), wait for it before
+    opening VPN-side panels. The VPN itself is brought up by either
+    forti-vpn.service (legacy single-VPN) or forti-vpn@<name>.service
+    (templated, multi-VPN). The unit name is HISTORICAL — the same
+    supervisor runs Fortinet, OpenVPN, WireGuard, and iNode backends
+    based on `vpn.type`; "forti-vpn" in the unit name doesn't mean
+    "Fortinet only". Non-fatal — wrapped in a top-level catch so a
+    probe error CANNOT kill the wall during startup."""
     try:
         vpn = vpn or {}
         if not vpn.get("enabled"):
@@ -130,16 +132,26 @@ def wait_for_vpn(vpn: dict, timeout: float):
                 "(want host:port)")
             return
         port = int(port)
-        log(f"[vpn] waiting for VPN reachability {host}:{port} ...")
+        name = (vpn.get("name") or "").strip()
+        kind = (vpn.get("type") or "fortinet").strip().lower()
+        unit = f"forti-vpn@{name}" if name else "forti-vpn"
+        log(f"[vpn] waiting for VPN '{name or 'default'}' (type={kind}) "
+            f"reachability {host}:{port} ...")
         deadline = time.time() + timeout
         while time.time() < deadline:
             if _port_open(host, port):
-                log("[vpn] VPN up")
+                log(f"[vpn] '{name or 'default'}' up")
                 return
             time.sleep(1)
-        log(f"[vpn] WARNING {host}:{port} never became reachable; "
-            f"VPN-side panels may show a connection error "
-            f"(check: systemctl status forti-vpn / journalctl -u forti-vpn)")
+        log(f"[vpn] WARNING '{name or 'default'}' (type={kind}) — "
+            f"{host}:{port} never became reachable; VPN-side panels "
+            f"may show a connection error.\n"
+            f"[vpn]   diagnose: systemctl status {unit}\n"
+            f"[vpn]             journalctl -u {unit} -e\n"
+            f"[vpn]   note: the '{unit}' unit name is HISTORICAL — the "
+            f"same supervisor runs Fortinet / OpenVPN / WireGuard / "
+            f"iNode (type={kind}); the log will show '[soc-vpn] ...' "
+            f"lines from the {kind} driver.")
     except Exception as e:                             # noqa: BLE001
         # The wait is purely advisory — if its own machinery breaks,
         # log loudly + continue. Never let it abort the boot.
@@ -479,6 +491,7 @@ class KioskHost:
                                    "reload_panels": self.reload_all_panels,
                                    "lock_wall": self._lock_wall,
                                    "calibrate_panel": self.calibrate_panel,
+                                   "stop_vpn_unit": self._stop_vpn_unit,
                                })
             self._config_win = win
             win.show_all()
@@ -1050,6 +1063,22 @@ class KioskHost:
                 log(f"VPN restart needs sudo (run: sudo systemctl restart "
                     f"{unit}); reason: {info}")
         threading.Thread(target=work, daemon=True).start()
+
+    def _stop_vpn_unit(self, name: str) -> None:
+        """Stop + disable forti-vpn@<name>.service. Called by the GUI's
+        Remove-VPN button so a removed VPN actually stops supervising.
+        Uses the same NOPASSWD sudo path as restart; raises (propagates
+        the systemctl error) so the caller can surface it. Does NOT
+        catch — the configwin caller wraps + alerts on failure."""
+        unit = f"forti-vpn@{name}.service"
+        ok1, msg1 = self._privileged_systemctl("stop", unit)
+        ok2, msg2 = self._privileged_systemctl("disable", unit)
+        if not ok1 and "could not be found" not in (msg1 or "").lower():
+            raise RuntimeError(f"systemctl stop {unit}: {msg1}")
+        if not ok2 and "could not be found" not in (msg2 or "").lower() \
+                and "not loaded" not in (msg2 or "").lower():
+            raise RuntimeError(f"systemctl disable {unit}: {msg2}")
+        log(f"stopped + disabled {unit} (operator removed the VPN in ⚙ Settings)")
 
     def _restart_tunnel_async(self):
         """A Tunnel-tab change — restart autossh-tunnel so the new jump host /

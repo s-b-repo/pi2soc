@@ -572,7 +572,21 @@ fi
 # --------------------------------------------------------------------------- #
 # has panels.yaml configured tunnels / a VPN? (used to enable services)
 want_tunnel(){ "$SOC_ROOT/.venv/bin/python" -c "import sys;sys.path.insert(0,'$SOC_ROOT/kiosk-host');from host import config;c=config.load('$ETC/panels.yaml');sys.exit(0 if any(p.mode=='tunnel' for p in c.panels) and c.tunnel.get('enabled',True) else 1)"; }
-want_vpn(){ "$SOC_ROOT/.venv/bin/python" -c "import sys;sys.path.insert(0,'$SOC_ROOT/kiosk-host');from host import config;v=config.load('$ETC/panels.yaml').vpn or {};k=config.vpn_kind(v);ok=bool(v.get('enabled')) and ((k=='fortinet' and v.get('gateway')) or (k in ('openvpn','wireguard') and v.get('config')));sys.exit(0 if ok else 1)"; }
+want_vpn(){ "$SOC_ROOT/.venv/bin/python" -c "import sys;sys.path.insert(0,'$SOC_ROOT/kiosk-host');from host import config;c=config.load('$ETC/panels.yaml');any_vpn=False
+for v in (c.vpns or []):
+ k=config.vpn_kind(v)
+ ok=bool(v.get('enabled')) and ((k in ('fortinet','inode') and v.get('gateway')) or (k in ('openvpn','wireguard') and v.get('config')))
+ if ok: any_vpn=True; break
+sys.exit(0 if any_vpn else 1)"; }
+enabled_vpn_names(){ "$SOC_ROOT/.venv/bin/python" -c "import sys;sys.path.insert(0,'$SOC_ROOT/kiosk-host');from host import config;c=config.load('$ETC/panels.yaml')
+names=[]
+for i,v in enumerate(c.vpns or []):
+ k=config.vpn_kind(v)
+ ok=bool(v.get('enabled')) and ((k in ('fortinet','inode') and v.get('gateway')) or (k in ('openvpn','wireguard') and v.get('config')))
+ if ok:
+  n=(v.get('name') or '').strip() or f'vpn-{i+1}'
+  names.append(n)
+print('\n'.join(names))"; }
 
 if [ "$HAS_SYSTEMD" = "1" ]; then
   log "Installing systemd services (vaultwarden, autossh-tunnel, forti-vpn, soc-wall, soc-firstboot, soc-tarpit)"
@@ -614,11 +628,43 @@ if [ "$HAS_SYSTEMD" = "1" ]; then
     warn "no tunnels in panels.yaml — autossh-tunnel left disabled"
   fi
   if want_vpn; then
-    systemctl enable forti-vpn.service
-    log "VPN service enabled (forti-vpn.service supervises Fortinet/OpenVPN/WireGuard)"
+    # Enable a SEPARATE templated supervisor per enabled VPN entry —
+    # this is what makes `vpns: [hq, dr, ...]` actually work. The
+    # legacy `forti-vpn.service` (no '@') is kept disabled because it
+    # always reads conf.vpns[0]; the per-name forti-vpn@<name> units
+    # each pin their own SOC_VPN_NAME=%i env and supervise just that
+    # one entry. Before today's audit, install.sh enabled ONLY the
+    # legacy singular — every entry past the first was silently never
+    # supervised. Fixed.
+    enabled_names="$(enabled_vpn_names || true)"
+    if [ -n "$enabled_names" ]; then
+      while IFS= read -r vpn_name; do
+        [ -z "$vpn_name" ] && continue
+        systemctl enable "forti-vpn@${vpn_name}.service" 2>&1 \
+          | grep -vE "^$" || true
+        log "  VPN supervisor enabled: forti-vpn@${vpn_name}"
+      done <<EOF
+$enabled_names
+EOF
+    else
+      # `vpns:` present but none currently pass the validation — disable
+      # the singular legacy unit so a stale enable doesn't keep
+      # supervising a no-longer-configured VPN.
+      systemctl disable forti-vpn.service 2>/dev/null || true
+    fi
+    # ALWAYS keep the legacy singular disabled when the templated path
+    # is being used — having both running races against the same
+    # ready_probe target.
+    systemctl disable forti-vpn.service 2>/dev/null || true
   else
     systemctl disable forti-vpn.service 2>/dev/null || true
-    warn "no vpn in panels.yaml — VPN service left disabled"
+    # Disable any leftover per-name supervisors from a previous install.
+    for u in /etc/systemd/system/multi-user.target.wants/forti-vpn@*.service; do
+      [ -e "$u" ] || continue
+      n="$(basename "$u" .service)"
+      systemctl disable "$n" 2>/dev/null || true
+    done
+    warn "no enabled vpn in panels.yaml — VPN services left disabled"
   fi
 else
   warn "no systemd — skipping service installation. Supervise these by hand"

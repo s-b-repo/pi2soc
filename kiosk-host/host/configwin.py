@@ -41,6 +41,14 @@ from . import style  # noqa: E402
 # --------------------------------------------------------------------------- #
 # State directory + overrides + PIN store (pure, no GTK — unit-testable)
 # --------------------------------------------------------------------------- #
+# Sentinels for _fetch_creds_with_recovery — distinct singleton objects so
+# `is` comparison reliably distinguishes "no such item" / "operator
+# cancelled" from a real result dict. Using a plain object() (not a string
+# or None) avoids any accidental aliasing.
+_NOT_FOUND = object()
+_CANCELLED = object()
+
+
 def state_dir() -> str:
     d = os.environ.get("SOC_STATE_DIR") or os.path.join(
         os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
@@ -1145,26 +1153,18 @@ class ConfigWindow(Gtk.Window):
         # missing item is the OPERATOR's normal first-time path (they
         # added a VPN, never saved its creds, now clicking Edit
         # to set them) — that's a CREATE flow, not an error.
-        # A transport error is something to surface loudly.
+        # A transport error is something to surface loudly + offers a
+        # one-click "Sync + retry" inside the dialog (the operator was
+        # blocked because the previous version told them to click the
+        # Refresh button under the modal, which the modal itself was
+        # covering).
         item_missing = False
-        try:
-            creds = v_handle.creds(name) or {}
-        except Exception as e:                           # noqa: BLE001
-            err_text = str(e).lower()
-            if ("not found" in err_text
-                    or "no vault item" in err_text
-                    or "no password" in err_text):
-                item_missing = True
-                creds = {}
-            else:
-                self._alert(f"Vault read failed for '{name}':\n\n{e}\n\n"
-                            "Common causes: the vault is locked (check "
-                            "`rbw unlocked`), Vaultwarden is unreachable "
-                            "(check `systemctl status vaultwarden`), or "
-                            "the rbw cache is stale (click 'Refresh from "
-                            "vault').",
-                            error=True, title="Vault read failed")
-                return
+        creds = self._fetch_creds_with_recovery(v_handle, name)
+        if creds is _CANCELLED:
+            return
+        if creds is _NOT_FOUND:
+            item_missing = True
+            creds = {}
         current_user = creds.get("user", "") or ""
         current_pass = creds.get("pass", "") or ""
         if item_missing:
@@ -1655,6 +1655,25 @@ class ConfigWindow(Gtk.Window):
         d.destroy()
         if rc != Gtk.ResponseType.OK:
             return
+        # Stop + disable the templated supervisor for THIS VPN before we
+        # drop the entry from the config. Without this, the VPN's
+        # forti-vpn@<name>.service would keep running on the box —
+        # silently auto-reconnecting against a deleted config until
+        # something else stops it. Uses the sudoers-allowed `sudo -n`
+        # path (the privilege we already arranged for "Save VPN edits
+        # live"); falls back to a clear log line if not allowed.
+        stop_action = self._actions.get("stop_vpn_unit")
+        if stop_action is not None and name:
+            try:
+                stop_action(name)
+            except Exception as e:                      # noqa: BLE001
+                self._alert(f"Could not stop forti-vpn@{name}.service:"
+                            f"\n\n{e}\n\nThe config is being removed, but "
+                            f"the supervisor is still running. Stop it "
+                            f"manually with:\n"
+                            f"    sudo systemctl disable --now "
+                            f"forti-vpn@{name}.service",
+                            error=True, title="VPN supervisor still running")
         # Remove the dict entry; we leave self._vpn_ws[idx] in place but
         # marked dead so apply_overrides skips it (lighter than re-indexing
         # every expander's name-rename closure).
@@ -1756,6 +1775,89 @@ class ConfigWindow(Gtk.Window):
                 cm.set_text(msg)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _fetch_creds_with_recovery(self, v_handle, name):  # noqa: D401
+        # Sentinels are defined at module bottom; they're singletons so
+        # `is` works for the dispatcher. See _NOT_FOUND / _CANCELLED.
+        """Read vault.creds(name); on a transport error, surface a
+        dialog with a 'Sync + retry' button so the operator can recover
+        without dismissing the modal (the previous version told them
+        to click 'Refresh from vault' which was COVERED by the modal —
+        unreachable). Returns either:
+          dict   — success (may be empty if item missing)
+          _NOT_FOUND — vault definitively says no such item (caller
+                       promotes to a Create flow)
+          _CANCELLED — operator cancelled the error dialog."""
+        from . import vault as _vault
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                return v_handle.creds(name) or {}
+            except Exception as e:                       # noqa: BLE001
+                err_text = str(e).lower()
+                # rbw says "Error: no entry found" — match that, plus the
+                # variants other backends may use.
+                if ("no entry found" in err_text
+                        or "not found" in err_text
+                        or "no vault item" in err_text
+                        or "no password" in err_text):
+                    return _NOT_FOUND
+                # Transport / lock error — offer Sync + Retry inside
+                # the dialog. Avoid infinite-retry: after 2 attempts,
+                # fall through to a Cancel-only dialog so a perma-down
+                # vault can't loop here forever.
+                if attempts >= 3:
+                    self._alert(
+                        f"Vault read still failing for '{name}' after "
+                        f"sync retry:\n\n{e}\n\n"
+                        "Check `systemctl status vaultwarden` + "
+                        "`rbw unlocked` from a terminal, then retry "
+                        "Edit. The wall's vault cache may need a full "
+                        "restart (⚙ Settings → Actions → Restart wall).",
+                        error=True, title="Vault read keeps failing")
+                    return _CANCELLED
+                # First / second failure — offer Sync + Retry.
+                d = Gtk.MessageDialog(
+                    transient_for=self, modal=True,
+                    message_type=Gtk.MessageType.WARNING,
+                    text=f"Vault read failed for '{name}'")
+                d.format_secondary_text(
+                    f"{e}\n\n"
+                    "This usually means rbw's cache is stale (the item "
+                    "was added / renamed / deleted directly in the web "
+                    "vault). Click 'Sync + retry' to refresh the cache "
+                    "and try again. If the vault is unreachable, Sync "
+                    "will also fail loudly.")
+                d.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                               "Sync + retry", Gtk.ResponseType.OK)
+                d.set_default_response(Gtk.ResponseType.OK)
+                rc = d.run(); d.destroy()
+                if rc != Gtk.ResponseType.OK:
+                    return _CANCELLED
+                # Run rbw sync in a small subprocess (the vault.facade
+                # has no public sync; we use the rbw CLI directly).
+                try:
+                    import subprocess
+                    subprocess.run(["rbw", "sync"], timeout=15,
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+                except Exception:                        # noqa: BLE001
+                    pass
+                # Also drop the in-process TTL cache for this item so
+                # the next creds() call REALLY hits rbw.
+                try:
+                    v_handle.invalidate(name)
+                except Exception:                        # noqa: BLE001
+                    pass
+                # Refresh the inventory list in the background so the
+                # operator sees the row updated even if the retry fails.
+                try:
+                    self._refresh_cred_inventory()
+                except Exception:                        # noqa: BLE001
+                    pass
+                # Loop — one more attempt against rbw.
 
     def _alert(self, msg: str, *, error: bool = False,
                 title: "str | None" = None):
