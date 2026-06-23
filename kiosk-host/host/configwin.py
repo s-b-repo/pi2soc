@@ -1350,6 +1350,16 @@ class ConfigWindow(Gtk.Window):
                 "Restart wall", self._actions["restart_wall"]))
             rows.append(("Restart wall (systemd respawn)", b))
 
+        if self._actions.get("lock_wall"):
+            b = Gtk.Button(label="🔒 Lock the wall now")
+            b.set_tooltip_text("Same as the toolbar 🔒 Lock and Ctrl+Alt+L. "
+                               "Panels stay visible; keyboard + mouse are "
+                               "inert until PIN or TOTP is entered.")
+            # Single-click (no confirm) — locking is reversible and the
+            # operator may need to lock fast.
+            b.connect("clicked", lambda _b: self._actions["lock_wall"]())
+            rows.append(("Lock the wall now", b))
+
         b = Gtk.Button(label="Repair install")
         b.set_tooltip_text("Run setup.py repair as root. Fixes perms, "
                            "re-seeds rbw config, re-ensures /run/user/<soc>.")

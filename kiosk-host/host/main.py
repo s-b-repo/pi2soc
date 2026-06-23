@@ -135,6 +135,15 @@ class KioskHost:
         self.panels_view = []          # live panel objects (WebKit/Chromium)
         self.wall = None               # WallWindow in single-window layout
         self._config_win = None        # the on-screen config window, when open
+        # Kiosk lock overlay (PIN/TOTP). Constructed unconditionally — `lock()`
+        # is cheap and idempotent, so wiring it from the toolbar / tray /
+        # Ctrl+Alt+L stays simple. Lock state files live under state_dir().
+        from . import locker as _locker
+        from . import configwin as _cw
+        self._locker = _locker.KioskLocker(_cw.state_dir())
+        # Tray is best-effort + only when running windowed (a tty1 kiosk has
+        # nowhere for a tray icon to live). Populated in build_and_show().
+        self._tray = None
 
     # creds callback handed to each panel
     def need_login(self, panel):
@@ -233,8 +242,22 @@ class KioskHost:
 
         if layout == "single":
             from .wall import WallWindow
-            self.wall = WallWindow(self.conf, log, on_destroy=self.shutdown,
-                                   on_config=config_cb, on_vpn=self.vpn_action)
+            # Tray sits in the system-tray of the desktop session. Pure-kiosk
+            # mode on tty1 has no tray surface, so we only construct it when
+            # running windowed AND the tray backend probe succeeds.
+            windowed = (os.environ.get("SOC_WINDOWED") == "1"
+                        or not getattr(self.conf.display, "fullscreen", True))
+            if windowed:
+                self._install_tray()
+            self.wall = WallWindow(
+                self.conf, log,
+                on_destroy=self.shutdown,
+                on_config=config_cb,
+                on_vpn=self.vpn_action,
+                on_lock=self._lock_wall,
+                on_hide_to_tray=(self._hide_to_tray
+                                 if self._tray is not None else None),
+            )
 
         stagger = cfg.env_float("SOC_LAUNCH_STAGGER", 1.5, lo=0.0, hi=60.0)
         cdp_base = cfg.env_int("SOC_CDP_BASE_PORT", 9222, lo=1024, hi=65535)
@@ -433,6 +456,7 @@ class KioskHost:
                                actions={
                                    "restart_wall": self.restart_wall,
                                    "reload_panels": self.reload_all_panels,
+                                   "lock_wall": self._lock_wall,
                                })
             self._config_win = win
             win.show_all()
@@ -440,6 +464,64 @@ class KioskHost:
         except Exception as e:  # noqa: BLE001 — never let the config UI kill the wall
             self._config_win = None
             log(f"config window failed to open: {e}")
+
+    # ---- tray + locker -----------------------------------------------------
+    def _install_tray(self):
+        """Best-effort: install a tray icon with Show / Lock / Settings /
+        Restart / Reboot / Quit. Returns silently if no tray backend is
+        available (AyatanaAppIndicator3 / AppIndicator3 / Gtk.StatusIcon)."""
+        try:
+            from . import tray as _tray
+        except Exception as e:  # noqa: BLE001
+            log(f"tray module import failed: {e}")
+            return
+        if not _tray.available():
+            log("no tray backend available — close button will quit")
+            return
+        t = _tray.Tray(app_id="soc-wall", icon_name="video-display",
+                       title="SOC wall")
+        ok = t.install([
+            ("Show wall",         lambda: self.wall and self.wall.window.present()),
+            ("Lock panel",        self._lock_wall),
+            None,
+            ("Open Settings",     self.open_config),
+            ("Restart wall",      self.restart_wall),
+            None,
+            ("Reboot machine",    self._tray_reboot),
+            None,
+            ("Quit",              self.shutdown),
+        ])
+        if ok:
+            self._tray = t
+            log(f"tray installed (backend={t.backend})")
+        else:
+            log("tray install failed")
+
+    def _lock_wall(self):
+        """Show the kiosk-lock overlay. Panels keep rendering underneath;
+        keyboard + mouse are inert until the operator enters PIN/TOTP."""
+        try:
+            self._locker.lock(on_unlock=None)
+        except Exception as e:  # noqa: BLE001
+            log(f"lock failed: {e}")
+
+    def _hide_to_tray(self):
+        """delete-event callback when tray is active — hide the window. The
+        wall keeps running; clicking the tray's "Show wall" brings it back."""
+        if self.wall is not None and self.wall.window is not None:
+            self.wall.window.hide()
+
+    def _tray_reboot(self):
+        """systemd reboot — needs root. Falls back to a journal note if not."""
+        import subprocess
+        log("tray: reboot requested")
+        try:
+            subprocess.run(["systemctl", "reboot"], timeout=10,
+                           stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=True)
+        except Exception as e:  # noqa: BLE001
+            log(f"tray: reboot needs root ({e}) — run sudo systemctl reboot")
 
     def _config_closed(self):
         self._config_win = None

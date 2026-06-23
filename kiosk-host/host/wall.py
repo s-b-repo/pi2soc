@@ -21,12 +21,33 @@ from gi.repository import Gtk, Gdk  # noqa: E402
 from . import style  # noqa: E402
 
 
+def _delete_event_action(on_hide_to_tray):
+    """Pure logic for delete-event handling — extracted so tests can exercise
+    it without constructing a GTK window. Returns True to *swallow* the close
+    (tray hide path), False to let GTK propagate to destroy (legacy path)."""
+    if on_hide_to_tray is None:
+        return False
+    try:
+        on_hide_to_tray()
+    except Exception:                                  # noqa: BLE001
+        # If hide-to-tray bombs, fall back to letting the window close
+        # rather than leaving an unresponsive zombie on screen.
+        return False
+    return True
+
+
 class WallWindow:
-    def __init__(self, conf, log, on_destroy=None, on_config=None, on_vpn=None):
+    def __init__(self, conf, log, on_destroy=None, on_config=None, on_vpn=None,
+                 on_lock=None, on_hide_to_tray=None):
         self.conf = conf
         self.log = log
         self.on_config = on_config        # callable() -> open the config window
         self.on_vpn = on_vpn              # callable(name) -> reconnect VPN named
+        self.on_lock = on_lock            # callable() -> show kiosk-lock overlay
+        # If on_hide_to_tray is set (i.e. main constructed a tray icon), the
+        # close button hides instead of destroys. Without it, close behaves as
+        # before — the destroy handler fires and the host shuts down.
+        self.on_hide_to_tray = on_hide_to_tray
         # Multi-VPN: one pill per entry in conf.vpns (name + traffic-light
         # colour). Falls back to a single "VPN: not configured" pill when
         # vpns is empty so the toolbar isn't visually empty.
@@ -77,7 +98,17 @@ class WallWindow:
             gear.get_style_context().add_class("soc-gear")
             gear.set_tooltip_text("Configure panels (Ctrl+Shift+C)")
             gear.connect("clicked", lambda *_: self.on_config and self.on_config())
+            # pack_end pushes right; this lands *right* of the lock button below.
             toolbar.pack_end(gear, False, False, 0)
+        if on_lock is not None:
+            # pack_end in reverse-visual order: gear is already on the right,
+            # pack_end the lock NEXT so it sits to gear's LEFT.
+            lock = Gtk.Button(label="🔒 Lock")
+            lock.get_style_context().add_class("soc-toolbar-action")
+            lock.set_tooltip_text("Lock the wall — unlock with PIN or TOTP "
+                                  "(Ctrl+Alt+L). Panels stay visible.")
+            lock.connect("clicked", lambda *_: self.on_lock and self.on_lock())
+            toolbar.pack_end(lock, False, False, 0)
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         vbox.pack_start(toolbar, False, False, 0)
@@ -85,14 +116,25 @@ class WallWindow:
         win.add(vbox)
 
         win.connect("key-press-event", self._on_key)
-        # window-wide accelerator so Ctrl+Shift+C still opens settings even when
-        # a webview has the keyboard focus
+        # window-wide accelerators so the hotkeys still work when a webview has
+        # focus: Ctrl+Shift+C opens settings, Ctrl+Alt+L locks the wall.
+        accel = Gtk.AccelGroup()
+        win.add_accel_group(accel)
         if on_config is not None:
-            accel = Gtk.AccelGroup()
-            win.add_accel_group(accel)
             key, mod = Gtk.accelerator_parse("<Control><Shift>c")
             if key:
                 accel.connect(key, mod, 0, self._accel_config)
+        if on_lock is not None:
+            key, mod = Gtk.accelerator_parse("<Control><Alt>l")
+            if key:
+                accel.connect(key, mod, 0, self._accel_lock)
+
+        # delete-event fires when the user clicks the close button. With a tray
+        # callback installed, we swallow it (window hides, host stays alive).
+        # Without one, we let it propagate to destroy, which fires on_destroy
+        # exactly as before.
+        win.connect("delete-event", lambda *_: _delete_event_action(
+            self.on_hide_to_tray))
 
         if on_destroy:
             # losing the wall window (e.g. the compositor killed it) leaves
@@ -105,6 +147,11 @@ class WallWindow:
     def _accel_config(self, *_):
         if self.on_config:
             self.on_config()
+        return True
+
+    def _accel_lock(self, *_):
+        if self.on_lock:
+            self.on_lock()
         return True
 
     def _on_key(self, _w, event):
