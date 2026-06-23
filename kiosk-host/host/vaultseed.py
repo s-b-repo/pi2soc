@@ -184,12 +184,60 @@ class Session:
         _req(self.base + "/api/ciphers", headers=self.auth, data=body, method="POST")
         return "created"
 
+    def upsert_secure_note(self, name, notes, folder=None) -> str:
+        """Create or update a Vaultwarden secure note (type=2). Used for items
+        whose payload lives entirely in the Notes field — e.g. TOTP secrets,
+        VPN config blocks parsed by fortivpn.py. Returns 'created'|'updated'.
+        `folder` is ignored today (folder IDs need a separate folders API
+        round-trip); planned for Phase 6 inventory grouping."""
+        def e(s):
+            return _enc(s.encode(), self.ek, self.mk)
+        body = {
+            "type": 2,
+            "name": e(name),
+            "favorite": False,
+            "notes": e(notes) if notes else None,
+            "secureNote": {"type": 0},
+        }
+        cid = self._find(name)
+        if cid:
+            _req(self.base + f"/api/ciphers/{cid}", headers=self.auth,
+                 data=body, method="PUT")
+            return "updated"
+        _req(self.base + "/api/ciphers", headers=self.auth, data=body, method="POST")
+        return "created"
+
+    def delete_item(self, name) -> bool:
+        """DELETE /api/ciphers/{id}. Returns True if a matching cipher was
+        found + deleted, False if no item by that name. Raises on transport /
+        auth errors (so a 5xx from Vaultwarden surfaces as a GUI 'delete
+        failed; check journal')."""
+        cid = self._find(name)
+        if not cid:
+            return False
+        _req(self.base + f"/api/ciphers/{cid}", headers=self.auth,
+             method="DELETE")
+        return True
+
 
 def upsert_login(url, email, master_password, name, username, password,
                  notes=None, uri=None) -> str:
     """One-shot: log in and create/update a Vaultwarden login. Returns the action."""
     return Session(url, email, master_password).upsert_login(
         name, username, password, notes=notes, uri=uri)
+
+
+def upsert_secure_note(url, email, master_password, name, notes,
+                       folder=None) -> str:
+    """One-shot: log in and create/update a Vaultwarden secure note."""
+    return Session(url, email, master_password).upsert_secure_note(
+        name, notes, folder=folder)
+
+
+def delete_login(url, email, master_password, name) -> bool:
+    """One-shot: log in and delete a vault item by name. Returns True if
+    deleted, False if nothing matched."""
+    return Session(url, email, master_password).delete_item(name)
 
 
 def account_exists(url: str, email: str, master_password: str) -> bool:

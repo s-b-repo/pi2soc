@@ -52,6 +52,17 @@ class FakeBackend:
                 f"vault item '{item}' has an empty Notes field{what}")
         return out
 
+    def delete(self, item):
+        """Symmetric to RbwBackend.delete — True on hit, False if absent."""
+        return self.data.pop(item, None) is not None
+
+    def list_by_folder(self, folder):
+        """Optional folder index. Tests that exercise list_by_folder seed
+        FakeBackend(...) with a `folders` kwarg via direct attribute set:
+        backend.folders = {'SOC Wall Auth': ['SOC Settings TOTP']}.
+        Default: empty list (so vault.list_by_folder is safe-no-op)."""
+        return list(getattr(self, "folders", {}).get(folder, []))
+
 
 @pytest.fixture
 def fake_vault():

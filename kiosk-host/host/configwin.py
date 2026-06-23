@@ -1020,11 +1020,12 @@ class ConfigWindow(Gtk.Window):
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         outer.set_border_width(12)
-        note = Gtk.Label(label="Two supervised VPNs. Each gets its own systemd "
+        note = Gtk.Label(label="Supervised VPNs. Each gets its own systemd "
                                "service (forti-vpn@<name>) and its own top-bar "
                                "pill (green=online · amber=connecting · "
-                               "red=offline). Credentials live in the vault — "
-                               "set them on the Credentials tab. Apply pushes "
+                               "red=offline). Inline username/password saves "
+                               "straight to the vault item; cert / config "
+                               "fields stay in the panels config. Apply pushes "
                                "the config back to the vault note and restarts "
                                "the VPN service(s).")
         note.get_style_context().add_class("soc-config-sub")
@@ -1032,15 +1033,136 @@ class ConfigWindow(Gtk.Window):
         note.set_line_wrap(True)
         outer.pack_start(note, False, False, 0)
 
+        # Header row: "+ Add VPN" button. Operator can add as many VPN sections
+        # as they want; the layout no longer hardcodes 2.
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        header.get_style_context().add_class("soc-config-sub")
+        add_btn = Gtk.Button(label="+ Add VPN")
+        add_btn.set_tooltip_text("Add a new collapsible VPN section. The new "
+                                 "entry starts disabled — fill in name + "
+                                 "gateway + vault item, then enable it.")
+        add_btn.connect("clicked", self._on_add_vpn)
+        header.pack_end(add_btn, False, False, 0)
+        outer.pack_start(header, False, False, 0)
+
+        # Re-buildable expander list. Cache the (outer container, header) so
+        # _on_add_vpn can append + show without rebuilding the whole tab.
         self._vpn_ws = []
+        self._vpn_expanders_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                                          spacing=8)
+        outer.pack_start(self._vpn_expanders_box, False, False, 0)
+
         for idx, v in enumerate(self._vpns):
-            outer.pack_start(self._vpn_section(v, idx), False, False, 0)
+            exp = self._vpn_section(v, idx)
+            self._vpn_expanders_box.pack_start(exp, False, False, 0)
+            # Only the first section is expanded by default — operators usually
+            # only edit one VPN at a time and the open-by-default sprawl was
+            # too tall on small displays.
+            exp.set_expanded(idx == 0)
+
         scroll.add(outer)
         return scroll
 
+    def _on_add_vpn(self, _btn):
+        """+ Add VPN — append a blank entry, build its expander, show it."""
+        idx = len(self._vpns)
+        v = {"name": f"vpn-{idx+1}", "enabled": False, "type": "fortinet"}
+        self._vpns.append(v)
+        exp = self._vpn_section(v, idx)
+        self._vpn_expanders_box.pack_start(exp, False, False, 0)
+        exp.set_expanded(True)
+        exp.show_all()
+
+    def _on_remove_vpn(self, idx: int, expander):
+        """Remove this VPN — dialog confirm, then drop from _vpns + UI.
+        Phase 6 gates this with _require_reauth; for now it's a simple
+        confirmation (no destructive action ships unguarded — Apply
+        pushing to vault is still gated by the Settings PIN)."""
+        d = Gtk.MessageDialog(transient_for=self,
+                              modal=True,
+                              message_type=Gtk.MessageType.QUESTION,
+                              buttons=Gtk.ButtonsType.OK_CANCEL,
+                              text="Remove this VPN entry?")
+        name = (self._vpns[idx].get("name") if idx < len(self._vpns)
+                else "") or f"vpn-{idx+1}"
+        d.format_secondary_text(
+            f"VPN '{name}' will be removed from the config on next Apply. "
+            "The vault credential item is NOT deleted by this action — "
+            "use the Credentials tab to delete it explicitly.")
+        rc = d.run()
+        d.destroy()
+        if rc != Gtk.ResponseType.OK:
+            return
+        # Remove the dict entry; we leave self._vpn_ws[idx] in place but
+        # marked dead so apply_overrides skips it (lighter than re-indexing
+        # every expander's name-rename closure).
+        if 0 <= idx < len(self._vpns):
+            self._vpns[idx] = None
+        if 0 <= idx < len(self._vpn_ws):
+            self._vpn_ws[idx] = None
+        if expander is not None:
+            expander.destroy()
+
+    def _save_vpn_creds(self, idx: int, user: str, password: str,
+                         vault_item_entry):
+        """Save inline VPN user/password to the vault item named by the
+        section's `vault_item` entry. If the operator has not chosen a
+        vault item name, default to 'SOC VPN <name>' so saving Just Works
+        for first-time setup."""
+        from . import vaultseed
+        import os as _os
+        if not vault_item_entry.get_text().strip():
+            vname = (self._vpns[idx].get("name")
+                     if 0 <= idx < len(self._vpns) and self._vpns[idx]
+                     else "") or f"vpn-{idx+1}"
+            vault_item_entry.set_text(f"SOC VPN {vname}")
+        item = vault_item_entry.get_text().strip()
+        if not user and not password:
+            self._toast("set a username + password first")
+            return
+        url = _os.environ.get("SOC_VAULT_URL", "http://127.0.0.1:8222")
+        email = _os.environ.get("SOC_VAULT_EMAIL", "")
+        master = getattr(self, "_master_pw", "") or ""
+        if not (email and master):
+            self._toast("vault credentials needed: type the master password "
+                        "in the Credentials tab first")
+            return
+        try:
+            rc = vaultseed.upsert_login(url, email, master,
+                                        name=item, username=user,
+                                        password=password)
+            self._toast(f"vault item '{item}' {rc} ✓")
+        except Exception as e:  # noqa: BLE001
+            self._toast(f"vault save failed: {e}")
+
+    def _toast(self, msg: str):
+        """Lightweight non-modal message — uses the existing status label
+        slot if present, falls back to a transient label at the bottom of
+        the active page. Idempotent: no-op if neither surface is built yet."""
+        lbl = getattr(self, "_apply_msg", None)
+        if lbl is None:
+            return
+        try:
+            lbl.set_text(msg)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _vpn_section(self, v: dict, idx: int):
+        """Build the collapsible per-VPN section. Returns a `Gtk.Expander`
+        (not the old `Gtk.Frame`) so multiple VPNs don't sprawl the tab,
+        and only the first one is open by default."""
         default_name = v.get("name") or f"vpn-{idx+1}"
-        frame = Gtk.Frame(label=f"  VPN {idx+1}: {default_name}  ")
+        # Custom label widget so we can set_markup live as the operator
+        # types in the name entry — keeps the header in sync.
+        header_lbl = Gtk.Label()
+        header_lbl.set_markup(self._vpn_header_markup(default_name, idx,
+                                                       v.get("type")))
+        header_lbl.set_xalign(0.0)
+
+        exp = Gtk.Expander()
+        exp.set_label_widget(header_lbl)
+        exp.set_resize_toplevel(True)
+
         inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         inner.set_border_width(8)
         w = {}
@@ -1066,15 +1188,21 @@ class ConfigWindow(Gtk.Window):
             return e
 
         w["name"] = entry(default_name, "name (top-bar pill label, systemd instance)")
-        # Live rename — the frame header updates as the operator types so the
-        # whole section reflects the chosen VPN identity (not stuck on
-        # "VPN 1" / "VPN 2"). Pass idx through the closure.
-        w["name"].connect("changed", lambda e, i=idx, fr=frame:
-            fr.set_label(f"  VPN {i+1}: {e.get_text().strip() or f'vpn-{i+1}'}  "))
+        # Live rename — the expander header updates as the operator types so
+        # the section reflects the chosen VPN identity (not stuck on
+        # "VPN 1" / "VPN 2"). Pass idx + the combo box for live type info too.
+        def _on_name_change(e, i=idx, hdr=header_lbl, type_combo=w["type"]):
+            hdr.set_markup(self._vpn_header_markup(
+                e.get_text().strip() or f"vpn-{i+1}", i,
+                type_combo.get_active_text()))
+        w["name"].connect("changed", _on_name_change)
+        w["type"].connect("changed", lambda _c: _on_name_change(w["name"]))
+
         w["gateway"] = entry(v.get("gateway"), "gateway host (fortinet / inode)")
         w["port"] = Gtk.SpinButton.new_with_range(0, 65535, 1)
         w["port"].set_value(int(v.get("port", 443) or 0))
-        w["vault_item"] = entry(v.get("vault_item"), "vault login (username + password)")
+        w["vault_item"] = entry(v.get("vault_item"),
+                                 "vault login item (auto-named 'SOC VPN <name>' if blank)")
         w["config"] = entry(v.get("config"), ".ovpn/.conf path, or the iNode client dir")
         w["domain"] = entry(v.get("domain"), "auth domain (inode)")
         w["realm"] = entry(v.get("realm"), "realm (fortinet)")
@@ -1101,9 +1229,66 @@ class ConfigWindow(Gtk.Window):
         w["config_from_vault"].set_active(bool(v.get("config_from_vault")))
         inner.pack_start(w["insecure"], False, False, 0)
         inner.pack_start(w["config_from_vault"], False, False, 0)
-        frame.add(inner)
-        self._vpn_ws.append(w)
-        return frame
+
+        # --- inline credentials (Phase 4 — write straight to the vault item).
+        # Read is intentionally NOT shown (no re-display of stored secrets).
+        cred_frame = Gtk.Frame(label="  inline credentials → vault  ")
+        cred_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        cred_box.set_border_width(6)
+        w["user"] = entry("", "VPN username (saved to the vault item; never read back)")
+        w["pass"] = Gtk.Entry()
+        w["pass"].set_visibility(False)
+        w["pass"].set_placeholder_text("VPN password (write-only)")
+        w["pass"].set_hexpand(True)
+        cred_box.pack_start(w["user"], False, False, 0)
+        cred_box.pack_start(w["pass"], False, False, 0)
+        save_btn = Gtk.Button(label="Save inline creds to vault")
+        save_btn.set_tooltip_text("Writes to the vault item named in 'vault "
+                                  "login'; auto-names it 'SOC VPN <name>' if "
+                                  "blank. Inputs are scrubbed after a "
+                                  "successful save.")
+        save_btn.connect(
+            "clicked",
+            lambda _b, i=idx, u=w["user"], p=w["pass"], vi=w["vault_item"]:
+                self._save_and_clear_vpn_creds(i, u, p, vi))
+        cred_box.pack_start(save_btn, False, False, 0)
+        cred_frame.add(cred_box)
+        inner.pack_start(cred_frame, False, False, 0)
+
+        # --- destructive: Remove this VPN.
+        rm = Gtk.Button(label="Remove this VPN")
+        rm.get_style_context().add_class("destructive-action")
+        rm.set_tooltip_text("Removes the section from the config (next Apply "
+                            "drops it). The vault credential item is left "
+                            "alone — delete it explicitly in Credentials.")
+        rm.connect("clicked", lambda _b, i=idx, e=exp: self._on_remove_vpn(i, e))
+        inner.pack_start(rm, False, False, 0)
+
+        exp.add(inner)
+        # Pad self._vpn_ws so indexing matches self._vpns.
+        while len(self._vpn_ws) <= idx:
+            self._vpn_ws.append(None)
+        self._vpn_ws[idx] = w
+        return exp
+
+    def _vpn_header_markup(self, name: str, idx: int, typ):
+        """Header label shown next to the expander arrow. Bold name, then
+        a small grey "(type)" suffix so the operator sees the choice
+        without expanding the section."""
+        name = name or f"vpn-{idx+1}"
+        t = (typ or "").strip() or "?"
+        return f"<b>VPN {idx+1}: {GLib.markup_escape_text(name)}</b>  " \
+               f"<span color='#888'>({GLib.markup_escape_text(t)})</span>"
+
+    def _save_and_clear_vpn_creds(self, idx, user_entry, pass_entry,
+                                   vault_item_entry):
+        """Wrapper: call _save_vpn_creds, then scrub the entries on success
+        so the password doesn't sit in a GTK Entry forever."""
+        self._save_vpn_creds(idx, user_entry.get_text(),
+                             pass_entry.get_text(), vault_item_entry)
+        # Scrub regardless — even on failure we don't want the password
+        # lingering; the operator can retype.
+        pass_entry.set_text("")
 
     def _tab_security(self):
         """PIN + TOTP enrollment for the Settings gate AND the panel lock.

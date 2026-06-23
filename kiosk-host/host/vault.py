@@ -135,6 +135,27 @@ class RbwBackend:
                 f"that item in Vaultwarden (web UI or the ⚙ Credentials tab).")
         return out
 
+    def delete(self, item: str) -> bool:
+        """Delete a vault item via `rbw remove <item>`. Returns True on exit
+        code 0; False otherwise. Used by the GUI's Remove buttons (VPN remove,
+        Credentials-tab delete). Idempotent — a second call returns False
+        because rbw exits non-zero when the item is already gone."""
+        r = subprocess.run(["rbw", "remove", item], capture_output=True,
+                           text=True, timeout=30)
+        return r.returncode == 0
+
+    def list_by_folder(self, folder: str) -> list:
+        """Names of every item in the named folder (e.g. 'SOC Wall Auth').
+        Returns [] if the folder is empty / does not exist / rbw fails — the
+        Credentials tab uses this to discover items it doesn't track via
+        panels.yaml. Uncached on purpose: the GUI calls it on demand."""
+        # `rbw list --folder <name>` prints one item name per line.
+        r = subprocess.run(["rbw", "list", "--folder", folder],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return []
+        return [line.strip() for line in r.stdout.splitlines() if line.strip()]
+
 
 def _make_backend():
     # Production-only: every credential comes from Vaultwarden via rbw. The legacy
@@ -220,3 +241,28 @@ class Vault:
                 self._cache.pop(item, None)
             else:
                 self._cache.clear()
+
+    def delete(self, item: str) -> bool:
+        """Delete a vault item and invalidate its cache entry. Returns True
+        on success; logs + returns False if the backend reports failure or
+        raises (so callers can show a single 'delete failed' toast rather
+        than a stack trace at the glass)."""
+        try:
+            ok = bool(self.backend.delete(item))
+        except Exception as e:  # noqa: BLE001 — never crash the GUI on delete
+            import logging
+            logging.warning("vault.delete(%r) failed: %s", item, e)
+            return False
+        if ok:
+            self.invalidate(item)
+        return ok
+
+    def list_by_folder(self, folder: str) -> list:
+        """Names of every item in the named folder. Empty list on failure /
+        unknown folder so the GUI can render an empty 'orphans' group."""
+        try:
+            return list(self.backend.list_by_folder(folder))
+        except Exception as e:  # noqa: BLE001
+            import logging
+            logging.warning("vault.list_by_folder(%r) failed: %s", folder, e)
+            return []
