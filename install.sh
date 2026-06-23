@@ -227,9 +227,13 @@ pm_try(){           # optional packages: best effort, one by one, warn only
 PK_XSRV_ALT=()
 case "$FAMILY" in
   debian)
+    # python3-pampy provides `import pam` (the API our ospass module
+    # uses). The Debian package called `python3-pam` is a DIFFERENT
+    # binding that exposes `import PAM` (uppercase) with a totally
+    # different API — easily confused. pampy is what we want.
     PK_CORE=(python3 python3-venv python3-gi gir1.2-gtk-3.0
              curl ca-certificates autossh openfortivpn ppp
-             python3-pam)
+             python3-pampy)
     PK_XSRV=(xserver-xorg xserver-xorg-legacy)
     PK_X11=(xinit x11-xserver-utils openbox)
     PK_WAYLAND=(cage)

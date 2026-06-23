@@ -16,26 +16,56 @@ from host import ospass                                 # noqa: E402
 
 
 def test_operator_user_prefers_env_var(monkeypatch):
-    """SOC_OPERATOR_USER wins over every fallback."""
+    """SOC_OPERATOR_USER wins over every fallback (even when 'root' —
+    operator's explicit choice; they may have set a root password)."""
     monkeypatch.setenv("SOC_OPERATOR_USER", "root")    # always exists
     monkeypatch.delenv("SUDO_USER", raising=False)
     assert ospass.operator_user() == "root"
 
 
-def test_operator_user_falls_back_to_sudo_user(monkeypatch):
-    """Without SOC_OPERATOR_USER, SUDO_USER is used (matches the launch-as-sudo
-    pattern)."""
+def test_operator_user_sudo_user_root_is_skipped(monkeypatch):
+    """SUDO_USER=root is the DOUBLE-SUDO trap: the wall was launched
+    via `sudo … sudo -u soc bash …`, so soc's env carries SUDO_USER=root.
+    operator_user() must skip 'root' here and fall through to the
+    /etc/passwd scan, otherwise we'd prompt for root's password — which
+    is locked on Kali / Ubuntu / Fedora out of the box."""
     monkeypatch.delenv("SOC_OPERATOR_USER", raising=False)
     monkeypatch.setenv("SUDO_USER", "root")
-    assert ospass.operator_user() == "root"
+    rv = ospass.operator_user()
+    # Should be a real human user (uid >= 1000), not root.
+    assert rv != "root"
+    import pwd
+    assert pwd.getpwnam(rv).pw_uid >= 1000
+
+
+def test_operator_user_sudo_user_real_user_wins(monkeypatch):
+    """SUDO_USER set to a real (non-root, existing) user IS used —
+    most common path when a desktop user runs `sudo launch.sh` directly."""
+    monkeypatch.delenv("SOC_OPERATOR_USER", raising=False)
+    import pwd
+    # Find a real human user on this box to assert against.
+    target = None
+    for e in pwd.getpwall():
+        if e.pw_uid >= 1000 and e.pw_uid != 65534:
+            target = e.pw_name
+            break
+    if target is None:
+        return                                          # nothing to test
+    monkeypatch.setenv("SUDO_USER", target)
+    assert ospass.operator_user() == target
 
 
 def test_operator_user_skips_nonexistent_env_values(monkeypatch):
     """A typo'd SOC_OPERATOR_USER (no such user on the box) doesn't get
-    returned — falls through to SUDO_USER / conventional guesses."""
+    returned — falls through to SUDO_USER / conventional guesses.
+    With SUDO_USER=root (which we now skip), we fall further to the
+    /etc/passwd scan."""
     monkeypatch.setenv("SOC_OPERATOR_USER", "this-user-does-not-exist-12345")
     monkeypatch.setenv("SUDO_USER", "root")
-    assert ospass.operator_user() == "root"
+    rv = ospass.operator_user()
+    assert rv != "root"
+    import pwd
+    assert pwd.getpwnam(rv).pw_uid >= 1000
 
 
 def test_operator_user_always_returns_string(monkeypatch):
@@ -54,48 +84,50 @@ def test_verify_returns_false_for_empty_user_or_password():
     assert ospass.verify_os_password("", "") is False
 
 
-def test_verify_uses_pam_backend_first(monkeypatch):
-    """When python3-pam reports True, no other backend should be tried."""
+def test_verify_uses_su_backend_first(monkeypatch):
+    """su is tried first because it's the only backend that reliably
+    works cross-user from an unprivileged caller (the wall runs as
+    `soc` and needs to verify the desktop operator's password)."""
     calls = []
-    monkeypatch.setattr(ospass, "_verify_via_pam",
-                        lambda u, p, *, timeout: (calls.append("pam"), True)[1])
+    monkeypatch.setattr(ospass, "_verify_via_su",
+                        lambda u, p, *, timeout: (calls.append("su"), True)[1])
     monkeypatch.setattr(ospass, "_verify_via_pamtester",
                         lambda *a, **kw: (calls.append("pamtester"), False)[1])
-    monkeypatch.setattr(ospass, "_verify_via_su",
-                        lambda *a, **kw: (calls.append("su"), False)[1])
-    # Skip the constant-time latency floor for tests.
+    monkeypatch.setattr(ospass, "_verify_via_pam",
+                        lambda *a, **kw: (calls.append("pam"), False)[1])
     monkeypatch.setattr(ospass, "_MIN_LATENCY_SEC", 0.0)
     assert ospass.verify_os_password("alice", "right-password") is True
-    assert calls == ["pam"]
+    assert calls == ["su"]
 
 
-def test_verify_falls_through_pam_to_pamtester(monkeypatch):
-    """When PAM module isn't installed (returns None), pamtester is next."""
+def test_verify_falls_through_su_to_pamtester(monkeypatch):
+    """When su is unusable (missing binary), pamtester is next."""
     calls = []
-    monkeypatch.setattr(ospass, "_verify_via_pam",
-                        lambda u, p, *, timeout: (calls.append("pam"), None)[1])
+    monkeypatch.setattr(ospass, "_verify_via_su",
+                        lambda u, p, *, timeout: (calls.append("su"), None)[1])
     monkeypatch.setattr(ospass, "_verify_via_pamtester",
                         lambda u, p, *, timeout: (calls.append("pamtester"),
                                                     True)[1])
-    monkeypatch.setattr(ospass, "_verify_via_su",
-                        lambda *a, **kw: (calls.append("su"), True)[1])
+    monkeypatch.setattr(ospass, "_verify_via_pam",
+                        lambda *a, **kw: (calls.append("pam"), True)[1])
     monkeypatch.setattr(ospass, "_MIN_LATENCY_SEC", 0.0)
     assert ospass.verify_os_password("alice", "pw") is True
-    assert calls == ["pam", "pamtester"]
+    assert calls == ["su", "pamtester"]
 
 
-def test_verify_falls_all_the_way_to_su(monkeypatch):
-    """When PAM + pamtester are both unavailable, su is the last resort."""
+def test_verify_falls_all_the_way_to_pam(monkeypatch):
+    """When su + pamtester are both unavailable, python3-pampy is the
+    last resort."""
     calls = []
-    monkeypatch.setattr(ospass, "_verify_via_pam",
-                        lambda *a, **kw: (calls.append("pam"), None)[1])
+    monkeypatch.setattr(ospass, "_verify_via_su",
+                        lambda *a, **kw: (calls.append("su"), None)[1])
     monkeypatch.setattr(ospass, "_verify_via_pamtester",
                         lambda *a, **kw: (calls.append("pamtester"), None)[1])
-    monkeypatch.setattr(ospass, "_verify_via_su",
-                        lambda *a, **kw: (calls.append("su"), False)[1])
+    monkeypatch.setattr(ospass, "_verify_via_pam",
+                        lambda *a, **kw: (calls.append("pam"), False)[1])
     monkeypatch.setattr(ospass, "_MIN_LATENCY_SEC", 0.0)
     assert ospass.verify_os_password("alice", "pw") is False
-    assert calls == ["pam", "pamtester", "su"]
+    assert calls == ["su", "pamtester", "pam"]
 
 
 def test_verify_returns_false_when_every_backend_unavailable(monkeypatch):

@@ -113,6 +113,61 @@ if [ ! -e "$MARKER" ]; then
   fi
 fi
 
+# Decide HOW to launch:
+#   tty1 / kiosk path  → start-session.sh starts a fresh compositor (cage/labwc
+#                         or X11) and runs the wall under it. Requires
+#                         XDG_RUNTIME_DIR for the kiosk user.
+#   desktop-session    → DISPLAY / WAYLAND_DISPLAY already point at the user's
+#                         existing compositor; we run the wall as a windowed
+#                         app on top of it via wall-windowed.sh (which handles
+#                         XDG_RUNTIME_DIR, XAUTHORITY discovery, safe env
+#                         source, and the respawn loop).
+#
+# The bug we fix here: running `sudo launch.sh` from a desktop terminal
+# kept DISPLAY=:1 in root's env (sudo's default env_keep). That made the
+# old code take the "Starting the wall session" path, which tried to
+# spawn cage as ROOT — cage immediately died because XDG_RUNTIME_DIR
+# isn't set for root. The right move when we're root in someone else's
+# desktop session is to drop to the kiosk user + use wall-windowed.sh.
+KIOSK_USER="$(awk -F= '/^SOC_WALL_USER=/ {gsub(/^"|"$/, "", $2); print $2}' \
+                /etc/soc-display/soc.env 2>/dev/null)"
+[ -z "${KIOSK_USER:-}" ] && KIOSK_USER="soc"
+
+# Is this an existing desktop session (X11 or Wayland) belonging to a
+# DIFFERENT user? If so, root running cage is wrong — delegate.
+if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] \
+    && [ "$(id -u)" = "0" ] \
+    && [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "$KIOSK_USER" ]; then
+  log "Detected an existing desktop session (DISPLAY=${DISPLAY:-?},"
+  log "  WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-?}) belonging to ${SUDO_USER}."
+  log "  Running the wall as a windowed app via $KIOSK_USER's launcher."
+  log "  (For the tty1 kiosk path instead, run as the kiosk user on tty1.)"
+  # Make sure $KIOSK_USER can open windows on the existing display. xhost
+  # is per-session + per-user; we run it as the desktop user via sudo so
+  # it targets THEIR display state.
+  if command -v xhost >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
+    sudo -u "$SUDO_USER" \
+      env DISPLAY="${DISPLAY}" \
+          XAUTHORITY="${XAUTHORITY:-/run/user/$(id -u "$SUDO_USER")/xauth_*}" \
+      xhost "+SI:localuser:$KIOSK_USER" >/dev/null 2>&1 \
+      || warn "could not run xhost as $SUDO_USER — if the wall fails on"
+    [ $? = 0 ] || warn "  X auth, run: scripts/grant-soc-x-display.sh"
+  fi
+  # Make sure XDG_RUNTIME_DIR exists for the kiosk user (the launcher
+  # tries again, but it can't always escalate; we have root here, so do
+  # it now).
+  install -d -m 0700 -o "$KIOSK_USER" -g "$KIOSK_USER" \
+    "/run/user/$(id -u "$KIOSK_USER")" 2>/dev/null || true
+  # Hand off — exec replaces this shell so we don't fall through.
+  KIOSK_HOME="$(getent passwd "$KIOSK_USER" | cut -d: -f6)"
+  LAUNCHER="${KIOSK_HOME}/wall-launcher.sh"
+  [ -x "$LAUNCHER" ] || LAUNCHER="$ROOT/scripts/wall-windowed.sh"
+  exec sudo -u "$KIOSK_USER" \
+    env DISPLAY="${DISPLAY:-:0}" \
+        WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
+    bash "$LAUNCHER"
+fi
+
 if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
   log "Starting the wall session"
   exec "$ROOT/scripts/start-session.sh"

@@ -1026,20 +1026,26 @@ class ConfigWindow(Gtk.Window):
         verifies via host.ospass.verify_os_password.
 
         Returns (ok, user). `ok` is True iff the operator provided a
-        valid password; `user` is the operator name that was checked
-        (useful for the next-step modal title).
+        valid password; `user` is the user that was checked (useful
+        for the next-step modal title).
+
+        The username field is OPERATOR-EDITABLE — auto-detection guesses
+        the most likely human user (uid >= 1000, real shell), but the
+        operator can override (e.g. on a multi-user box, or when the
+        wall was launched via a sudo chain that confused the
+        auto-detect).
 
         The password string is held only inside this scope — never
-        returned, logged, or stored. Failures use a 1 s back-off + a
-        clear toast so a brute-forcer can't sit on the prompt."""
+        returned, logged, or stored. Rejection raises a loud error
+        dialog so the operator can't miss it."""
         from . import ospass as _osp
-        user = _osp.operator_user()
+        auto_user = _osp.operator_user()
         d = Gtk.Dialog(transient_for=self, modal=True,
                         title=f"OS password required — {what}")
         d.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
                        "Verify", Gtk.ResponseType.OK)
         d.set_default_response(Gtk.ResponseType.OK)
-        d.set_default_size(420, 0)
+        d.set_default_size(440, 0)
         box = d.get_content_area()
         box.set_spacing(8)
         box.set_margin_start(14); box.set_margin_end(14)
@@ -1047,32 +1053,70 @@ class ConfigWindow(Gtk.Window):
         hint = Gtk.Label()
         hint.set_xalign(0.0); hint.set_line_wrap(True)
         hint.set_markup(
-            f"This action reveals + changes a stored credential. Enter the "
-            f"OS login password for <b>{GLib.markup_escape_text(user)}</b> "
-            f"to continue. Wall PIN/TOTP is <i>not</i> sufficient for "
-            f"reveal operations.")
-        entry = Gtk.Entry()
-        entry.set_visibility(False)
-        entry.set_activates_default(True)
-        entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+            "This action reveals + changes a stored credential. Enter "
+            "your OS login username + password to continue.  "
+            "Wall PIN/TOTP is <i>not</i> sufficient for reveal operations.")
+        # Username (editable — pre-filled with the auto-detected operator).
+        u_lbl = Gtk.Label(label="username")
+        u_lbl.set_xalign(0.0)
+        u_lbl.get_style_context().add_class("soc-config-sub")
+        u_entry = Gtk.Entry()
+        u_entry.set_text(auto_user)
+        u_entry.set_tooltip_text("Default is the first uid≥1000 with a "
+                                  "real shell. Override if the wall guessed "
+                                  "wrong (or you set SOC_OPERATOR_USER).")
+        # Password.
+        p_lbl = Gtk.Label(label="password")
+        p_lbl.set_xalign(0.0)
+        p_lbl.get_style_context().add_class("soc-config-sub")
+        p_entry = Gtk.Entry()
+        p_entry.set_visibility(False)
+        p_entry.set_activates_default(True)
+        p_entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
         box.pack_start(hint, False, False, 0)
-        box.pack_start(entry, False, False, 0)
+        for w in (u_lbl, u_entry, p_lbl, p_entry):
+            box.pack_start(w, False, False, 0)
         d.show_all()
+        p_entry.grab_focus()
         rc = d.run()
-        pw = entry.get_text()
+        user = (u_entry.get_text() or "").strip() or auto_user
+        pw = p_entry.get_text()
         d.destroy()
         if rc != Gtk.ResponseType.OK:
             return False, user
         try:
             ok = _osp.verify_os_password(user, pw)
         except Exception as e:                          # noqa: BLE001
-            self._toast(f"OS password verification crashed: {e}")
             ok = False
+            err_msg = f"OS password verification crashed: {e}"
+        else:
+            err_msg = None
         finally:
             pw = "x" * len(pw)                          # scrub
             del pw
         if not ok:
-            self._toast(f"OS password rejected for {user}")
+            # Loud error dialog (toast was missable). Surface the
+            # username we tried so the operator can correct it.
+            msg = err_msg or (
+                f"OS password rejected for user '{user}'.\n\n"
+                "Common causes:\n"
+                "  • Wrong username — the wall auto-detected this one;\n"
+                "    override it in the field if your desktop user is\n"
+                "    different (e.g. 'kali', 'pi', or whatever you log\n"
+                "    in as).\n"
+                "  • Wrong password — the wall checks your LOCAL OS\n"
+                "    login password, NOT the wall PIN, vault master,\n"
+                "    or anything stored in Vaultwarden.\n"
+                "  • Account has no password (e.g. Kali root by default).\n"
+                "    Set one with: sudo passwd <user>, OR set\n"
+                "    SOC_OPERATOR_USER=<real-user> in /etc/soc-display/\n"
+                "    soc.env and restart the wall.")
+            err = Gtk.MessageDialog(transient_for=self, modal=True,
+                                     message_type=Gtk.MessageType.ERROR,
+                                     buttons=Gtk.ButtonsType.OK,
+                                     text="OS password rejected")
+            err.format_secondary_text(msg)
+            err.run(); err.destroy()
         return ok, user
 
     def _on_cred_edit(self, name: str):
