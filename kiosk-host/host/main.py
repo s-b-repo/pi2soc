@@ -903,6 +903,13 @@ class KioskHost:
             if can_restart:
                 for v in vpns_ch:
                     self._restart_vpn_async(v.get("name") or "")
+                # Make it visible in the GUI Apply message that the unit
+                # restart kicked off — the user shouldn't have to wonder
+                # whether the edit went live or queued.
+                applied = result.setdefault("applied_live", [])
+                applied.extend(
+                    f"forti-vpn@{v.get('name') or 'default'}"
+                    for v in vpns_ch)
             else:
                 for v in vpns_ch:
                     name = v.get("name") or ""
@@ -963,51 +970,100 @@ class KioskHost:
         return result
 
     def _can_systemctl_restart(self) -> bool:
-        """True iff this process can `systemctl restart` a unit. The wall runs
-        as user `soc` with NoNewPrivileges=yes, so the answer is almost always
-        False in production — but it can be True in dev (run as root) or once
-        a polkit rule for `org.freedesktop.systemd1.manage-units` is added."""
+        """True iff this process can `systemctl restart` the wall's
+        managed units WITHOUT a password prompt. Three paths:
+
+          1. euid 0 — running as root (dev), trivially yes.
+          2. `sudo -n systemctl status forti-vpn.service` exits 0 —
+             /etc/sudoers.d/soc-wall-restart was installed by install.sh
+             granting `soc` NOPASSWD systemctl on a minimal allowlist
+             (forti-vpn(@*), autossh-tunnel, soc-tarpit). This is the
+             production-recommended path — VPN edits apply LIVE.
+          3. Otherwise False — edits fall back to "PENDING" messages.
+
+        Cached after the first successful probe to keep the apply path
+        fast on every subsequent Save."""
         import os as _os
         if _os.geteuid() == 0:
             return True
-        # polkit rule path — pkexec without a TTY agent fails fast, which is
-        # the right signal (no rule installed). We DON'T actually run it here;
-        # we just check the system has the agent. Conservative: return False.
-        return False
+        cached = getattr(self, "_sudo_systemctl_ok", None)
+        if cached is not None:
+            return cached
+        import subprocess
+        ok = False
+        try:
+            r = subprocess.run(
+                ["sudo", "-n", "/usr/bin/systemctl", "status",
+                 "forti-vpn.service"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=4,
+            )
+            # systemctl status returns 0 (active), 3 (dead but loaded),
+            # 4 (no such unit) — any of those means we got past sudo's
+            # auth gate. sudo with no NOPASSWD rule returns 1 ("a
+            # password is required") without touching systemctl.
+            ok = r.returncode in (0, 3, 4)
+        except (OSError, subprocess.SubprocessError):
+            ok = False
+        self._sudo_systemctl_ok = ok
+        return ok
+
+    def _privileged_systemctl(self, *args) -> "tuple[bool, str]":
+        """Run `systemctl <args>` with the minimum privilege needed:
+        bare if we're root, `sudo -n` if we have NOPASSWD coverage,
+        else refuse (returning False) so the caller can surface a
+        clean PENDING message. Returns (ok, stderr-or-status)."""
+        import os as _os
+        import subprocess
+        cmd = ["/usr/bin/systemctl", *args] if _os.geteuid() == 0 \
+            else ["sudo", "-n", "/usr/bin/systemctl", *args]
+        if _os.geteuid() != 0 and not self._can_systemctl_restart():
+            return False, "no NOPASSWD sudo for systemctl"
+        try:
+            r = subprocess.run(cmd, timeout=15,
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True)
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"systemctl invocation failed: {e}"
+        if r.returncode == 0:
+            return True, (r.stdout or "ok").strip()
+        return False, (r.stderr or r.stdout or "").strip()
 
     def _restart_vpn_async(self, name: str = ""):
-        """A VPN-tab change — restart the VPN service so it re-reads the config
-        (off the GTK thread; best-effort, needs privilege). When `name` is
-        non-empty, restarts the templated instance forti-vpn@<name>; otherwise
-        the legacy single-VPN unit."""
+        """A VPN-tab change — restart the VPN service so it re-reads the
+        config (off the GTK thread). Uses the sudoers drop-in installed
+        by install.sh; falls back to a clear log line if it isn't
+        present so the operator knows the edit was saved + needs a
+        manual restart."""
         import threading
-        import subprocess
         unit = f"forti-vpn@{name}" if name else "forti-vpn"
 
         def work():
-            try:
-                subprocess.run(["systemctl", "restart", unit], timeout=10,
-                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
-                log(f"VPN config changed — restarted {unit}")
-            except Exception as e:  # noqa: BLE001
-                log(f"VPN restart not permitted from the wall ({e})")
+            ok, info = self._privileged_systemctl("restart", unit)
+            if ok:
+                log(f"VPN config changed — restarted {unit} live ✓")
+            else:
+                log(f"VPN restart needs sudo (run: sudo systemctl restart "
+                    f"{unit}); reason: {info}")
         threading.Thread(target=work, daemon=True).start()
 
     def _restart_tunnel_async(self):
         """A Tunnel-tab change — restart autossh-tunnel so the new jump host /
         identity / forwards come up. Same caveats as _restart_vpn_async."""
         import threading
-        import subprocess
 
         def work():
-            try:
-                subprocess.run(["systemctl", "restart", "autossh-tunnel"], timeout=10,
-                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
-                log("tunnel config changed — restarted autossh-tunnel")
-            except Exception as e:  # noqa: BLE001
-                log(f"tunnel restart not permitted from the wall ({e})")
+            ok, info = self._privileged_systemctl(
+                "restart", "autossh-tunnel.service")
+            if ok:
+                log("tunnel config changed — restarted autossh-tunnel live ✓")
+            else:
+                log("tunnel restart needs sudo (run: sudo systemctl restart "
+                    f"autossh-tunnel.service); reason: {info}")
         threading.Thread(target=work, daemon=True).start()
 
     def _push_config_to_vault(self) -> str:

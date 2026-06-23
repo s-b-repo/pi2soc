@@ -1140,18 +1140,52 @@ class ConfigWindow(Gtk.Window):
                         "for vault.open() errors.",
                         error=True, title="Vault unavailable")
             return
+        # `creds()` raises VaultError on "no such item" AND on
+        # transport errors. The user-facing difference is huge: a
+        # missing item is the OPERATOR's normal first-time path (they
+        # added a VPN, never saved its creds, now clicking Edit
+        # to set them) — that's a CREATE flow, not an error.
+        # A transport error is something to surface loudly.
+        item_missing = False
         try:
             creds = v_handle.creds(name) or {}
         except Exception as e:                           # noqa: BLE001
-            self._alert(f"Vault read failed for '{name}':\n\n{e}\n\n"
-                        "Common causes: the item was renamed / deleted "
-                        "directly in the web vault (rbw cache is stale — "
-                        "click 'Refresh from vault'), or the vault is "
-                        "locked (check `rbw unlocked`).",
-                        error=True, title="Vault read failed")
-            return
+            err_text = str(e).lower()
+            if ("not found" in err_text
+                    or "no vault item" in err_text
+                    or "no password" in err_text):
+                item_missing = True
+                creds = {}
+            else:
+                self._alert(f"Vault read failed for '{name}':\n\n{e}\n\n"
+                            "Common causes: the vault is locked (check "
+                            "`rbw unlocked`), Vaultwarden is unreachable "
+                            "(check `systemctl status vaultwarden`), or "
+                            "the rbw cache is stale (click 'Refresh from "
+                            "vault').",
+                            error=True, title="Vault read failed")
+                return
         current_user = creds.get("user", "") or ""
         current_pass = creds.get("pass", "") or ""
+        if item_missing:
+            # Promote the Edit modal into a Create modal — fields are
+            # empty, title makes the intent explicit, Save upserts
+            # (vaultseed.upsert_login creates on miss). One tap, no
+            # extra prompt — the operator already authed with their OS
+            # password, that's enough auth to create.
+            self.log_msg = (f"Vault item '{name}' does not exist yet — "
+                             "creating a new entry. Fill in the username "
+                             "and password, then Save.")
+            d_pre = Gtk.MessageDialog(transient_for=self, modal=True,
+                                       message_type=Gtk.MessageType.INFO,
+                                       buttons=Gtk.ButtonsType.OK,
+                                       text=f"Create vault item '{name}'?")
+            d_pre.format_secondary_text(
+                "This vault item doesn't exist yet — that's normal for a "
+                "first-time setup (a panel or VPN that hasn't had creds "
+                "saved). The next dialog lets you fill in the username + "
+                "password; Save will CREATE the item in Vaultwarden.")
+            d_pre.run(); d_pre.destroy()
 
         # Edit modal with prefilled values.
         d = Gtk.Dialog(transient_for=self, modal=True,

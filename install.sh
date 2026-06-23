@@ -630,6 +630,29 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
+# sudoers drop-in: lets the soc user restart ONLY the VPN/tunnel/tarpit
+# units without a password, so ⚙ Settings → Save applies VPN edits LIVE
+# (no "PENDING restart" message). visudo -c validates the file before we
+# move it into /etc/sudoers.d so a syntax error can NEVER break sudoers.
+log "Installing sudoers drop-in (soc -> systemctl restart forti-vpn/tunnel/tarpit)"
+SUDOERS_SRC="$SOC_ROOT/security/soc-wall-restart.sudoers"
+SUDOERS_TMP="/etc/sudoers.d/.soc-wall-restart.tmp"
+SUDOERS_DST="/etc/sudoers.d/soc-wall-restart"
+if command -v visudo >/dev/null 2>&1 && [ -f "$SUDOERS_SRC" ]; then
+  install -m 0440 -o root -g root "$SUDOERS_SRC" "$SUDOERS_TMP"
+  if visudo -cf "$SUDOERS_TMP" >/dev/null 2>&1; then
+    mv -f "$SUDOERS_TMP" "$SUDOERS_DST"
+    log "  sudoers OK -> $SUDOERS_DST"
+  else
+    warn "  visudo rejected $SUDOERS_SRC — NOT installing; VPN/tunnel"
+    warn "  edits will continue to surface PENDING restart messages."
+    rm -f "$SUDOERS_TMP"
+  fi
+else
+  warn "  visudo not found OR sudoers source missing — skipping drop-in"
+fi
+
+# --------------------------------------------------------------------------- #
 log "Configuring zram + sysctl"
 if [ "$HAS_SYSTEMD" = "1" ] && [ "${#PK_ZRAM[@]}" -gt 0 ]; then
   cp "$SOC_ROOT/security/zram.conf" /etc/systemd/zram-generator.conf
