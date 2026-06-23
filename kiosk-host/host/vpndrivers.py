@@ -174,7 +174,20 @@ class INodeDriver(Driver):
 
     def build_cmd(self, vpn, user):
         """svpn-connect.sh <gw:port> <user> [domain] [-- pin/insecure + extra].
-        The password is NOT here — the supervisor sets $H3C_SVPN_PASSWORD."""
+        The password is NOT here — the supervisor sets $H3C_SVPN_PASSWORD.
+
+        NB: cfg.inode_extra_args ALREADY prepends the `--` separator
+        when there's anything in the tail (cert pin / --insecure /
+        extra_args), so build_cmd just concatenates. Hand-checked
+        against svpn-connect.sh's argv parser:
+            GW USER [DOMAIN] [-- EXTRA...]
+        With NO domain + a pin, cmd is [script, gw, user, "--",
+        "--pin-sha256", "AA:BB"] — svpn-connect.sh sees "$1=='--'",
+        skips the DOMAIN assignment, shifts past the "--", and
+        EXTRA=("--pin-sha256", "AA:BB") goes to h3csvpn intact.
+        With a domain, [script, gw, user, "abc", "--", "--pin-sha256",
+        "AA"] — DOMAIN="abc", shift, "$1=='--'", shift, EXTRA correct.
+        """
         cmd = [cfg.inode_script(vpn), cfg.inode_gateway(vpn), user]
         domain = str(vpn.get("domain", "") or "").strip()
         if domain:

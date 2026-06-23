@@ -154,12 +154,56 @@ def _safe_extra_args(v) -> list:
 
 
 def _host_port(host: str, port: int) -> str:
-    """Format 'host:port', bracketing a bare IPv6 literal per RFC 3986 so a value
-    like 'fd00::1' becomes '[fd00::1]:443' instead of an ambiguous/malformed
-    'fd00::1:443'. Already-bracketed hosts are left as-is."""
-    if ":" in host and not host.startswith("["):
+    """Format 'host:port', bracketing a bare IPv6 literal per RFC 3986 so a
+    value like 'fd00::1' becomes '[fd00::1]:443' instead of an ambiguous/
+    malformed 'fd00::1:443'. Already-bracketed hosts are left as-is.
+
+    Detects IPv6 by **>= 2 colons** (every IPv6 literal has at least two:
+    the abbreviated `::` form OR the full `aaaa:bbbb:cccc:...` form). A
+    single colon means `hostname:port` which we deliberately do NOT
+    bracket — bracketing a v4 / hostname value with a colon-and-port
+    would produce a doubled `[host:port]:port` (the original bug that
+    silently corrupted iNode gateways when an operator put the port into
+    `vpn.gateway` instead of a separate `vpn.port`)."""
+    if host.startswith("["):
+        return f"{host}:{port}"
+    if host.count(":") >= 2:
         return f"[{host}]:{port}"
     return f"{host}:{port}"
+
+
+def _split_host_port(value: str, default_port: int):
+    """Operator-friendly: accept any of these and return (host, port):
+       'gw.example'             → ('gw.example', default_port)
+       'gw.example:443'         → ('gw.example', 443)
+       'fd00::1'                → ('fd00::1', default_port)        # IPv6
+       '[fd00::1]:443'          → ('fd00::1', 443)
+       'fd00::1:443'            → ('fd00::1:443', default_port)    # ambiguous → assume IPv6
+    Raises ValueError for malformed input. Lets `vpn.gateway` accept a
+    port inline (the common shape `host:port`) without producing the
+    doubled-port that `_host_port` used to silently emit. `default_port`
+    is what `vpn.port` says (or 443)."""
+    s = str(value or "").strip()
+    if not s:
+        raise ValueError("host is empty")
+    if s.startswith("["):
+        # [ipv6]  or  [ipv6]:port
+        if "]:" in s:
+            host_part, _, port_part = s.rpartition(":")
+            host_part = host_part.lstrip("[").rstrip("]")
+        elif s.endswith("]"):
+            host_part, port_part = s.strip("[]"), ""
+        else:
+            raise ValueError(f"malformed bracketed host {s!r}")
+    elif s.count(":") == 1:
+        # 'host:port' — single colon, never IPv6
+        host_part, _, port_part = s.partition(":")
+    else:
+        # bare IPv6 (>= 2 colons) or bare hostname/v4 (0 colons)
+        host_part, port_part = s, ""
+    if port_part:
+        return host_part, _safe_port(port_part, "embedded port")
+    return host_part, _safe_port(default_port, "default port")
 
 
 VALID_LAYOUTS = {"auto", "windows", "single"}
@@ -372,8 +416,13 @@ def openfortivpn_args(vpn: dict) -> list:
     gateway = vpn.get("gateway")
     if not gateway:
         return []
-    host = _safe_host(gateway, "vpn.gateway")
-    port = _safe_port(vpn.get("port", 443), "vpn.port")
+    # Accept gateway as 'host', 'host:port', '[ipv6]', '[ipv6]:port',
+    # or bare 'ipv6' — same forgiveness as inode_gateway. Without this
+    # split, vpn.gateway='gw.example:443' produced '[gw.example:443]:443'
+    # (silent corruption from the embedded colon being treated as IPv6).
+    default_port = vpn.get("port", 443) or 443
+    host_part, port = _split_host_port(gateway, default_port)
+    host = _safe_host(host_part, "vpn.gateway")
     args = [_host_port(host, port)]
     if vpn.get("trusted_cert"):
         args.append(f"--trusted-cert={vpn['trusted_cert']}")
@@ -425,14 +474,27 @@ def wireguard_target(vpn: dict) -> str:
 
 
 def inode_gateway(vpn: dict) -> str:
-    """'host:port' for the H3C iNode SSL-VPN gateway (default port 443). '' when
-    no gateway is configured."""
+    """'host:port' for the H3C iNode SSL-VPN gateway (default port 443).
+    '' when no gateway is configured.
+
+    Accepts the gateway in either of the operator-natural shapes:
+      * vpn.gateway='gw.example', vpn.port=443  (canonical)
+      * vpn.gateway='gw.example:443'            (port inline)
+      * vpn.gateway='[fd00::1]:3000'            (bracketed IPv6 + port)
+      * vpn.gateway='fd00::1', vpn.port=443     (bare IPv6 + port)
+
+    Before today this function called _safe_host on the raw value and
+    then _host_port to add port — which for 'gw.example:443' produced
+    '[gw.example:443]:443' (the embedded colon was mistaken for IPv6,
+    the default port got appended, and svpn-connect.sh promptly failed
+    to resolve the doubled gateway)."""
     vpn = vpn or {}
     raw = str(vpn.get("gateway", "") or "").strip()
     if not raw:
         return ""
-    host = _safe_host(raw, "vpn.gateway")
-    port = _safe_port(vpn.get("port", 443) or 443, "vpn.port")
+    default_port = vpn.get("port", 443) or 443
+    host_part, port = _split_host_port(raw, default_port)
+    host = _safe_host(host_part, "vpn.gateway")
     return _host_port(host, port)
 
 
