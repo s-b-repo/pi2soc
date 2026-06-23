@@ -8,6 +8,10 @@
 # packages is a separate one-time step:  sudo python3 setup.py
 #
 #   ./launch.sh                 # run the wall (first run configures it once)
+#   ./launch.sh --skip-setup    # run the wall without ever opening the setup
+#                               # page — marks the install as configured (wall
+#                               # shows 'click to configure' tiles for any
+#                               # blank panel; vault/sealed master must exist)
 #   ./launch.sh --setup         # run the first-time setup page now, then exit
 #   ./launch.sh --reconfigure   # re-run the setup page, then run
 #   ./launch.sh --repair        # diagnose + fix this install (setup.py doctor/repair)
@@ -25,11 +29,13 @@ warn(){ printf '\033[33m!!\033[0m %s\n' "$*"; }
 usage(){ sed -n '4,17p' "$0" | sed 's/^# \{0,1\}//'; }
 
 MODE="run"
+SKIP_SETUP=0
 for a in "$@"; do
   case "$a" in
     --setup)        MODE="setup" ;;
     --reconfigure)  MODE="reconfigure" ;;
     --repair)       MODE="repair" ;;
+    --skip-setup)   SKIP_SETUP=1 ;;
     -h|--help)      usage; exit 0 ;;
     *) echo "unknown option: $a (try --help)" >&2; exit 2 ;;
   esac
@@ -88,9 +94,23 @@ fi
 
 # ---- run: configure once if needed, then hand off to the boot session ------
 if [ ! -e "$MARKER" ]; then
-  require_root
-  log "First run on this host — opening the setup page"
-  "$PY" setup.py firstboot
+  if [ "$SKIP_SETUP" = "1" ]; then
+    # Operator chose to launch without ever opening the wizard. Mark the
+    # install configured + warn loudly: the wall WILL come up, but any
+    # unconfigured panel shows the 'click to configure' card until the
+    # operator pins it via the ⚙ Settings window at the glass. The vault
+    # + sealed master MUST already exist (no fresh-install bootstrap
+    # here — for that, run `sudo python3 setup.py` once).
+    require_root
+    install -m 0644 /dev/null "$MARKER"
+    warn "--skip-setup: marked $MARKER without running the wizard."
+    warn "  Unconfigured panels will show 'click to configure' tiles."
+    warn "  Use ⚙ Settings at the glass to set URLs + vault items."
+  else
+    require_root
+    log "First run on this host — opening the setup page"
+    "$PY" setup.py firstboot
+  fi
 fi
 
 if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
