@@ -137,8 +137,17 @@ All green on an x86 Xvfb host (2026-06-23):
 - `make verify-proxy` — authenticated proxy for both WebKit and Chromium, loopback bypass: **VERIFY-PROXY OK**
 - `make verify-single` — Wayland/single-window layout, all panels login: **VERIFY-SINGLE OK**
 
+**Live Fortinet backend validation (2026-06-23):** the openfortivpn path was tested against a
+real FortiGate (`…:10443`). Both the raw invocation and the **project code path**
+(`config.openfortivpn_args` + `FortinetDriver.build_cmd` + `forti-pinentry.sh`, password via
+`$SOC_VPN_PASSWORD`, never on argv) authenticated and reached *"Tunnel is up and running"*
+(`ppp0` UP, VPN address allocated); `--trusted-cert` pinning matched; clean teardown left no
+routes/DNS/interfaces (`--set-routes=0 --set-dns=0`). The log classifier matched the real
+gateway output. **openfortivpn backend: validated live.**
+
 Still recommended on the **target Pi** before cutover (hardware-specific): re-run the four
-`verify*` suites on-device, plus the §4 deferred items (real VPN backends, on-device RSS reclaim).
+`verify*` suites on-device, plus the remaining §4 items (openvpn/wireguard/iNode backends on
+real gateways, on-device RSS reclaim).
 
 ## 6. Recommended pre-deployment checklist
 
