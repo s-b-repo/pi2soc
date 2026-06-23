@@ -125,10 +125,20 @@ Pi + live VPN backends to validate safely. Each is low residual risk and documen
 
 ## 5. Verification status
 
+All green on an x86 Xvfb host (2026-06-23):
+
 - `make lint` — shell + python syntax: **pass**
-- Unit suite (`cd kiosk-host && pytest tests/ -q`): **186 passed**
-- Not run here (need a display/hardware): `make verify`, `verify-single`, `verify-proxy`,
-  `verify-vpn`. **Run these on a Pi (or Xvfb host) before cutover.**
+- Unit suite (`cd kiosk-host && pytest tests/ -q`): **186 passed** (was 136; +50 regression tests)
+- `make verify` — 4-panel grid, auto-login on all panels, **origin gate does not break login**,
+  Chromium CDP path, tunnel readiness gate, screenshot: **VERIFY OK**
+- `make verify-vpn` — all 4 backends (fortinet/openvpn/wireguard/inode), 14 checks incl.
+  *"openvpn creds over mgmt socket (not argv)"* and *"wireguard transient config cleaned up"*
+  (directly exercising the CR/LF-sanitize and `try/finally` cleanup fixes): **VERIFY-VPN OK**
+- `make verify-proxy` — authenticated proxy for both WebKit and Chromium, loopback bypass: **VERIFY-PROXY OK**
+- `make verify-single` — Wayland/single-window layout, all panels login: **VERIFY-SINGLE OK**
+
+Still recommended on the **target Pi** before cutover (hardware-specific): re-run the four
+`verify*` suites on-device, plus the §4 deferred items (real VPN backends, on-device RSS reclaim).
 
 ## 6. Recommended pre-deployment checklist
 
