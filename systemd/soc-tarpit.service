@@ -52,6 +52,10 @@ UMask=0077
 MemoryHigh=64M
 MemoryMax=128M
 TasksMax=128
+# Cap the file-descriptor budget. With CONC_MAX=64 + keep-alive disabled,
+# 4096 fds is wildly generous; it just keeps a half-open-socket flood from
+# eating the box's global fd pool.
+LimitNOFILE=4096
 
 [Install]
 WantedBy=multi-user.target
