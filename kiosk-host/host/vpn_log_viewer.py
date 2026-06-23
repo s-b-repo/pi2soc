@@ -43,13 +43,24 @@ _MAX_LINES = 5_000          # ring-buffer cap per tab; older trimmed first
 
 
 def _have_nopasswd_journalctl() -> bool:
-    """Cheap probe: can we run `sudo -n journalctl` without a prompt?
-    Used at window-build time so the fallback path can warn the
-    operator (instead of the subprocess silently hanging on a sudo
-    prompt that has no TTY)."""
+    """Cheap probe: can we run `sudo -n journalctl -u <unit>` without
+    a prompt? Used at window-build time so the fallback path can warn
+    the operator (instead of the subprocess silently hanging on a
+    sudo prompt that has no TTY).
+
+    Important: the sudoers drop-in allows a SPECIFIC command shape —
+    `journalctl -u <unit> *`, NOT bare `journalctl --version`. The
+    probe must use a command that matches the same shape we'll run
+    for real, otherwise the warning fires even when journalctl is
+    perfectly fine."""
     try:
         r = subprocess.run(
-            ["sudo", "-n", "/usr/bin/journalctl", "--version"],
+            # `-n 0 --no-pager -u soc-vpn.service` matches the sudoers
+            # pattern `journalctl -u soc-vpn.service *`. Returns 0 even
+            # when there are no journal entries (the unit may never
+            # have run on this box).
+            ["sudo", "-n", "/usr/bin/journalctl", "-u", "soc-vpn.service",
+             "-n", "0", "--no-pager"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

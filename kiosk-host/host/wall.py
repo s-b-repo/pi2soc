@@ -38,12 +38,17 @@ def _delete_event_action(on_hide_to_tray):
 
 class WallWindow:
     def __init__(self, conf, log, on_destroy=None, on_config=None, on_vpn=None,
-                 on_lock=None, on_hide_to_tray=None):
+                 on_lock=None, on_hide_to_tray=None, on_show_vpn_log=None):
         self.conf = conf
         self.log = log
         self.on_config = on_config        # callable() -> open the config window
         self.on_vpn = on_vpn              # callable(name) -> reconnect VPN named
         self.on_lock = on_lock            # callable() -> show kiosk-lock overlay
+        # callable() -> open the live VPN log viewer WITHOUT triggering a
+        # reconnect (a VPN pill click still does both via on_vpn → vpn_action).
+        # Operator's ask: the log button should be next to Lock and NOT the
+        # same as the VPN reconnect button.
+        self.on_show_vpn_log = on_show_vpn_log
         # If on_hide_to_tray is set (i.e. main constructed a tray icon), the
         # close button hides instead of destroys. Without it, close behaves as
         # before — the destroy handler fires and the host shuts down.
@@ -109,6 +114,21 @@ class WallWindow:
                                   "(Ctrl+Alt+L). Panels stay visible.")
             lock.connect("clicked", lambda *_: self.on_lock and self.on_lock())
             toolbar.pack_end(lock, False, False, 0)
+        if on_show_vpn_log is not None:
+            # Dedicated 'show the VPN log' button — distinct from the VPN
+            # pill (which RECONNECTS), this just opens the live log viewer
+            # so the operator can observe without forcing a restart.
+            # Pack_end so it sits to the LEFT of the lock button.
+            vlog = Gtk.Button(label="📜 VPN log")
+            vlog.get_style_context().add_class("soc-toolbar-action")
+            vlog.set_tooltip_text("Open the live VPN log viewer — one tab "
+                                  "per VPN streaming `journalctl -u "
+                                  "soc-vpn[@<name>]`. Does NOT reconnect "
+                                  "the VPN (use the pill for that).")
+            vlog.connect("clicked",
+                          lambda *_: self.on_show_vpn_log
+                                     and self.on_show_vpn_log())
+            toolbar.pack_end(vlog, False, False, 0)
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         vbox.pack_start(toolbar, False, False, 0)

@@ -334,6 +334,7 @@ class KioskHost:
                 on_config=config_cb,
                 on_vpn=self.vpn_action,
                 on_lock=self._lock_wall,
+                on_show_vpn_log=self.open_vpn_log_viewer,
                 on_hide_to_tray=(self._hide_to_tray
                                  if self._tray is not None else None),
             )
@@ -515,15 +516,13 @@ class KioskHost:
 
     def vpn_action(self, name: str = ""):
         """Pill click: show 'checking', best-effort reconnect the named VPN's
-        service, then re-poll. With `name` empty (legacy), restarts the first.
-        ALSO auto-opens the live VPN log viewer focused on this VPN — that
-        way 'click pill to reconnect' is also 'click pill to see what
-        happens' (the user's ask: 'when iNode reconnect it should open
-        up a small box printing every step and error for all VPNs')."""
-        try:
-            self.open_vpn_log_viewer(focus_name=name)
-        except Exception as e:                          # noqa: BLE001
-            log(f"could not open VPN log viewer: {e}")
+        service, then re-poll. With `name` empty (legacy), restarts the
+        first VPN.
+
+        The pill no longer auto-opens the log viewer (operator asked for
+        that to be a separate, dedicated 📜 button in the toolbar next
+        to Lock so the pill stays "reconnect-only"). To watch the
+        reconnect, hit 📜 first, then click the pill."""
         target_unit = f"soc-vpn@{name}" if name else "soc-vpn"
         if self.wall is not None:
             self.wall.set_vpn_status("checking", f"{name or 'VPN'}: checking…",
@@ -1439,4 +1438,12 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Ctrl+C during boot (or any point before/after Gtk.main) should exit
+    # cleanly (rc 0) so the launcher loop respawns without printing a
+    # noisy KeyboardInterrupt traceback. Inside Gtk.main, SIGINT is
+    # handled by the GLibUnix.signal_add hook + host.shutdown.
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("\n[soc-kiosk] interrupted (Ctrl+C); exiting cleanly\n")
+        sys.exit(0)
