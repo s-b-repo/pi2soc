@@ -25,7 +25,15 @@
     // socLogin refuses to fill credentials on any other origin, so an open
     // redirect / compromised dashboard can't autofill SOC creds into an
     // attacker page. Empty string = unset = legacy behaviour (no gate).
-    allowedOrigin: "{{ALLOWED_ORIGIN}}"
+    allowedOrigin: "{{ALLOWED_ORIGIN}}",
+    // Click-zone fallback for auto-login (Phase 8). Operator runs the
+    // ⚙ Settings → "Calibrate login zones" tool against a panel that
+    // has unusual selectors; the wall stores relative ratios so a resize
+    // keeps the zones accurate. Schema:
+    //   { user?: {x_pct, y_pct},
+    //     pass?: {x_pct, y_pct},
+    //     submit?: {x_pct, y_pct} }   (each ratio in 0.0..1.0)
+    loginZones: {{LOGIN_ZONES_JSON}}
   };
 
   window.__SOC = { installed: true, cfg: CFG, needLogin: false,
@@ -108,8 +116,27 @@
     // Loose fallback: type=password OR a name/id that contains "pass". Picks
     // up forms that style a "PIN" field as type=password etc. — same heuristic
     // the text-pattern login detector above uses.
-    return document.querySelector(
+    var p2 = document.querySelector(
       'input[type="password"], input[name*="pass" i], input[id*="pass" i]');
+    if (p2) return p2;
+    // Final fallback: click-zone (Phase 8). If the operator calibrated the
+    // panel, document.elementFromPoint at the recorded ratio gets us back
+    // to the right input even when the page has no obvious markers.
+    return zoneInput("pass");
+  }
+
+  // Locate an input via the calibrated click zone. Returns null when no
+  // zone is set or the element-at-point isn't an <input> (closest('input')
+  // climbs once in case the operator clicked a label/wrapper).
+  function zoneInput(which) {
+    var z = CFG.loginZones && CFG.loginZones[which];
+    if (!z || typeof z.x_pct !== "number" || typeof z.y_pct !== "number") return null;
+    var vw = window.innerWidth, vh = window.innerHeight;
+    var el = document.elementFromPoint(z.x_pct * vw, z.y_pct * vh);
+    if (!el) return null;
+    if (el.tagName === "INPUT") return el;
+    if (el.closest) return el.closest('input');
+    return null;
   }
 
   function userField(p) {
@@ -125,7 +152,8 @@
         return c;                                        // sits before the pass field
       if (!best) best = c;
     }
-    return best;
+    if (best) return best;
+    return zoneInput("user");                            // Phase 8 fallback
   }
 
   // Called by the host with real creds. Returns true if it submitted.
@@ -153,6 +181,17 @@
       var btn = CFG.submitSel ? document.querySelector(CFG.submitSel) : null;
       if (!btn && p.form)
         btn = p.form.querySelector('button[type="submit"],input[type="submit"],button');
+      if (!btn) {
+        // Phase 8 fallback: a calibrated submit zone. elementFromPoint may
+        // land on the button itself or a wrapper; climb once just in case.
+        var z = CFG.loginZones && CFG.loginZones.submit;
+        if (z && typeof z.x_pct === "number" && typeof z.y_pct === "number") {
+          var sel = document.elementFromPoint(
+            z.x_pct * window.innerWidth, z.y_pct * window.innerHeight);
+          if (sel) btn = sel.closest ? (sel.closest('button,input[type="submit"]') || sel)
+                                      : sel;
+        }
+      }
       if (btn) { btn.click(); }
       else if (p.form && p.form.requestSubmit) { p.form.requestSubmit(); }
       else if (p.form) { p.form.submit(); }

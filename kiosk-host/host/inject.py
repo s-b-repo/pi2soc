@@ -36,15 +36,29 @@ def bootstrap_js(panel, mode: str) -> str:
     if panel.keepalive.target:
         ka["target"] = panel.keepalive.target
 
+    # Phase 8: serialise login_zones. We pass only valid keys (user/pass/
+    # submit) with numeric ratios so a hand-edited config can't smuggle
+    # extra JS into the template. An empty dict serialises as {} → JS
+    # `null` check in zoneInput() returns null cleanly.
+    zones = {}
+    for k in ("user", "pass", "submit"):
+        z = (getattr(panel, "login_zones", None) or {}).get(k)
+        if isinstance(z, dict):
+            x = z.get("x_pct"); y = z.get("y_pct")
+            if isinstance(x, (int, float)) and isinstance(y, (int, float)) \
+                    and 0.0 <= float(x) <= 1.0 and 0.0 <= float(y) <= 1.0:
+                zones[k] = {"x_pct": float(x), "y_pct": float(y)}
+
     # token (including surrounding quotes where present) -> replacement literal
     repl = {
-        '"{{PANEL_ID}}"':     json.dumps(panel.id),
-        '"{{MODE}}"':         json.dumps(mode),
-        '"{{USER_SEL}}"':     json.dumps(sel.get("user", "")),
-        '"{{PASS_SEL}}"':     json.dumps(sel.get("pass", "")),
-        '"{{SUBMIT_SEL}}"':   json.dumps(sel.get("submit", "")),
-        '"{{LOGIN_MARKER}}"': json.dumps(panel.login_marker),
-        "{{KEEPALIVE_JSON}}": json.dumps(ka),
+        '"{{PANEL_ID}}"':       json.dumps(panel.id),
+        '"{{MODE}}"':           json.dumps(mode),
+        '"{{USER_SEL}}"':       json.dumps(sel.get("user", "")),
+        '"{{PASS_SEL}}"':       json.dumps(sel.get("pass", "")),
+        '"{{SUBMIT_SEL}}"':     json.dumps(sel.get("submit", "")),
+        '"{{LOGIN_MARKER}}"':   json.dumps(panel.login_marker),
+        "{{KEEPALIVE_JSON}}":   json.dumps(ka),
+        "{{LOGIN_ZONES_JSON}}": json.dumps(zones),
     }
     js = _template()
     for token, value in repl.items():

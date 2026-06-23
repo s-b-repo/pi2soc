@@ -171,10 +171,12 @@ VALID_VPN_TYPES = {"fortinet", "openvpn", "wireguard", "inode"}
 _TOP_KEYS = {"display", "panels", "tunnel", "vpn", "vpns", "proxy"}
 _DISPLAY_KEYS = {"auto", "width", "height", "cols", "rows", "gap", "layout",
                  "fullscreen"}
+_LOGIN_ZONE_KEYS = {"x_pct", "y_pct"}
+_LOGIN_ZONES_KEYS = {"user", "pass", "submit"}
 _PANEL_KEYS = {"id", "engine", "grid", "mode", "url", "tunnel", "path", "scheme",
                "vault_item", "selectors", "login_marker", "keepalive", "proxy",
                "title", "allow_insecure", "allow_media",
-               "relogin_url", "blocked_url_patterns"}
+               "relogin_url", "blocked_url_patterns", "login_zones"}
 _PROXY_KEYS = {"enabled", "url", "vault_item", "ignore_hosts"}
 _TUNNEL_PANEL_KEYS = {"local_port", "remote_host", "remote_port"}
 _KEEPALIVE_KEYS = {"strategy", "intervalSec", "url", "target"}
@@ -234,6 +236,15 @@ class Panel:
     # `*/account/settings*`, `*change-password*`). Enforced by the WebKit
     # decide-policy hook and the Chromium Fetch.requestPaused interceptor.
     blocked_url_patterns: list = field(default_factory=list)
+    # Optional click-zone fallback for auto-login (Phase 8). When the CSS
+    # selectors AND the text-pattern heuristic both fail to find the
+    # user / pass / submit elements, the injected JS falls back to
+    # document.elementFromPoint(x_pct * vw, y_pct * vh) at each of these
+    # ratios. Captured by the on-screen Calibrate mode; ratios are
+    # resolution-independent so a wall resize doesn't break them.
+    # Schema: dict with optional "user", "pass", "submit" keys, each a
+    # {"x_pct": 0.0..1.0, "y_pct": 0.0..1.0} dict.
+    login_zones: dict = field(default_factory=dict)
     geometry: Optional[Geometry] = None
 
     @property
@@ -615,6 +626,32 @@ def _validate_panel(i: int, p: dict, disp: DisplayCfg, errs: list, warns: list):
             errs.append(f"{where}: blocked_url_patterns must be a list of "
                         f"fnmatch-style strings (e.g. '*account/settings*')")
 
+    lz = p.get("login_zones")
+    if lz is not None:
+        if not isinstance(lz, dict):
+            errs.append(f"{where}: login_zones must be a dict with optional "
+                        f"'user', 'pass', 'submit' entries")
+        else:
+            extra = set(lz) - _LOGIN_ZONES_KEYS
+            if extra:
+                errs.append(f"{where}: unknown login_zones key(s) "
+                            f"{sorted(extra)}; valid: {sorted(_LOGIN_ZONES_KEYS)}")
+            for k, z in lz.items():
+                if not isinstance(z, dict):
+                    errs.append(f"{where}: login_zones.{k} must be a dict "
+                                f"with x_pct + y_pct, got {z!r}")
+                    continue
+                missing = _LOGIN_ZONE_KEYS - set(z)
+                if missing:
+                    errs.append(f"{where}: login_zones.{k} missing "
+                                f"{sorted(missing)}")
+                    continue
+                for axis in ("x_pct", "y_pct"):
+                    v = z[axis]
+                    if not isinstance(v, (int, float)) or not 0.0 <= float(v) <= 1.0:
+                        errs.append(f"{where}: login_zones.{k}.{axis} must be "
+                                    f"a 0.0..1.0 ratio, got {v!r}")
+
     # Auto-login is optional: a panel with a vault_item logs itself in (and then
     # needs selectors); a panel without one is display-only (the page just shows,
     # an operator logs in once if needed). This makes the wall usable as a pure
@@ -952,6 +989,7 @@ def _parse(raw, path: str) -> Config:
             allow_media=bool(p.get("allow_media", False)),
             relogin_url=(p.get("relogin_url") or None),
             blocked_url_patterns=list(p.get("blocked_url_patterns") or []),
+            login_zones=dict(p.get("login_zones") or {}),
         )
         panel.geometry = compute_geometry(disp, panel.grid)
         panels.append(panel)
@@ -1019,6 +1057,8 @@ def to_yaml(conf: "Config") -> str:
             pd["relogin_url"] = p.relogin_url
         if getattr(p, "blocked_url_patterns", None):
             pd["blocked_url_patterns"] = list(p.blocked_url_patterns)
+        if getattr(p, "login_zones", None):
+            pd["login_zones"] = {k: dict(v) for k, v in p.login_zones.items()}
         out["panels"].append(pd)
     if conf.tunnel:
         out["tunnel"] = conf.tunnel
