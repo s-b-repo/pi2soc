@@ -784,7 +784,10 @@ class ConfigWindow(Gtk.Window):
         Updates the status label when the operator finishes."""
         action = self._actions.get("calibrate_panel")
         if action is None:
-            self._toast("calibrate is unavailable in this session")
+            self._alert("Calibrate is unavailable in this session — the "
+                        "wall wasn't launched with a calibrate-capable "
+                        "host (the action wasn't wired by main.py).",
+                        error=True, title="Calibrate unavailable")
             return
         # Update the in-memory Panel + the status label once the host
         # writes the override; the operator sees confirmation immediately.
@@ -807,7 +810,8 @@ class ConfigWindow(Gtk.Window):
         try:
             action(panel_id, _on_done)
         except Exception as e:                            # noqa: BLE001
-            self._toast(f"calibrate failed: {e}")
+            self._alert(f"Calibrate failed to start for '{panel_id}':\n\n{e}",
+                        error=True, title="Calibrate failed")
 
     def _on_clear_login_zones(self, panel_id: str, status_lbl):
         """Drop the panel's saved zones from the override file and the
@@ -1130,12 +1134,21 @@ class ConfigWindow(Gtk.Window):
         # Now read the current user+pass from vault.
         v_handle = getattr(self, "_vault", None)
         if v_handle is None or not hasattr(v_handle, "creds"):
-            self._toast(f"vault handle missing — cannot edit '{name}'")
+            self._alert(f"Cannot edit '{name}': no vault handle attached to "
+                        "this Settings window. The wall must be launched "
+                        "with a vault for Edit to work; check the journal "
+                        "for vault.open() errors.",
+                        error=True, title="Vault unavailable")
             return
         try:
             creds = v_handle.creds(name) or {}
         except Exception as e:                           # noqa: BLE001
-            self._toast(f"vault read failed for '{name}': {e}")
+            self._alert(f"Vault read failed for '{name}':\n\n{e}\n\n"
+                        "Common causes: the item was renamed / deleted "
+                        "directly in the web vault (rbw cache is stale — "
+                        "click 'Refresh from vault'), or the vault is "
+                        "locked (check `rbw unlocked`).",
+                        error=True, title="Vault read failed")
             return
         current_user = creds.get("user", "") or ""
         current_pass = creds.get("pass", "") or ""
@@ -1153,10 +1166,12 @@ class ConfigWindow(Gtk.Window):
         u_e = Gtk.Entry()
         u_e.set_text(current_user)
         u_e.set_placeholder_text("username")
+        u_e.set_activates_default(True)        # Enter → Save
         p_e = Gtk.Entry()
         p_e.set_text(current_pass)
         p_e.set_visibility(False)
         p_e.set_placeholder_text("password")
+        p_e.set_activates_default(True)        # Enter → Save
         show_pass = Gtk.CheckButton(label="show password")
         show_pass.connect("toggled",
                            lambda b: p_e.set_visibility(b.get_active()))
@@ -1168,6 +1183,9 @@ class ConfigWindow(Gtk.Window):
             body.pack_start(w, False, False, 0)
         body.pack_start(show_pass, False, False, 0)
         d.show_all()
+        # Focus the password (assume the username is correct from the
+        # pre-fill — operator usually edits the password).
+        p_e.grab_focus()
         rc = d.run()
         new_user = u_e.get_text().strip()
         new_pass = p_e.get_text()
@@ -1179,18 +1197,15 @@ class ConfigWindow(Gtk.Window):
             new_pass = "x" * len(new_pass); del new_pass
             return
         if not new_user and not new_pass:
-            self._toast("nothing changed — empty user + password")
+            self._alert("Both username AND password are empty — nothing to "
+                        "save. Cancel the Edit dialog if you didn't mean "
+                        "to change anything, otherwise type the new values.",
+                        title="Nothing to save")
             return
-        # Reuse the same vaultseed.upsert_login path the Save grid uses.
-        # The master password comes from the host-bound seal (or, fallback,
-        # the manual entry in this tab).
-        self._save_cred(name,
-                         _e=type("_E", (), {"get_text": lambda _s: new_user})(),
-                         pass_e=type("_E", (), {"get_text": lambda _s: new_pass,
-                                                  "set_text": lambda *_a: None})(),
-                         uri=None) if False else None
-        # Direct call — _save_cred has the wrong signature for a dialog
-        # flow; do the upsert inline so we control the toast messages.
+        # Hand off to vaultseed.upsert_login (threaded so the GUI stays
+        # responsive). _do_vault_upsert raises a loud MessageDialog on
+        # completion — success OR failure — so the operator sees feedback
+        # even when the apply_msg label isn't on screen.
         self._do_vault_upsert(name, new_user, new_pass)
         new_pass = "x" * len(new_pass); del new_pass
 
@@ -1207,8 +1222,19 @@ class ConfigWindow(Gtk.Window):
             master = ""
         if not master and getattr(self, "_cred_master", None):
             master = self._cred_master.get_text()
-        if not (email and master):
-            self._toast(f"vault credentials needed for edit ({name})")
+        if not email:
+            self._alert("SOC_VAULT_EMAIL is empty in /etc/soc-display/soc.env "
+                        "— cannot write to Vaultwarden. Set it via `sudo "
+                        "python3 setup.py wizard` then restart the wall.",
+                        error=True, title="Vault email missing")
+            return
+        if not master:
+            self._alert("No vault master password available for the Edit.\n\n"
+                        "Either the wall isn't sealed (run `sudo python3 "
+                        "setup.py first-run` to seal the master host-bound), "
+                        "or the Credentials tab's master-password field is "
+                        "empty — type it there first, then retry Edit.",
+                        error=True, title="Vault master missing")
             return
         import threading
         from . import vaultseed
@@ -1218,13 +1244,31 @@ class ConfigWindow(Gtk.Window):
                 rc = vaultseed.upsert_login(url, email, master, name, user,
                                               password)
                 msg = f"edited '{name}' in Vaultwarden ✓ ({rc})"
+                err = False
             except Exception as e:                       # noqa: BLE001
                 msg = f"edit failed for '{name}': {e}"
-            GLib.idle_add(self._post_edit_done, msg)
+                err = True
+            GLib.idle_add(self._post_edit_done, msg, err)
         threading.Thread(target=work, daemon=True).start()
 
-    def _post_edit_done(self, msg: str):
-        self._toast(msg)
+    def _post_edit_done(self, msg: str, err: bool = False):
+        # Loud MessageDialog so the operator can't miss the result. The
+        # old toast was only visible in the apply_msg label at the bottom
+        # of the Panels tab — invisible from the Credentials tab where
+        # Edit lives.
+        self._toast(msg)                               # keep the toast too
+        try:
+            mt = (Gtk.MessageType.ERROR if err
+                  else Gtk.MessageType.INFO)
+            d = Gtk.MessageDialog(transient_for=self, modal=True,
+                                   message_type=mt,
+                                   buttons=Gtk.ButtonsType.OK,
+                                   text=("Vault edit failed" if err
+                                         else "Vault edit succeeded"))
+            d.format_secondary_text(msg)
+            d.run(); d.destroy()
+        except Exception:                              # noqa: BLE001
+            pass
         self._refresh_cred_inventory()
         return False
 
@@ -1246,14 +1290,26 @@ class ConfigWindow(Gtk.Window):
             return
         v_handle = getattr(self, "_vault", None)
         if v_handle is None or not hasattr(v_handle, "delete"):
-            self._toast(f"vault handle missing — cannot delete '{name}'")
+            self._alert(f"Cannot delete '{name}': no vault handle attached "
+                        "to this Settings window. The wall must be launched "
+                        "with a vault for Delete to work.",
+                        error=True, title="Vault unavailable")
             return
         ok = v_handle.delete(name)
         if ok:
-            self._toast(f"deleted '{name}' ✓")
+            self._alert(f"Vault item '{name}' deleted ✓\n\n"
+                        "Any panel / VPN / proxy referencing this item will "
+                        "fail to auto-login until the item is recreated or "
+                        "the field is re-pointed at a different vault item.",
+                        title="Deleted")
             self._refresh_cred_inventory()
         else:
-            self._toast(f"delete failed for '{name}' (see journal)")
+            self._alert(f"Delete failed for '{name}'.\n\n"
+                        "rbw returned non-zero. Check `journalctl -u "
+                        "soc-wall -n 30` for details. The item may already "
+                        "be gone (in which case clicking Refresh should "
+                        "remove the row from the list).",
+                        error=True, title="Delete failed")
 
     def _save_cred(self, name, user_e, pass_e, uri):
         user = user_e.get_text().strip()
@@ -1297,6 +1353,10 @@ class ConfigWindow(Gtk.Window):
         self._cred_msg.set_text(msg)
         if "✓" in msg:
             pass_e.set_text("")
+        else:
+            # Failed write — surface a loud dialog instead of leaving
+            # the operator squinting at the bottom-of-tab label.
+            self._alert(msg, error=True, title="Vault save failed")
         return False
 
     def _tab_display(self):
@@ -1576,8 +1636,12 @@ class ConfigWindow(Gtk.Window):
         """Save inline VPN user/password to the vault item named by the
         section's `vault_item` entry. If the operator has not chosen a
         vault item name, default to 'SOC VPN <name>' so saving Just Works
-        for first-time setup."""
+        for first-time setup. Reuses the same secretstore-unseal + manual-
+        master fallback as the Credentials tab Save grid so a sealed
+        prod install needs no extra inputs and a dev install can paste
+        the master into the Credentials tab once."""
         from . import vaultseed
+        from . import secretstore
         import os as _os
         if not vault_item_entry.get_text().strip():
             vname = (self._vpns[idx].get("name")
@@ -1586,34 +1650,103 @@ class ConfigWindow(Gtk.Window):
             vault_item_entry.set_text(f"SOC VPN {vname}")
         item = vault_item_entry.get_text().strip()
         if not user and not password:
-            self._toast("set a username + password first")
+            self._alert("Set a username AND a password before saving inline "
+                        "VPN credentials.", error=True,
+                        title="Nothing to save")
             return
         url = _os.environ.get("SOC_VAULT_URL", "http://127.0.0.1:8222")
         email = _os.environ.get("SOC_VAULT_EMAIL", "")
-        master = getattr(self, "_master_pw", "") or ""
-        if not (email and master):
-            self._toast("vault credentials needed: type the master password "
-                        "in the Credentials tab first")
+        # FIX: the old code read `self._master_pw` which is never set,
+        # so VPN inline Save ALWAYS hit the "vault credentials needed"
+        # toast. Match the working pattern from _save_cred: prefer the
+        # sealed master, fall back to the master-password entry the
+        # Credentials tab shows when the wall isn't sealed.
+        sd = _os.environ.get("SOC_SECRET_DIR")
+        try:
+            master = secretstore.unseal(sd) if secretstore.is_sealed(sd) else ""
+        except Exception:                              # noqa: BLE001
+            master = ""
+        if not master and getattr(self, "_cred_master", None):
+            master = self._cred_master.get_text()
+        if not email:
+            self._alert("SOC_VAULT_EMAIL is empty in /etc/soc-display/soc.env "
+                        "— the wall doesn't know which Vaultwarden account "
+                        "to write to. Set it via `sudo python3 setup.py "
+                        "wizard` then restart the wall.",
+                        error=True, title="Vault email missing")
+            return
+        if not master:
+            self._alert("No vault master password available.\n\n"
+                        "Either the wall isn't sealed (run `sudo python3 "
+                        "setup.py first-run` to seal the master host-bound), "
+                        "or the Credentials tab's master-password field is "
+                        "empty — type the master password there first.",
+                        error=True, title="Vault master missing")
             return
         try:
             rc = vaultseed.upsert_login(url, email, master,
                                         name=item, username=user,
                                         password=password)
-            self._toast(f"vault item '{item}' {rc} ✓")
+            self._alert(f"VPN credential '{item}' {rc} in Vaultwarden ✓\n\n"
+                        "The wall will pick up the new credential on the "
+                        "next auto-login attempt.",
+                        error=False, title="Vault save succeeded")
         except Exception as e:  # noqa: BLE001
-            self._toast(f"vault save failed: {e}")
+            self._alert(f"Failed to write '{item}' to Vaultwarden:\n\n{e}\n\n"
+                        "Common causes: vault unreachable (check `systemctl "
+                        "status vaultwarden`), wrong master password, the "
+                        "'cryptography' package not installed.",
+                        error=True, title="Vault save failed")
 
     def _toast(self, msg: str):
         """Lightweight non-modal message — uses the existing status label
         slot if present, falls back to a transient label at the bottom of
-        the active page. Idempotent: no-op if neither surface is built yet."""
+        the active page. Idempotent: no-op if neither surface is built yet.
+
+        NOT for error reporting — use `_alert(msg, error=True)` for
+        anything an operator MUST see (auth failure, vault write failure,
+        ...). The Settings tab label this writes to is invisible from
+        every other tab, so quiet failures got missed all session."""
         lbl = getattr(self, "_apply_msg", None)
-        if lbl is None:
-            return
+        if lbl is not None:
+            try:
+                lbl.set_text(msg)
+            except Exception:  # noqa: BLE001
+                pass
+        # Also write to the Credentials tab message slot if present, so
+        # toast(...) from the Edit / Save / Delete flow lands somewhere
+        # the operator is actually looking.
+        cm = getattr(self, "_cred_msg", None)
+        if cm is not None and cm is not lbl:
+            try:
+                cm.set_text(msg)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _alert(self, msg: str, *, error: bool = False,
+                title: "str | None" = None):
+        """Modal MessageDialog — for things the operator MUST see. Use
+        this instead of `_toast()` for auth failures, vault errors,
+        post-action confirmations, anything the operator can't recover
+        from without knowing what happened.
+
+        `error=True` paints the red-cross icon + ERROR class; otherwise
+        an INFO icon. Always blocks until the operator acknowledges, so
+        the next destructive step can never race ahead of an error the
+        user hasn't seen."""
         try:
-            lbl.set_text(msg)
-        except Exception:  # noqa: BLE001
-            pass
+            mt = (Gtk.MessageType.ERROR if error else Gtk.MessageType.INFO)
+            d = Gtk.MessageDialog(transient_for=self, modal=True,
+                                   message_type=mt,
+                                   buttons=Gtk.ButtonsType.OK,
+                                   text=title or ("Error" if error
+                                                  else "Notice"))
+            d.format_secondary_text(msg)
+            d.run(); d.destroy()
+        except Exception:                              # noqa: BLE001
+            # GUI tear-down race or no transient_for — at least record
+            # to the toast surface so the message isn't lost entirely.
+            self._toast(msg)
 
     def _require_reauth(self, what: str = "this action") -> bool:
         """Modal PIN/TOTP prompt before a destructive action. Returns True

@@ -60,10 +60,19 @@ def detect_resolution():
 
 
 def _port_open(host: str, port: int, timeout=1.0) -> bool:
+    """Best-effort TCP-connect probe. NEVER raises — every conceivable
+    failure (socket.gaierror, socket.timeout, ConnectionRefusedError, no
+    route, blocked, ValueError on a bad arg, even SSL on the rare
+    connect-then-close path) is caught + returned as False. The wall's
+    startup gates (`wait_for_vpn`, `wait_for_tunnels`) loop on this; a
+    transient network failure must NEVER bubble up and kill the wall
+    before the GTK loop even starts. This used to catch OSError only,
+    which left a hole for str/int boundary errors caught only by
+    Exception (host=None from a malformed override, for instance)."""
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
-    except OSError:
+    except Exception:                                  # noqa: BLE001
         return False
 
 
@@ -101,31 +110,41 @@ def heaviest_panel(views):
 
 
 def wait_for_vpn(vpn: dict, timeout: float):
-    """Best-effort gate: if a Fortinet VPN is enabled with a `ready_probe`
+    """Best-effort gate: if a VPN is enabled with a `ready_probe`
     (host:port reachable only once the VPN is up), wait for it before opening
-    VPN-side panels. The VPN itself is brought up by forti-vpn.service; this only
-    avoids loading those panels into a dead route. Non-fatal."""
-    vpn = vpn or {}
-    if not vpn.get("enabled"):
-        return
-    probe = (vpn.get("ready_probe") or "").strip()
-    if not probe:
-        return
-    host, _, port = probe.rpartition(":")
-    if not host or not port.isdigit():
-        log(f"[vpn] ignoring malformed ready_probe '{probe}' (want host:port)")
-        return
-    port = int(port)
-    log(f"[vpn] waiting for VPN reachability {host}:{port} ...")
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if _port_open(host, port):
-            log("[vpn] VPN up")
+    VPN-side panels. The VPN itself is brought up by forti-vpn.service; this
+    only avoids loading those panels into a dead route. Non-fatal — wrapped
+    in a top-level catch so a probe error CANNOT kill the wall during startup
+    (a transient gaierror / DNS hiccup / KeyboardInterrupt on a long sleep
+    would otherwise propagate out and tear down the host before GTK ran)."""
+    try:
+        vpn = vpn or {}
+        if not vpn.get("enabled"):
             return
-        time.sleep(1)
-    log(f"[vpn] WARNING {host}:{port} never became reachable; "
-        f"VPN-side panels may show a connection error "
-        f"(check: systemctl status forti-vpn / journalctl -u forti-vpn)")
+        probe = (vpn.get("ready_probe") or "").strip()
+        if not probe:
+            return
+        host, _, port = probe.rpartition(":")
+        if not host or not port.isdigit():
+            log(f"[vpn] ignoring malformed ready_probe '{probe}' "
+                "(want host:port)")
+            return
+        port = int(port)
+        log(f"[vpn] waiting for VPN reachability {host}:{port} ...")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if _port_open(host, port):
+                log("[vpn] VPN up")
+                return
+            time.sleep(1)
+        log(f"[vpn] WARNING {host}:{port} never became reachable; "
+            f"VPN-side panels may show a connection error "
+            f"(check: systemctl status forti-vpn / journalctl -u forti-vpn)")
+    except Exception as e:                             # noqa: BLE001
+        # The wait is purely advisory — if its own machinery breaks,
+        # log loudly + continue. Never let it abort the boot.
+        log(f"[vpn] WARNING wait_for_vpn aborted ({e.__class__.__name__}: "
+            f"{e}); proceeding without the readiness gate")
 
 
 class KioskHost:
@@ -1222,8 +1241,21 @@ def main():
     host.build_and_show()
 
     # 5. signals + main loop
+    # GLib's signal helper moved namespaces between PyGObject versions:
+    #   * 3.46+   gi.repository.GLibUnix.signal_add (preferred)
+    #   * pre-3.46 GLib.unix_signal_add (deprecated but still callable)
+    # Try the new module first to silence the deprecation warning on
+    # modern systems, fall back transparently on older ones.
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix as _GLibUnix  # noqa: E402
+        _add_signal = lambda s: _GLibUnix.signal_add(  # noqa: E731
+            GLib.PRIORITY_DEFAULT, s, host.shutdown)
+    except (ValueError, ImportError):
+        _add_signal = lambda s: GLib.unix_signal_add(  # noqa: E731
+            GLib.PRIORITY_DEFAULT, s, host.shutdown)
     for sig in (signal.SIGINT, signal.SIGTERM):
-        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, host.shutdown)
+        _add_signal(sig)
     log("entering GTK main loop")
     Gtk.main()
     return 0

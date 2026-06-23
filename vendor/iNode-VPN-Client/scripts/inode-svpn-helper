@@ -95,6 +95,11 @@ case "$cmd" in
         # 'h3csvpn' in cwd can't shadow the vendored backend. Ignored on older
         # pythons (harmless).
         export PYTHONSAFEPATH=1
+        # Don't write __pycache__/*.pyc into the backend tree. Running as root we
+        # could otherwise drop group/other-writable bytecode (depending on the
+        # inherited umask) right back into $BACKEND, which would re-trip the
+        # group/other-writable check above on the next connect.
+        export PYTHONDONTWRITEBYTECODE=1
 
         # Run the backend in the background so we can record its PID, then
         # forward terminating signals to it for a graceful logout/teardown.

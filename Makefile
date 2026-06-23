@@ -38,6 +38,18 @@ install:  ## install on the Pi (run as root)
 secrets-scan:  ## run .githooks/pre-commit against the staged set
 	@.githooks/pre-commit && echo "secrets-scan: ok"
 
+.PHONY: refresh-manifest
+refresh-manifest:  ## re-hash /opt/soc-display so the boot drift warning clears
+	@# Write the source commit into /opt/soc-display/.commit so the
+	@# manifest carries the right "deployed commit" tag even though
+	@# /opt/soc-display isn't a git checkout (rsync excludes .git).
+	@sha=$$(git rev-parse HEAD 2>/dev/null || true); \
+	  if [ -n "$$sha" ]; then \
+	    printf '%s\n' "$$sha" | sudo tee /opt/soc-display/.commit >/dev/null; \
+	  fi
+	@PYTHONPATH=/opt/soc-display/kiosk-host sudo \
+	    /opt/soc-display/.venv/bin/python -m host.manifest 2>&1
+
 .PHONY: clean
 clean:  ## remove Python caches
 	find . -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true

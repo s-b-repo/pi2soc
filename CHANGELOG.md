@@ -9,6 +9,119 @@ Production-hardening pass on top of the initial single-engine wall: multi-distro
 + multi-display-server install, a supervised multi-protocol VPN, an outbound
 proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
+### Silent-failure sweep · iNode sync · drift-refresh CLI · bulletproof boot · GLib deprecation (2026-06-24)
+
+User-reported follow-ups from live testing of the previous build. Five
+themes; same commit.
+
+#### Silent-failure sweep (operator now SEES every error)
+
+The Edit / Save / Delete / Calibrate flows had several paths that
+failed without surfacing anything visible — the operator pressed Enter
+or clicked Save, and nothing happened. Two specific root-causes:
+
+- **`_save_vpn_creds` referenced `self._master_pw` which is NEVER set.**
+  That variable was a leftover from a refactor; the real master comes
+  from `secretstore.unseal()` (sealed prod path) or the Credentials
+  tab's master-password Entry (dev fallback). VPN inline Save was
+  effectively broken for everyone — it always hit the "vault
+  credentials needed" toast at the bottom of the Panels tab,
+  invisible from the VPN tab where the operator clicked Save.
+- **The Edit modal's user/pass entries didn't `set_activates_default`**
+  so pressing Enter to submit did nothing.
+- **`_toast()` writes to a label at the bottom of the Panels tab**
+  that's invisible from every other tab. Critical errors (auth
+  failure, vault write failure, missing vault handle) were going
+  there and getting missed.
+
+New `_alert(msg, *, error=False, title=None)` helper renders a modal
+`Gtk.MessageDialog` (red-cross ERROR / blue INFO) that BLOCKS until
+the operator acknowledges. Every silent-fail path now routes through
+it:
+
+  * `_save_vpn_creds` — missing email / master / vault write failure
+    each get a specific alert with the recovery command spelled out
+    (`sudo python3 setup.py wizard`, `sudo python3 setup.py first-run`,
+    `systemctl status vaultwarden`).
+  * `_on_cred_edit` — missing vault handle, vault read failure,
+    empty user+password, missing email, missing master — each named.
+  * `_on_cred_delete` — missing vault handle, delete success
+    confirmation, delete failure with `journalctl` pointer.
+  * `_on_calibrate_panel` — missing action wiring, calibrate
+    subprocess failure.
+  * `_cred_done` (Credentials Save grid) — failed write upgrades the
+    bottom-of-tab label to a loud dialog.
+  * `_post_edit_done` — success + failure both get a dialog (used to
+    be a toast only).
+  * Edit modal entries: `set_activates_default(True)` + `p_e.grab_focus()`
+    on the password so Enter submits and focus lands where the
+    operator types.
+- `_toast()` itself now writes to BOTH the Panels-tab apply label AND
+  the Credentials-tab cred-msg label, so a non-error toast at least
+  lands somewhere visible from any tab.
+
+#### iNode (H3C SSL-VPN) client refreshed from upstream
+
+Rsync'd `/home/kali/Downloads/Linux/iNode-VPN-Client/` into
+`vendor/iNode-VPN-Client/`. The only protocol-relevant change is
+`scripts/inode-svpn-helper` adding `PYTHONDONTWRITEBYTECODE=1` — the
+backend dir would otherwise accumulate `__pycache__` files that
+re-trip install.sh's "no group/other-writable backend" guard on the
+next connect (and prevent inode-svpn-helper from loading the
+backend). The new upstream also ships `bin/` (Qt GUI client) and
+`iNode-VPN.sh` (GUI launcher) — neither is used by the wall (we go
+through the CLI via `svpn-connect.sh`), but they ship in vendor/
+unchanged for parity with upstream.
+
+The wall's iNode driver in `host/fortivpn.py` is unchanged — it still
+calls `svpn-connect.sh` for `vpn.type: inode` and parses the same
+KEY=VALUE Notes block from the vault item (allowlist:
+`gateway/port/realm/domain/trusted_cert/ca_file/ready_probe/insecure/
+set_routes/set_dns/half_internet_routes/otp_from_vault`). Verified
+that semantics are preserved.
+
+#### Drift warning that won't go away — fixed
+
+The boot-time file-drift detection (Phase 9) kept warning "files drift
+from deployed commit dedcdad3dbb8" even after manual `rsync` deploys.
+Two causes:
+
+- The manifest at install time was hashed from `SRC_DIR` (the dev
+  checkout), but the wall hashes `/opt/soc-display` at boot — slightly
+  different file sets when the rsync includes the venv etc. Fixed
+  install.sh to hash `SOC_ROOT` (the deploy tree) so the manifest is
+  byte-exact with what the wall sees.
+- `_current_commit()` ran `git -C <root> rev-parse HEAD` but
+  `/opt/soc-display` isn't a git checkout. Added a fallback chain:
+  `git rev-parse` → `<root>/.commit` sentinel file → `SOC_DEPLOY_COMMIT`
+  env. install.sh now writes `/opt/soc-display/.commit` with the
+  source SHA alongside the deploy.
+- New `python -m host.manifest [root] [dest]` CLI entry-point for
+  ad-hoc refresh. `make refresh-manifest` writes the source HEAD into
+  `/opt/soc-display/.commit` (sudo) then runs the CLI. Use after any
+  manual rsync.
+
+#### Bulletproof `wait_for_vpn` boot gate
+
+The user pasted a traceback showing the wall crashed during startup
+inside `wait_for_vpn → _port_open → socket.create_connection`. The
+trace was truncated so the exact exception class is unknown — but
+`_port_open` only caught `OSError`, which left a hole for anything
+unusual (host=None from a malformed override, `BlockingIOError`
+edge case, `KeyboardInterrupt` mid-sleep).
+
+`_port_open` now catches `Exception`. `wait_for_vpn` wraps its entire
+body in a top-level catch + log so even a probe-machinery bug logs
+loudly and continues — boot can NEVER fail because of a network
+gate.
+
+#### Misc
+
+- `GLib.unix_signal_add` → tries `GLibUnix.signal_add` first
+  (PyGObject 3.46+ path; silences the deprecation warning) and falls
+  back transparently on older systems.
+- `Makefile` gains `refresh-manifest`.
+
 ### Credential Edit (OS-password gated) · button-wiring audit · vault-bypass audit (2026-06-23 late night)
 
 #### Edit vault item — gated by the OPERATING SYSTEM password

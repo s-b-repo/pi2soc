@@ -92,16 +92,35 @@ def build_manifest(root: str, commit_sha: str = "") -> dict:
 
 
 def _current_commit(root: str) -> str:
-    """`git -C root rev-parse HEAD`. Returns '' on failure (not a checkout,
-    git missing, detached state without a rev) — that's the manifest's
-    'unknown commit' state and the drift warning degrades gracefully."""
+    """Resolve the source-commit SHA, tried in order:
+      1. `git -C root rev-parse HEAD` — works in a dev checkout.
+      2. `<root>/.commit` file — install.sh writes this alongside the
+         deploy so /opt/soc-display (no .git) still knows its source.
+      3. `SOC_DEPLOY_COMMIT` env var — for ad-hoc refresh from CI.
+      4. Empty string — manifest's "unknown commit" state; drift
+         summary degrades gracefully to "commit unknown".
+    Tries each fallback in turn and never raises."""
     try:
         r = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"],
                            capture_output=True, text=True, timeout=10)
-        if r.returncode == 0:
+        if r.returncode == 0 and r.stdout.strip():
             return r.stdout.strip()
     except (OSError, subprocess.SubprocessError):
         pass
+    sentinel = os.path.join(root, ".commit")
+    try:
+        with open(sentinel, encoding="utf-8") as fh:
+            v = fh.read().strip()
+        # Only accept a plausibly-SHA-shaped value so a corrupted file
+        # doesn't become the manifest's "deployed commit".
+        if v and all(c in "0123456789abcdef" for c in v.lower()) \
+                and 7 <= len(v) <= 64:
+            return v
+    except OSError:
+        pass
+    env_v = os.environ.get("SOC_DEPLOY_COMMIT", "").strip()
+    if env_v:
+        return env_v
     return ""
 
 
@@ -167,6 +186,21 @@ def check_drift(deploy_root: str,
     }
 
 
+def _cli_refresh(deploy_root: str = "/opt/soc-display",
+                 dest: str = MANIFEST_PATH) -> int:
+    """`python -m host.manifest refresh` entry — re-hash deploy_root and
+    overwrite the manifest. Used after a manual `rsync … /opt/soc-display/`
+    so the boot-time drift check stops flagging the (intentional) updates.
+    Returns the exit code suitable for `make`."""
+    try:
+        rc = write_manifest(deploy_root, dest=dest)
+    except OSError as e:
+        print(f"manifest refresh failed: {e}", flush=True)
+        return 1
+    print(f"manifest refreshed: {rc}", flush=True)
+    return 0
+
+
 def format_drift_summary(drift: dict, *, max_files: int = 5) -> str:
     """Compose a one-line warning suitable for the wall's top-bar.
 
@@ -186,3 +220,15 @@ def format_drift_summary(drift: dict, *, max_files: int = 5) -> str:
     return (f"⚠ files drift from deployed commit {sha_short} "
             f"({summary}). Run `git diff {sha_short}` against the "
             f"repo to investigate.")
+
+
+if __name__ == "__main__":
+    # Tiny CLI:
+    #   python -m host.manifest                 -> refresh /opt/soc-display
+    #   python -m host.manifest <root>          -> refresh from <root>
+    #   python -m host.manifest <root> <dest>   -> custom dest path
+    import sys
+    args = sys.argv[1:]
+    root = args[0] if len(args) >= 1 else "/opt/soc-display"
+    dest = args[1] if len(args) >= 2 else MANIFEST_PATH
+    sys.exit(_cli_refresh(root, dest))

@@ -444,18 +444,27 @@ chmod -R go-w "$SOC_ROOT"/vendor/iNode-VPN-Client/backends 2>/dev/null || true
 # Deploy-time manifest: record every shipped file's sha256 + the source
 # commit. The wall reads /etc/soc-display/manifest.json at boot and warns in
 # the top bar if anything has drifted (tampered install, ad-hoc edit on the
-# Pi). We hash SRC_DIR (the git checkout — it's byte-identical to SOC_ROOT
-# right after the tar above, AND it has the .git for `rev-parse HEAD`).
+# Pi). We hash SOC_ROOT (the deployed tree) AND write a `.commit` sentinel
+# into SOC_ROOT so the manifest CLI can refresh the manifest later (after a
+# `rsync … /opt/soc-display/`) without losing the source-commit anchor.
 # Best-effort: if python3 / git aren't available yet (unusual but possible
 # mid-install), skip and the wall just won't show the warning.
 log "Recording deploy manifest (file hashes + source commit)"
 if command -v python3 >/dev/null 2>&1; then
   install -d -m 0755 /etc/soc-display
+  # Capture the source commit from SRC_DIR (it has the .git checkout).
+  src_commit="$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || true)"
+  if [ -n "$src_commit" ]; then
+    printf '%s\n' "$src_commit" > "$SOC_ROOT/.commit"
+    chmod 0644 "$SOC_ROOT/.commit"
+  fi
+  # Write the manifest from SOC_ROOT (the deployed tree). _current_commit
+  # falls back to SOC_ROOT/.commit when SOC_ROOT itself has no .git.
   PYTHONPATH="$SOC_ROOT/kiosk-host" python3 -c "
 from host import manifest
 import sys
 try:
-    p = manifest.write_manifest('$SRC_DIR', dest='/etc/soc-display/manifest.json')
+    p = manifest.write_manifest('$SOC_ROOT', dest='/etc/soc-display/manifest.json')
     print(f'manifest: wrote {p}')
 except Exception as e:
     sys.stderr.write(f'manifest: skipped ({e})\n')
