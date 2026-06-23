@@ -673,6 +673,153 @@ class WebKitPanel:
                 pass
         self.webview.run_javascript(js, None, None, None)
 
+    # ---- Phase 8: click-zone calibrate -------------------------------------
+    def _evaluate_for_string(self, js: str, on_value):
+        """Evaluate `js`, call on_value(str_or_None) with the result. None
+        means the call failed or the JS returned undefined/null.
+        Handles both WebKit2 4.0 (run_javascript_finish → JavascriptResult →
+        get_js_value()) and 4.1 (evaluate_javascript_finish → JSCValue).
+        on_value runs on the GLib thread (the WebKit callback IS the GLib
+        thread)."""
+        def _coerce(value_or_result):
+            """Best-effort: drill from a 4.0 JavascriptResult OR a 4.1 JSCValue
+            to a str (or None for null/undefined/error)."""
+            try:
+                v = value_or_result
+                if hasattr(v, "get_js_value"):
+                    v = v.get_js_value()
+                # JSCValue: .is_null / .is_undefined / .to_string()
+                if hasattr(v, "is_null") and v.is_null():
+                    return None
+                if hasattr(v, "is_undefined") and v.is_undefined():
+                    return None
+                if hasattr(v, "to_string"):
+                    return v.to_string()
+            except Exception:                            # noqa: BLE001
+                return None
+            return None
+
+        if hasattr(self.webview, "evaluate_javascript"):
+            def _cb_41(view, async_result, _user):
+                try:
+                    val = view.evaluate_javascript_finish(async_result)
+                except Exception:                        # noqa: BLE001
+                    on_value(None); return
+                on_value(_coerce(val))
+            try:
+                self.webview.evaluate_javascript(
+                    js, -1, None, None, None, _cb_41, None)
+                return
+            except TypeError:
+                pass                                     # fall through to 4.0
+
+        def _cb_40(view, async_result, _user):
+            try:
+                jr = view.run_javascript_finish(async_result)
+            except Exception:                            # noqa: BLE001
+                on_value(None); return
+            on_value(_coerce(jr))
+        try:
+            self.webview.run_javascript(js, None, _cb_40, None)
+        except Exception:                                # noqa: BLE001
+            on_value(None)
+
+    def calibrate(self, on_done):
+        """Begin click-zone calibration on this panel. Injects
+        inject/calibrate.js.tmpl, then polls window.__SOC_CALIBRATE_RESULT
+        every 500 ms. Calls `on_done(zones_dict)` on success, `on_done(None)`
+        if the operator pressed Esc or the panel was torn down.
+
+        Idempotent: a second call while a calibration is in flight returns
+        without starting a new one (the on_done from the first call still
+        fires)."""
+        if getattr(self, "_calibrating", False):
+            self.log(f"[{self.panel.id}] calibrate already in progress")
+            return
+        # Read the template every time so an operator can iterate on it
+        # without restarting the wall (mirrors how login.js.tmpl reloads
+        # via host/inject.py's lru_cache — only ours doesn't cache because
+        # calibrate is rare and rerunning + re-reading is harmless).
+        tmpl_path = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), "..", "..", "inject",
+            "calibrate.js.tmpl"))
+        try:
+            with open(tmpl_path, "r", encoding="utf-8") as fh:
+                src = fh.read()
+        except OSError as e:
+            self.log(f"[{self.panel.id}] calibrate template missing: {e}")
+            on_done(None)
+            return
+
+        self._calibrating = True
+        self._calibrate_ticks = 0
+        self.log(f"[{self.panel.id}] calibrate: overlay injected, "
+                 "awaiting 3 clicks")
+        # Inject the overlay JS. It builds the crosshair UI and stuffs the
+        # result into window.__SOC_CALIBRATE_RESULT when done.
+        self._evaluate(src)
+
+        from gi.repository import GLib
+
+        # Poll for up to 5 minutes; abort cleanly afterwards.
+        MAX_TICKS = 600                                  # 600 * 0.5s = 5 min
+
+        def _finish(zones):
+            self._calibrating = False
+            try:
+                on_done(zones)
+            except Exception as e:                       # noqa: BLE001
+                self.log(f"[{self.panel.id}] calibrate on_done raised: {e}")
+
+        def _tick():
+            self._calibrate_ticks += 1
+            if not self._calibrating:
+                return False                             # caller already done
+            if self._calibrate_ticks > MAX_TICKS:
+                self.log(f"[{self.panel.id}] calibrate: timed out after "
+                         f"{MAX_TICKS // 2}s")
+                self._evaluate("try{document.getElementById('__soc_calibrate')"
+                               ".remove();}catch(e){}"
+                               "window.__SOC_CALIBRATE_ACTIVE=false;"
+                               "window.__SOC_CALIBRATE_RESULT=null;")
+                _finish(None)
+                return False
+
+            def _on_value(s):
+                if s is None or not self._calibrating:
+                    return
+                # The template sets the result to either the captured dict
+                # (3 zones) or {cancelled: true}. We strip the global on
+                # read so the next calibration doesn't re-read this one.
+                self._evaluate("window.__SOC_CALIBRATE_RESULT=null;")
+                import json as _json
+                try:
+                    obj = _json.loads(s)
+                except (ValueError, TypeError):
+                    self.log(f"[{self.panel.id}] calibrate: malformed "
+                             f"result {s!r}")
+                    _finish(None)
+                    return
+                if obj.get("cancelled"):
+                    self.log(f"[{self.panel.id}] calibrate: cancelled by "
+                             "operator")
+                    _finish(None)
+                    return
+                # Drop any keys we don't recognise so the override stays
+                # schema-conformant (config.validator double-checks anyway).
+                clean = {k: obj[k] for k in ("user", "pass", "submit")
+                         if isinstance(obj.get(k), dict)}
+                self.log(f"[{self.panel.id}] calibrate: captured "
+                         f"{sorted(clean)}")
+                _finish(clean)
+
+            self._evaluate_for_string(
+                "JSON.stringify(window.__SOC_CALIBRATE_RESULT||null)",
+                _on_value)
+            return True                                  # keep polling
+
+        GLib.timeout_add(500, _tick)
+
     def _on_destroy(self, *_):
         self.log(f"[{self.panel.id}] window closed")
 

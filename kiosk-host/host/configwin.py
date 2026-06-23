@@ -725,6 +725,37 @@ class ConfigWindow(Gtk.Window):
         bsw.add(blocked_tv)
         adv.pack_start(bsw, False, False, 0)
 
+        # --- Phase 8: click-zone calibration --------------------------------
+        # Last-resort login fallback: when the CSS selectors AND the text-
+        # pattern heuristic both miss, the operator can click the three
+        # zones (user / pass / submit) on the rendered page; ratios are
+        # stored so a resize keeps the calibration accurate.
+        cz_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        cz_lbl = Gtk.Label()
+        cz_lbl.set_xalign(0.0); cz_lbl.set_line_wrap(True); cz_lbl.set_hexpand(True)
+        cz_lbl.get_style_context().add_class("soc-config-sub")
+        cz_lbl.set_markup(self._login_zones_status(p))
+        cz_btn = Gtk.Button(label="Calibrate login zones")
+        cz_btn.set_tooltip_text("Overlay a crosshair on the panel; click "
+                                "the username, password, and submit "
+                                "elements. Ratios are stored — a resize "
+                                "keeps the calibration accurate.")
+        cz_clr_btn = Gtk.Button(label="Clear zones")
+        cz_clr_btn.set_tooltip_text("Drop the saved zones from this panel. "
+                                    "The wall falls back to selectors + "
+                                    "text-pattern heuristics.")
+        cz_clr_btn.get_style_context().add_class("destructive-action")
+        cz_btn.connect("clicked",
+                       lambda _b, pid=p.id, lbl=cz_lbl:
+                            self._on_calibrate_panel(pid, lbl))
+        cz_clr_btn.connect("clicked",
+                           lambda _b, pid=p.id, lbl=cz_lbl:
+                                self._on_clear_login_zones(pid, lbl))
+        cz_box.pack_start(cz_lbl, True, True, 0)
+        cz_box.pack_start(cz_btn, False, False, 0)
+        cz_box.pack_start(cz_clr_btn, False, False, 0)
+        adv.pack_start(cz_box, False, False, 0)
+
         exp.add(adv)
         inner.pack_start(exp, False, False, 0)
         frame.add(inner)
@@ -734,8 +765,74 @@ class ConfigWindow(Gtk.Window):
                             "allow_insecure": ai_c, "allow_media": am_c,
                             "proxy": px_c, "ka_strat": ka_strat,
                             "ka_int": ka_int,
-                            "relogin": relogin_e, "blocked": blocked_tv}
+                            "relogin": relogin_e, "blocked": blocked_tv,
+                            "zones_lbl": cz_lbl}
         return frame
+
+    def _login_zones_status(self, p) -> str:
+        """Markup string for the per-panel "zones: …" status label.
+        Names the captured zones (or notes the absence) so the operator
+        sees calibration state at a glance without expanding the panel."""
+        zones = getattr(p, "login_zones", None) or {}
+        if not zones:
+            return ("<b>login zones:</b> none — selectors + heuristics only")
+        names = sorted(zones.keys())
+        return f"<b>login zones:</b> calibrated ✓  ({', '.join(names)})"
+
+    def _on_calibrate_panel(self, panel_id: str, status_lbl):
+        """Wire the per-panel Calibrate button → host.calibrate_panel().
+        Updates the status label when the operator finishes."""
+        action = self._actions.get("calibrate_panel")
+        if action is None:
+            self._toast("calibrate is unavailable in this session")
+            return
+        # Update the in-memory Panel + the status label once the host
+        # writes the override; the operator sees confirmation immediately.
+        p = next((pp for pp in self.panels if pp.id == panel_id), None)
+
+        def _on_done(zones):
+            if zones is None:
+                self._toast(f"{panel_id}: calibration cancelled / timed out")
+                return
+            if p is not None:
+                p.login_zones = dict(zones)
+            try:
+                status_lbl.set_markup(self._login_zones_status(p
+                    if p is not None else type("P", (), {"login_zones": zones})))
+            except Exception:                            # noqa: BLE001
+                pass
+            self._toast(f"{panel_id}: calibrated ✓ ({len(zones)} zones)")
+        self._toast(f"{panel_id}: click USER → PASS → SUBMIT on the panel "
+                    "(Esc cancels)")
+        try:
+            action(panel_id, _on_done)
+        except Exception as e:                            # noqa: BLE001
+            self._toast(f"calibrate failed: {e}")
+
+    def _on_clear_login_zones(self, panel_id: str, status_lbl):
+        """Drop the panel's saved zones from the override file and the
+        live Panel object. Gated by re-auth — same policy as Remove VPN."""
+        if not self._require_reauth(f"clearing login zones on '{panel_id}'"):
+            return
+        ov = load_overrides()
+        per = dict(ov.get(panel_id) or {})
+        had = bool(per.get("login_zones"))
+        per.pop("login_zones", None)
+        if not per:
+            ov.pop(panel_id, None)
+        else:
+            ov[panel_id] = per
+        save_overrides(ov)
+        p = next((pp for pp in self.panels if pp.id == panel_id), None)
+        if p is not None:
+            p.login_zones = {}
+        try:
+            status_lbl.set_markup(self._login_zones_status(
+                p if p is not None else type("P", (), {"login_zones": {}})))
+        except Exception:                                # noqa: BLE001
+            pass
+        self._toast(f"{panel_id}: login zones cleared"
+                    if had else f"{panel_id}: no zones to clear")
 
     def _tab_credentials(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)

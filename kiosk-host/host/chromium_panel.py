@@ -701,3 +701,110 @@ class ChromiumPanel:
         if self.cdp:
             self.cdp.close()
         self._reap()
+
+    # ---- Phase 8: click-zone calibrate -------------------------------------
+    def calibrate(self, on_done):
+        """Inject inject/calibrate.js.tmpl via CDP Runtime.evaluate, then
+        poll window.__SOC_CALIBRATE_RESULT on the same channel. Calls
+        on_done(zones_dict) on success, on_done(None) on cancel / timeout.
+
+        Polling runs on a background daemon thread so it doesn't block the
+        GTK main loop. The CDP socket is thread-safe via Cdp.rpc()'s
+        internal locking; we don't need GLib.timeout here."""
+        if getattr(self, "_calibrating", False):
+            self.log(f"[{self.panel.id}] calibrate already in progress")
+            return
+        if not self.cdp:
+            self.log(f"[{self.panel.id}] calibrate: no CDP session — is "
+                     "the panel still loading?")
+            on_done(None)
+            return
+        import json as _json
+        import os as _os
+        import threading
+        tmpl_path = _os.path.abspath(_os.path.join(
+            _os.path.dirname(__file__), "..", "..", "inject",
+            "calibrate.js.tmpl"))
+        try:
+            with open(tmpl_path, "r", encoding="utf-8") as fh:
+                src = fh.read()
+        except OSError as e:
+            self.log(f"[{self.panel.id}] calibrate template missing: {e}")
+            on_done(None)
+            return
+
+        self._calibrating = True
+        self.log(f"[{self.panel.id}] calibrate: overlay injected (CDP), "
+                 "awaiting 3 clicks")
+        try:
+            self.cdp.rpc("Runtime.evaluate", {"expression": src,
+                                              "awaitPromise": False})
+        except Exception as e:                            # noqa: BLE001
+            self.log(f"[{self.panel.id}] calibrate inject failed: {e}")
+            self._calibrating = False
+            on_done(None)
+            return
+
+        def _poll_loop():
+            # Up to 5 minutes at 0.5s ticks (mirrors WebKit budget).
+            for _ in range(600):
+                if self._stop.is_set() or not self._calibrating:
+                    return
+                time.sleep(0.5)
+                try:
+                    val = self.cdp.rpc("Runtime.evaluate", {
+                        "expression":
+                            "JSON.stringify(window.__SOC_CALIBRATE_RESULT||null)",
+                        "returnByValue": True,
+                        "awaitPromise": False,
+                    }).get("result", {}).get("value")
+                except Exception as e:                    # noqa: BLE001
+                    self.log(f"[{self.panel.id}] calibrate poll error: {e}")
+                    self._calibrating = False
+                    on_done(None)
+                    return
+                if not val or val == "null":
+                    continue
+                # Clear the global so the next calibration starts clean.
+                try:
+                    self.cdp.send_nowait("Runtime.evaluate", {
+                        "expression": "window.__SOC_CALIBRATE_RESULT=null;"})
+                except Exception:                         # noqa: BLE001
+                    pass
+                try:
+                    obj = _json.loads(val)
+                except (ValueError, TypeError):
+                    self.log(f"[{self.panel.id}] calibrate: malformed "
+                             f"result {val!r}")
+                    self._calibrating = False
+                    on_done(None)
+                    return
+                if obj.get("cancelled"):
+                    self.log(f"[{self.panel.id}] calibrate: cancelled by "
+                             "operator")
+                    self._calibrating = False
+                    on_done(None)
+                    return
+                clean = {k: obj[k] for k in ("user", "pass", "submit")
+                         if isinstance(obj.get(k), dict)}
+                self.log(f"[{self.panel.id}] calibrate: captured "
+                         f"{sorted(clean)}")
+                self._calibrating = False
+                on_done(clean)
+                return
+            # Loop fell through → timeout.
+            self.log(f"[{self.panel.id}] calibrate: timed out after 300s")
+            try:
+                self.cdp.send_nowait("Runtime.evaluate", {
+                    "expression":
+                        "try{document.getElementById('__soc_calibrate')"
+                        ".remove();}catch(e){}"
+                        "window.__SOC_CALIBRATE_ACTIVE=false;"
+                        "window.__SOC_CALIBRATE_RESULT=null;"})
+            except Exception:                             # noqa: BLE001
+                pass
+            self._calibrating = False
+            on_done(None)
+
+        threading.Thread(target=_poll_loop, daemon=True,
+                         name=f"calibrate-{self.panel.id}").start()

@@ -459,6 +459,7 @@ class KioskHost:
                                    "restart_wall": self.restart_wall,
                                    "reload_panels": self.reload_all_panels,
                                    "lock_wall": self._lock_wall,
+                                   "calibrate_panel": self.calibrate_panel,
                                })
             self._config_win = win
             win.show_all()
@@ -548,7 +549,10 @@ class KioskHost:
             return
         msg = _mf.format_drift_summary(drift)
         if msg and self.wall is not None:
-            self.wall.show_top_bar_warning(msg)
+            # Pass the full drift dict so wall.py can open a detail modal
+            # listing changed / missing / extras + a clickable URL to the
+            # deployed commit on GitHub.
+            self.wall.show_top_bar_warning(msg, detail=drift)
             log(f"file drift detected: {len(drift['changed'])} changed, "
                 f"{len(drift['missing'])} missing, "
                 f"{len(drift['extras'])} extras (commit "
@@ -558,6 +562,68 @@ class KioskHost:
 
     def _config_closed(self):
         self._config_win = None
+
+    def calibrate_panel(self, panel_id: str, on_done):
+        """Phase 8: start click-zone calibration on the panel matching
+        `panel_id`. Routes to webkit_panel.calibrate or chromium_panel.
+        calibrate. on_done(zones_dict_or_None) fires once the operator
+        finishes (zones dict) or cancels / timeout (None).
+
+        On success we ALSO persist the captured zones into the panel's
+        override + the panel.login_zones attribute so the next injected
+        JS picks it up without a restart. Save is best-effort — a write
+        failure is logged and the override-save is skipped, but the
+        in-memory panel.login_zones still has the value so the operator
+        can verify the new fallback works before re-applying."""
+        # Find the panel + its view.
+        view = None
+        panel = None
+        for v in self.panels_view:
+            pid = getattr(getattr(v, "panel", None), "id", None)
+            if pid == panel_id:
+                view = v
+                panel = v.panel
+                break
+        if view is None or panel is None:
+            log(f"calibrate_panel: no view for id={panel_id!r}")
+            on_done(None)
+            return
+        if not hasattr(view, "calibrate"):
+            log(f"calibrate_panel: {panel_id} engine has no calibrate() "
+                "(needs WebKit or Chromium renderer)")
+            on_done(None)
+            return
+
+        def _on_zones(zones):
+            if zones is not None:
+                try:
+                    panel.login_zones = dict(zones)
+                    self._save_login_zones_override(panel_id, zones)
+                except Exception as e:                    # noqa: BLE001
+                    log(f"calibrate_panel: persist failed for "
+                        f"{panel_id}: {e}")
+            try:
+                on_done(zones)
+            except Exception as e:                        # noqa: BLE001
+                log(f"calibrate_panel: on_done raised: {e}")
+
+        try:
+            view.calibrate(_on_zones)
+        except Exception as e:                            # noqa: BLE001
+            log(f"calibrate_panel: view.calibrate raised: {e}")
+            on_done(None)
+
+    def _save_login_zones_override(self, panel_id: str, zones: dict):
+        """Merge {panel_id: {login_zones: zones}} into the overrides file
+        so the calibration survives a restart. Reuses configwin's
+        save_overrides path to keep the file format consistent."""
+        from . import configwin
+        ov = configwin.load_overrides()
+        per = dict(ov.get(panel_id) or {})
+        per["login_zones"] = {k: dict(v) for k, v in zones.items()}
+        ov[panel_id] = per
+        configwin.save_overrides(ov)
+        log(f"saved login_zones override for {panel_id} ({sorted(zones)})")
 
     def reload_all_panels(self):
         """Reload every panel view in place — no teardown, no exit. Used by

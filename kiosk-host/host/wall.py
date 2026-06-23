@@ -16,7 +16,7 @@ from __future__ import annotations
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, Gdk  # noqa: E402
+from gi.repository import Gtk, Gdk, GLib  # noqa: E402
 
 from . import style  # noqa: E402
 
@@ -176,12 +176,17 @@ class WallWindow:
         else:
             self.window.unfullscreen()
 
-    def show_top_bar_warning(self, text: str):
+    def show_top_bar_warning(self, text: str, detail: dict = None):
         """Surface a banner above the toolbar — used for the file-hash
         drift warning at boot. Idempotent: replaces an existing banner
-        if any. Click to dismiss for this session (warning re-paints on
-        next boot if the drift persists)."""
-        # Late-built helper: dismantle previous banner first.
+        if any. Click opens a detail modal (when `detail` is provided)
+        OR dismisses for this session (when not). The warning re-paints
+        on next boot if drift persists.
+
+        `detail` (Phase 9) is the dict returned by manifest.check_drift —
+        {'commit', 'repo', 'changed', 'missing', 'extras'}. When set, the
+        banner becomes click-to-open instead of click-to-dismiss; a
+        Dismiss button inside the modal handles the temporary close."""
         prev = getattr(self, "_warn_bar", None)
         if prev is not None:
             try:
@@ -193,32 +198,125 @@ class WallWindow:
             return
         bar = Gtk.EventBox()
         bar.get_style_context().add_class("soc-warn-bar")
+        # Layout: text label (hexpand) + "Details ›" hint on the right when
+        # `detail` was supplied. Keeps the affordance discoverable.
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         lbl = Gtk.Label(label=text)
         lbl.set_xalign(0.0)
         lbl.set_line_wrap(True)
-        lbl.set_margin_start(12); lbl.set_margin_end(12)
+        lbl.set_margin_start(12); lbl.set_margin_end(8)
         lbl.set_margin_top(6);   lbl.set_margin_bottom(6)
-        bar.add(lbl)
-        bar.set_tooltip_text("Click to dismiss for this session. The "
-                             "warning re-paints on next boot if drift "
-                             "persists.")
+        box.pack_start(lbl, True, True, 0)
+        if detail is not None:
+            hint = Gtk.Label(label="Details ›")
+            hint.set_margin_end(12)
+            box.pack_start(hint, False, False, 0)
+            bar.set_tooltip_text("Click to see the full list of changed / "
+                                 "missing / extra files + a link to the "
+                                 "deployed commit on GitHub.")
+        else:
+            bar.set_tooltip_text("Click to dismiss for this session. The "
+                                 "warning re-paints on next boot if drift "
+                                 "persists.")
+        bar.add(box)
 
-        def _dismiss(*_):
-            try:
-                bar.destroy()
-            except Exception:                          # noqa: BLE001
-                pass
-            self._warn_bar = None
+        def _on_click(*_):
+            if detail is not None:
+                self._open_drift_detail_dialog(text, detail)
+            else:
+                try:
+                    bar.destroy()
+                except Exception:                      # noqa: BLE001
+                    pass
+                self._warn_bar = None
             return True
 
-        bar.connect("button-press-event", _dismiss)
-        # Inject at the very top of the vbox (above the toolbar).
+        bar.connect("button-press-event", _on_click)
         vbox = self.window.get_child()
         if vbox is not None and hasattr(vbox, "pack_start"):
             vbox.pack_start(bar, False, False, 0)
             vbox.reorder_child(bar, 0)
             bar.show_all()
         self._warn_bar = bar
+
+    def _open_drift_detail_dialog(self, summary: str, detail: dict):
+        """Modal dialog listing the drift contents + a clickable URL to
+        the deployed commit on GitHub. Dismiss button on top of the OS
+        close button — both clear the top-bar banner for this session."""
+        dlg = Gtk.Dialog(transient_for=self.window, modal=True,
+                          title="File integrity — drift detected")
+        dlg.add_buttons("Dismiss banner", Gtk.ResponseType.CLOSE)
+        dlg.set_default_size(640, 420)
+        area = dlg.get_content_area()
+        area.set_spacing(8)
+        area.set_margin_start(14); area.set_margin_end(14)
+        area.set_margin_top(10);  area.set_margin_bottom(10)
+
+        # Top line: the same summary the banner shows, in muted text.
+        head = Gtk.Label(label=summary)
+        head.set_xalign(0.0); head.set_line_wrap(True)
+        head.get_style_context().add_class("soc-config-sub")
+        area.pack_start(head, False, False, 0)
+
+        # GitHub link (commit-pinned tree). LinkButton renders as a real
+        # hyperlink (GTK opens it in the user's default browser); falls
+        # back to a non-clickable Label if URI handlers aren't installed.
+        commit = (detail.get("commit") or "").strip()
+        repo = (detail.get("repo") or "").strip()
+        if commit and repo:
+            url = f"{repo.rstrip('/')}/tree/{commit}"
+            try:
+                link = Gtk.LinkButton.new_with_label(
+                    url, f"open commit {commit[:12]} on GitHub")
+                link.set_halign(Gtk.Align.START)
+                area.pack_start(link, False, False, 0)
+            except Exception:                          # noqa: BLE001
+                fall = Gtk.Label(label=url)
+                fall.set_xalign(0.0)
+                area.pack_start(fall, False, False, 0)
+
+        # Three scrollable sections — only the ones that have content
+        # are added, so a "changed only" diff doesn't waste vertical
+        # space on empty Missing / Extras panes.
+        def _section(title: str, items: list, marker: str):
+            if not items:
+                return
+            hdr = Gtk.Label()
+            hdr.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>  "
+                           f"<span color='#888'>({len(items)})</span>")
+            hdr.set_xalign(0.0)
+            area.pack_start(hdr, False, False, 0)
+            sw = Gtk.ScrolledWindow()
+            sw.set_policy(Gtk.PolicyType.AUTOMATIC,
+                          Gtk.PolicyType.AUTOMATIC)
+            sw.set_min_content_height(min(150, 18 * max(3, len(items)) + 8))
+            tv = Gtk.TextView()
+            tv.set_editable(False)
+            tv.set_cursor_visible(False)
+            tv.set_monospace(True)
+            tv.set_left_margin(8); tv.set_right_margin(8)
+            tv.get_buffer().set_text("\n".join(f"{marker} {p}"
+                                                for p in items))
+            sw.add(tv)
+            area.pack_start(sw, True, True, 0)
+
+        _section("Changed (hash differs)", detail.get("changed") or [], "M")
+        _section("Missing (in manifest, not on disk)",
+                  detail.get("missing") or [], "D")
+        _section("Extra (on disk, not in manifest)",
+                  detail.get("extras") or [], "?")
+
+        dlg.show_all()
+        rc = dlg.run()
+        dlg.destroy()
+        if rc == Gtk.ResponseType.CLOSE:
+            prev = getattr(self, "_warn_bar", None)
+            if prev is not None:
+                try:
+                    prev.destroy()
+                except Exception:                      # noqa: BLE001
+                    pass
+                self._warn_bar = None
 
     def set_vpn_status(self, state: str, label: str, name: str = ""):
         """Update a pill. With `name` empty, updates the first pill (back-compat
