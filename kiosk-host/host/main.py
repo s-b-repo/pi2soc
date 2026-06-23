@@ -117,8 +117,29 @@ def wait_for_vpn(vpn: dict, timeout: float):
     (templated, multi-VPN). The unit name is HISTORICAL — the same
     supervisor runs Fortinet, OpenVPN, WireGuard, and iNode backends
     based on `vpn.type`; "forti-vpn" in the unit name doesn't mean
-    "Fortinet only". Non-fatal — wrapped in a top-level catch so a
-    probe error CANNOT kill the wall during startup."""
+    "Fortinet only".
+
+    UX contract: this is a SHORT wait (15 s default). The panel views
+    have their own retry loops, so a slow-to-establish VPN doesn't
+    block boot indefinitely — panels just show "load failed; retrying"
+    cards until the route exists. SIGINT during the wait skips the
+    rest cleanly (so an operator who knows the VPN isn't coming can
+    get to the GUI without waiting).
+
+    Non-fatal — wrapped in a top-level catch so a probe error CANNOT
+    kill the wall during startup."""
+    import signal as _signal
+    skipped = {"flag": False}
+
+    def _on_sigint(_sig, _frame):
+        skipped["flag"] = True
+
+    prev_handler = _signal.getsignal(_signal.SIGINT)
+    try:
+        _signal.signal(_signal.SIGINT, _on_sigint)
+    except (ValueError, OSError):
+        prev_handler = None                            # not on the main thread
+
     try:
         vpn = vpn or {}
         if not vpn.get("enabled"):
@@ -135,28 +156,55 @@ def wait_for_vpn(vpn: dict, timeout: float):
         name = (vpn.get("name") or "").strip()
         kind = (vpn.get("type") or "fortinet").strip().lower()
         unit = f"forti-vpn@{name}" if name else "forti-vpn"
-        log(f"[vpn] waiting for VPN '{name or 'default'}' (type={kind}) "
-            f"reachability {host}:{port} ...")
-        deadline = time.time() + timeout
+        log(f"[vpn] waiting up to {int(timeout)}s for VPN "
+            f"'{name or 'default'}' (type={kind}) at {host}:{port} "
+            f"... (Ctrl+C skips)")
+        start = time.time()
+        deadline = start + timeout
+        last_progress = start
         while time.time() < deadline:
-            if _port_open(host, port):
-                log(f"[vpn] '{name or 'default'}' up")
+            if skipped["flag"]:
+                log(f"[vpn] '{name or 'default'}' — Ctrl+C; skipping "
+                    "VPN wait. Panels will retry-load until the VPN comes up.")
                 return
+            if _port_open(host, port):
+                elapsed = time.time() - start
+                log(f"[vpn] '{name or 'default'}' up "
+                    f"(after {elapsed:.1f}s)")
+                return
+            # Surface a progress line every ~5s so the operator can see
+            # the wall is polling, not hung. Without this, a stale
+            # gateway looks identical to a process crash.
+            now = time.time()
+            if now - last_progress >= 5:
+                remaining = max(0, int(deadline - now))
+                log(f"[vpn] still waiting for {host}:{port} ... "
+                    f"({remaining}s left)")
+                last_progress = now
             time.sleep(1)
+        elapsed = time.time() - start
         log(f"[vpn] WARNING '{name or 'default'}' (type={kind}) — "
-            f"{host}:{port} never became reachable; VPN-side panels "
-            f"may show a connection error.\n"
-            f"[vpn]   diagnose: systemctl status {unit}\n"
-            f"[vpn]             journalctl -u {unit} -e\n"
-            f"[vpn]   note: the '{unit}' unit name is HISTORICAL — the "
-            f"same supervisor runs Fortinet / OpenVPN / WireGuard / "
-            f"iNode (type={kind}); the log will show '[soc-vpn] ...' "
-            f"lines from the {kind} driver.")
+            f"{host}:{port} not reachable after {elapsed:.0f}s. "
+            f"Continuing boot; panels will retry-load until the route "
+            f"exists.\n"
+            f"[vpn]   diagnose: sudo systemctl status {unit}\n"
+            f"[vpn]             sudo journalctl -u {unit} -e\n"
+            f"[vpn]   note: '{unit}' is the SUPERVISOR unit name "
+            f"(historical); the {kind} driver is the actual backend. "
+            f"Raise SOC_READY_TIMEOUT in soc.env if 15s is too short "
+            f"for your VPN.")
     except Exception as e:                             # noqa: BLE001
-        # The wait is purely advisory — if its own machinery breaks,
-        # log loudly + continue. Never let it abort the boot.
-        log(f"[vpn] WARNING wait_for_vpn aborted ({e.__class__.__name__}: "
-            f"{e}); proceeding without the readiness gate")
+        log(f"[vpn] WARNING wait_for_vpn aborted "
+            f"({e.__class__.__name__}: {e}); proceeding without the "
+            "readiness gate")
+    finally:
+        # Always restore the original SIGINT handler so the wall's
+        # later GLib.unix_signal_add for SIGINT works correctly.
+        if prev_handler is not None:
+            try:
+                _signal.signal(_signal.SIGINT, prev_handler)
+            except (ValueError, OSError):
+                pass
 
 
 class KioskHost:
@@ -1319,8 +1367,18 @@ def main():
 
     # 3. VPN + tunnels (best-effort). VPN first: its routes may be what makes a
     #    tunnel's jump host (or a direct VPN-side panel) reachable at all.
-    wait_for_vpn(conf.vpn, timeout=ready_timeout)
-    wait_for_tunnels(conf.panels, timeout=ready_timeout)
+    # VPN + tunnel waits are SEPARATE knobs from the vault open gate.
+    # Default 15 s each — long enough for a healthy VPN to come up,
+    # short enough that an unreachable gateway (this Kali dev box,
+    # most CI runs) doesn't make `launch.sh` look hung. SOC_READY_-
+    # TIMEOUT (the vault open) stays at 120 s; that one MUST succeed
+    # for the wall to do anything.
+    vpn_timeout = cfg.env_float("SOC_VPN_READY_TIMEOUT", 15.0,
+                                lo=0.0, hi=3600.0)
+    tunnel_timeout = cfg.env_float("SOC_TUNNEL_READY_TIMEOUT", 15.0,
+                                   lo=0.0, hi=3600.0)
+    wait_for_vpn(conf.vpn, timeout=vpn_timeout)
+    wait_for_tunnels(conf.panels, timeout=tunnel_timeout)
 
     # 4. windows
     host.build_and_show()

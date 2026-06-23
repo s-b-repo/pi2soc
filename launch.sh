@@ -162,9 +162,19 @@ if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] \
   KIOSK_HOME="$(getent passwd "$KIOSK_USER" | cut -d: -f6)"
   LAUNCHER="${KIOSK_HOME}/wall-launcher.sh"
   [ -x "$LAUNCHER" ] || LAUNCHER="$ROOT/scripts/wall-windowed.sh"
+  # When this is a --skip-setup invocation we're almost certainly on a
+  # dev box (no real VPN routes); pin the VPN + tunnel waits to 5 s
+  # each so the launcher terminal doesn't appear to hang at the boot
+  # gate. The wall's panel views retry-load anyway; if the operator
+  # has an actual VPN running, they can override via soc.env.
+  skip_setup_env=()
+  if [ "${SKIP_SETUP:-0}" = "1" ]; then
+    skip_setup_env=( SOC_VPN_READY_TIMEOUT=5 SOC_TUNNEL_READY_TIMEOUT=5 )
+  fi
   exec sudo -u "$KIOSK_USER" \
     env DISPLAY="${DISPLAY:-:0}" \
         WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
+        "${skip_setup_env[@]}" \
     bash "$LAUNCHER"
 fi
 
