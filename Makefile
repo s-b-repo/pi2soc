@@ -34,6 +34,10 @@ lint: .venv  ## syntax-check shell + python
 install:  ## install on the Pi (run as root)
 	sudo bash install.sh
 
+.PHONY: secrets-scan
+secrets-scan:  ## run .githooks/pre-commit against the staged set
+	@.githooks/pre-commit && echo "secrets-scan: ok"
+
 .PHONY: clean
 clean:  ## remove Python caches
 	find . -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
