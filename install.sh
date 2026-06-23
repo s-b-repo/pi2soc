@@ -656,6 +656,47 @@ install -m 0755 -o "$KIOSK_USER" -g "$KIOSK_USER" \
     "$SOC_ROOT/scripts/wall-windowed.sh" "$HOME_DIR/wall-launcher.sh"
 log "wall-launcher.sh deployed to $HOME_DIR/wall-launcher.sh"
 
+# Robust "is there an active graphical session?" probe — three signals
+# any of which marks the box as a desktop install:
+#   1. A logind session with Type=x11|wayland AND State=active.
+#   2. A running compositor process (plasmashell, gnome-shell, kwin_*,
+#      sway, labwc, cage, mutter, weston).
+#   3. The console-user's $DISPLAY / $WAYLAND_DISPLAY is set in our own
+#      env (we were invoked from a desktop shell via sudo).
+# Returns 0 (has graphical) / 1 (none).
+_has_graphical_session(){
+  # (1) logind — most reliable when systemd is present.
+  if command -v loginctl >/dev/null 2>&1; then
+    for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+      type="$(loginctl show-session "$s" -p Type --value 2>/dev/null || true)"
+      state="$(loginctl show-session "$s" -p State --value 2>/dev/null || true)"
+      [ "$state" = "active" ] || continue
+      case "$type" in x11|wayland|mir) return 0 ;; esac
+    done
+  fi
+  # (2) compositor process — works without systemd / on chroots.
+  if pgrep -x plasmashell >/dev/null 2>&1 \
+      || pgrep -x gnome-shell >/dev/null 2>&1 \
+      || pgrep -f 'kwin_(x11|wayland)' >/dev/null 2>&1 \
+      || pgrep -x sway >/dev/null 2>&1 \
+      || pgrep -x labwc >/dev/null 2>&1 \
+      || pgrep -x cage >/dev/null 2>&1 \
+      || pgrep -x mutter >/dev/null 2>&1 \
+      || pgrep -x weston >/dev/null 2>&1; then
+    return 0
+  fi
+  # (3) the invoking shell knows of a display. Useful when the operator
+  # ran `sudo bash install.sh` from inside a desktop terminal AND the
+  # other signals are missing (containerised sessions, weird DMs).
+  if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}${XDG_SESSION_TYPE:-}" ]; then
+    case "${XDG_SESSION_TYPE:-}" in
+      x11|wayland|mir) return 0 ;;
+    esac
+    [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && return 0
+  fi
+  return 1
+}
+
 if [ "$HAS_SYSTEMD" = "1" ]; then
   # --- tty1 autologin + default.target ------------------------------------
   # Old behaviour: ALWAYS flipped default.target to multi-user.target and
@@ -680,7 +721,7 @@ if [ "$HAS_SYSTEMD" = "1" ]; then
   elif [ "$prior_target" != "graphical.target" ]; then
     flip_default_target=1
     log "default.target is already $prior_target — assuming kiosk path; flipping to multi-user.target"
-  elif ! loginctl list-sessions --no-legend 2>/dev/null | awk '$5 ~ /tty|seat/' | grep -q .; then
+  elif ! _has_graphical_session; then
     # graphical default but no active graphical session — headless box
     flip_default_target=1
     log "graphical.target default + no active graphical session — flipping to multi-user.target"
