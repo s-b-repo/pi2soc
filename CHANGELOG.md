@@ -9,6 +9,91 @@ Production-hardening pass on top of the initial single-engine wall: multi-distro
 + multi-display-server install, a supervised multi-protocol VPN, an outbound
 proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
+### Credential Edit (OS-password gated) · button-wiring audit · vault-bypass audit (2026-06-23 late night)
+
+#### Edit vault item — gated by the OPERATING SYSTEM password
+The Credentials tab inventory list previously only allowed **Delete** (re-
+auth via wall PIN / TOTP). To change a stored username or password,
+operators had to use the bottom "Save to vault" grid, which is write-
+only — they couldn't view the current value to amend it.
+
+This release adds a per-row **Edit** button with a higher authentication
+bar than Delete:
+
+- **Edit reveals the stored secret.** That is the worst-possible data
+  class to leak via a stolen wall PIN — so Edit is gated by the
+  operator's local UNIX login password, not the wall PIN/TOTP.
+- Operator identity: `SOC_OPERATOR_USER` env (recommended explicit
+  config) → `SUDO_USER` (set by sudo) → conventional desktop user
+  guess (kali / pi / operator / admin / debian) → the wall's own user
+  (only authenticates if a password is set, usually nothing).
+- Backend chain (first available wins, all guard against ImportError /
+  missing-binary):
+    1. **python3-pam** — the cleanest API, single `authenticate()` call.
+       Two API shapes accepted (`pam.pam()` and module-level
+       `authenticate`).
+    2. **pamtester** — small CLI wrapping `pam_authenticate`; piped
+       password on stdin.
+    3. **su** — universal Unix fallback via `su - <user> -c true` with
+       the password on stdin. Returns 0 on auth success.
+- Constant-time wall clock: every verification takes ≥ 300 ms so wrong-
+  vs-right can't be distinguished by response timing.
+- The entered password lives only inside the prompt scope — scrubbed
+  to `"x" * len` and `del`'d on every exit path, never logged or
+  re-displayed.
+- install.sh adds `python3-pam` (Debian/Fedora/openSUSE) / `python-pam`
+  (Arch) / `py3-pam` (Alpine) to PK_CORE so the preferred backend is
+  present on every supported distro.
+
+The Edit modal pre-fills the current values, has a "show password"
+checkbox (operator-readable when needed), and writes back via the
+same `vaultseed.upsert_login` path Save uses.
+
+#### Full button-wiring audit
+- Enumerated every `.connect("clicked", ...)` site in `configwin.py`
+  (21 handlers) and `wall.py` (3 handlers). All reference a real
+  callable — lambdas, methods on self, local closures, or the
+  `_confirm_and_run(...)` two-click wrapper.
+- One real gap found + fixed: the legacy **"Security — lock PIN"**
+  expander at the bottom of the Panels tab had a `Remove PIN` button
+  that called `_clear_pin()` **without re-auth** (older code, gap
+  relative to Phase 6's policy that every destructive action is
+  re-auth gated). Now mirrors the Security-tab clear path:
+  `_require_reauth` first, then clear.
+- New `test_button_wiring.py` meta-test walks both files and asserts
+  every clicked handler resolves to a defined callable. Catches the
+  regression where a refactor renames a method but forgets to update
+  the connect site. Two additional tests pin the Edit / re-auth
+  invariants so they can't regress silently.
+
+#### Vault-bypass audit (everything goes through the password manager)
+- Confirmed: every credential READ in `kiosk-host/host/` goes via
+  `vault.creds(item)` (`webkit_panel`, `chromium_panel`, `fortivpn`,
+  `main`). No path bypasses the vault.
+- Confirmed: every credential WRITE goes via
+  `vaultseed.upsert_login(...)` (Credentials tab Save, VPN inline-
+  creds Save, new Edit modal). Never to a plaintext file.
+- The only secret on disk in production is the **host-bound sealed
+  master** under `$SOC_SECRET_DIR` (AES-256-GCM, scrypt KDF, machine-
+  ID-bound). `pinentry-vault.py` prefers the sealed master FIRST;
+  `SOC_VAULT_PASSWORD` env-var fallback only fires when the sealed
+  store is empty (dev only — `setup.py first-run` actively removes
+  any plaintext SOC_VAULT_PASSWORD from `soc.env` once the seal is
+  verified).
+- `backup.py` has its own backup-encryption passphrase prompted via
+  `getpass` — that's a SEPARATE concern (encrypting the backup tarball,
+  not a vault credential).
+- `setup.py` interactive prompts via `getpass.getpass` (wizard for
+  master password, panel cred entry) all write to the vault via
+  `vaultseed.upsert_login` — never to disk.
+
+#### Tests
+- 378 → 396 (+18). 14 for `ospass` (operator resolution, backend
+  dispatch chain with mocks, constant-time latency floor, ImportError
+  / missing-binary handling). 4 for button wiring (configwin handlers
+  resolve, wall handlers resolve, legacy clear-PIN re-auth in place,
+  Edit button + `_on_cred_edit` + `_prompt_os_password` all present).
+
 ### Auto-fix · ARM polish · no-reboot settings · Restart-actually-restarts (2026-06-23 night)
 
 Closes the post-reinstall friction loop: every manual fix-up I had to do

@@ -228,7 +228,8 @@ PK_XSRV_ALT=()
 case "$FAMILY" in
   debian)
     PK_CORE=(python3 python3-venv python3-gi gir1.2-gtk-3.0
-             curl ca-certificates autossh openfortivpn ppp)
+             curl ca-certificates autossh openfortivpn ppp
+             python3-pam)
     PK_XSRV=(xserver-xorg xserver-xorg-legacy)
     PK_X11=(xinit x11-xserver-utils openbox)
     PK_WAYLAND=(cage)
@@ -244,7 +245,8 @@ case "$FAMILY" in
     ;;
   fedora)
     PK_CORE=(python3 python3-gobject gtk3 webkit2gtk4.1
-             curl ca-certificates autossh openfortivpn ppp)
+             curl ca-certificates autossh openfortivpn ppp
+             python3-pam)
     PK_XSRV=(xorg-x11-server-Xorg)
     PK_X11=(xorg-x11-xinit openbox)
     PK_WAYLAND=(cage)
@@ -255,7 +257,8 @@ case "$FAMILY" in
     ;;
   arch)
     PK_CORE=(python python-gobject gtk3 webkit2gtk-4.1
-             curl ca-certificates autossh openfortivpn ppp)
+             curl ca-certificates autossh openfortivpn ppp
+             python-pam)
     PK_XSRV=(xorg-server)
     PK_XSRV_ALT=(xlibre-xserver)   # AUR / Artix; honoured if already installed
     PK_X11=(xorg-xinit openbox)
@@ -267,7 +270,8 @@ case "$FAMILY" in
     ;;
   suse)
     PK_CORE=(python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1
-             curl ca-certificates autossh openfortivpn ppp)
+             curl ca-certificates autossh openfortivpn ppp
+             python3-python-pam)
     PK_XSRV=(xorg-x11-server)
     PK_X11=(xinit openbox)
     PK_WAYLAND=(cage)
@@ -277,7 +281,8 @@ case "$FAMILY" in
     ;;
   alpine)
     PK_CORE=(python3 py3-gobject3 gtk+3.0 webkit2gtk-4.1
-             curl ca-certificates autossh openfortivpn ppp)
+             curl ca-certificates autossh openfortivpn ppp
+             py3-pam)
     PK_XSRV=(xorg-server)
     PK_X11=(xinit openbox)
     PK_WAYLAND=(cage)

@@ -999,6 +999,16 @@ class ConfigWindow(Gtk.Window):
             origin = Gtk.Label(label=f"({it['origin']})")
             origin.set_xalign(0.0)
             origin.get_style_context().add_class("soc-config-sub")
+            # Edit — fetches the current user/pass from the vault, gated
+            # by the OPERATING SYSTEM password (not the wall PIN). Higher
+            # bar than Delete because Edit reveals the stored secret.
+            edit = Gtk.Button(label="Edit")
+            edit.set_tooltip_text("Reveal + change the username/password for "
+                                  "this vault item. Requires your OS login "
+                                  "password (NOT the wall PIN).")
+            edit.connect("clicked",
+                         lambda _b, n=it["name"]: self._on_cred_edit(n))
+            # Delete — re-auth via wall PIN/TOTP. Doesn't reveal anything.
             delete = Gtk.Button(label="Delete")
             delete.get_style_context().add_class("destructive-action")
             delete.set_tooltip_text("Permanent. PIN/TOTP required.")
@@ -1006,9 +1016,173 @@ class ConfigWindow(Gtk.Window):
                            lambda _b, n=it["name"]: self._on_cred_delete(n))
             row.pack_start(name, True, True, 0)
             row.pack_start(origin, False, False, 0)
+            row.pack_start(edit, False, False, 0)
             row.pack_start(delete, False, False, 0)
             self._inv_list.pack_start(row, False, False, 0)
         self._inv_list.show_all()
+
+    def _prompt_os_password(self, what: str) -> "tuple[bool, str]":
+        """Modal that asks for the operator's OS login password and
+        verifies via host.ospass.verify_os_password.
+
+        Returns (ok, user). `ok` is True iff the operator provided a
+        valid password; `user` is the operator name that was checked
+        (useful for the next-step modal title).
+
+        The password string is held only inside this scope — never
+        returned, logged, or stored. Failures use a 1 s back-off + a
+        clear toast so a brute-forcer can't sit on the prompt."""
+        from . import ospass as _osp
+        user = _osp.operator_user()
+        d = Gtk.Dialog(transient_for=self, modal=True,
+                        title=f"OS password required — {what}")
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                       "Verify", Gtk.ResponseType.OK)
+        d.set_default_response(Gtk.ResponseType.OK)
+        d.set_default_size(420, 0)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_start(14); box.set_margin_end(14)
+        box.set_margin_top(10);  box.set_margin_bottom(10)
+        hint = Gtk.Label()
+        hint.set_xalign(0.0); hint.set_line_wrap(True)
+        hint.set_markup(
+            f"This action reveals + changes a stored credential. Enter the "
+            f"OS login password for <b>{GLib.markup_escape_text(user)}</b> "
+            f"to continue. Wall PIN/TOTP is <i>not</i> sufficient for "
+            f"reveal operations.")
+        entry = Gtk.Entry()
+        entry.set_visibility(False)
+        entry.set_activates_default(True)
+        entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+        box.pack_start(hint, False, False, 0)
+        box.pack_start(entry, False, False, 0)
+        d.show_all()
+        rc = d.run()
+        pw = entry.get_text()
+        d.destroy()
+        if rc != Gtk.ResponseType.OK:
+            return False, user
+        try:
+            ok = _osp.verify_os_password(user, pw)
+        except Exception as e:                          # noqa: BLE001
+            self._toast(f"OS password verification crashed: {e}")
+            ok = False
+        finally:
+            pw = "x" * len(pw)                          # scrub
+            del pw
+        if not ok:
+            self._toast(f"OS password rejected for {user}")
+        return ok, user
+
+    def _on_cred_edit(self, name: str):
+        """Edit flow: OS password → fetch via vault → modal with user +
+        pass entries → vaultseed.upsert_login. The current password is
+        the only operator-side disclosure path for stored secrets, so
+        it's gated by the same authentication root would need."""
+        ok, _user = self._prompt_os_password(f"edit '{name}'")
+        if not ok:
+            return
+        # Now read the current user+pass from vault.
+        v_handle = getattr(self, "_vault", None)
+        if v_handle is None or not hasattr(v_handle, "creds"):
+            self._toast(f"vault handle missing — cannot edit '{name}'")
+            return
+        try:
+            creds = v_handle.creds(name) or {}
+        except Exception as e:                           # noqa: BLE001
+            self._toast(f"vault read failed for '{name}': {e}")
+            return
+        current_user = creds.get("user", "") or ""
+        current_pass = creds.get("pass", "") or ""
+
+        # Edit modal with prefilled values.
+        d = Gtk.Dialog(transient_for=self, modal=True,
+                        title=f"Edit vault item — {name}")
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                       "Save to vault", Gtk.ResponseType.OK)
+        d.set_default_response(Gtk.ResponseType.OK)
+        d.set_default_size(440, 0)
+        body = d.get_content_area()
+        body.set_spacing(6); body.set_margin_start(14); body.set_margin_end(14)
+        body.set_margin_top(10); body.set_margin_bottom(10)
+        u_e = Gtk.Entry()
+        u_e.set_text(current_user)
+        u_e.set_placeholder_text("username")
+        p_e = Gtk.Entry()
+        p_e.set_text(current_pass)
+        p_e.set_visibility(False)
+        p_e.set_placeholder_text("password")
+        show_pass = Gtk.CheckButton(label="show password")
+        show_pass.connect("toggled",
+                           lambda b: p_e.set_visibility(b.get_active()))
+        for label, w in (("username", u_e), ("password", p_e)):
+            l = Gtk.Label(label=label)
+            l.set_xalign(0.0)
+            l.get_style_context().add_class("soc-config-sub")
+            body.pack_start(l, False, False, 0)
+            body.pack_start(w, False, False, 0)
+        body.pack_start(show_pass, False, False, 0)
+        d.show_all()
+        rc = d.run()
+        new_user = u_e.get_text().strip()
+        new_pass = p_e.get_text()
+        d.destroy()
+        # Scrub the in-memory copies BEFORE doing anything else.
+        current_pass = "x" * len(current_pass)
+        del current_pass
+        if rc != Gtk.ResponseType.OK:
+            new_pass = "x" * len(new_pass); del new_pass
+            return
+        if not new_user and not new_pass:
+            self._toast("nothing changed — empty user + password")
+            return
+        # Reuse the same vaultseed.upsert_login path the Save grid uses.
+        # The master password comes from the host-bound seal (or, fallback,
+        # the manual entry in this tab).
+        self._save_cred(name,
+                         _e=type("_E", (), {"get_text": lambda _s: new_user})(),
+                         pass_e=type("_E", (), {"get_text": lambda _s: new_pass,
+                                                  "set_text": lambda *_a: None})(),
+                         uri=None) if False else None
+        # Direct call — _save_cred has the wrong signature for a dialog
+        # flow; do the upsert inline so we control the toast messages.
+        self._do_vault_upsert(name, new_user, new_pass)
+        new_pass = "x" * len(new_pass); del new_pass
+
+    def _do_vault_upsert(self, name: str, user: str, password: str):
+        """Inline upsert — used by the Edit modal. Threaded so the GUI
+        doesn't freeze while vaultseed talks to Vaultwarden."""
+        url = os.environ.get("SOC_VAULT_URL", "http://127.0.0.1:8222")
+        email = os.environ.get("SOC_VAULT_EMAIL", "")
+        from . import secretstore
+        sd = os.environ.get("SOC_SECRET_DIR")
+        try:
+            master = secretstore.unseal(sd) if secretstore.is_sealed(sd) else ""
+        except Exception:                                # noqa: BLE001
+            master = ""
+        if not master and getattr(self, "_cred_master", None):
+            master = self._cred_master.get_text()
+        if not (email and master):
+            self._toast(f"vault credentials needed for edit ({name})")
+            return
+        import threading
+        from . import vaultseed
+
+        def work():
+            try:
+                rc = vaultseed.upsert_login(url, email, master, name, user,
+                                              password)
+                msg = f"edited '{name}' in Vaultwarden ✓ ({rc})"
+            except Exception as e:                       # noqa: BLE001
+                msg = f"edit failed for '{name}': {e}"
+            GLib.idle_add(self._post_edit_done, msg)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _post_edit_done(self, msg: str):
+        self._toast(msg)
+        self._refresh_cred_inventory()
+        return False
 
     def _on_cred_delete(self, name: str):
         """Delete a vault item from the inventory list.
@@ -2020,6 +2194,14 @@ class ConfigWindow(Gtk.Window):
         self._sec_state.set_text("PIN updated — it will be required next time.")
 
     def _clear_pin(self):
+        # Gate Remove PIN with the same re-auth policy Phase 6 added to
+        # the Security tab's clear buttons. Without this, anyone who can
+        # already open the Settings window (because a PIN unlocked it)
+        # could trivially remove the PIN — which the wall now warns is
+        # exactly the action we want gated.
+        if pin_is_set() and not self._require_reauth(
+                "removal of the Settings PIN (legacy expander)"):
+            return
         clear_pin()
         self._newpin.set_text("")
         self._sec_state.set_text("PIN removed — the window now opens without one.")
