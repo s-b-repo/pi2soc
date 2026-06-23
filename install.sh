@@ -391,6 +391,11 @@ chmod +x "$SOC_ROOT"/scripts/*.sh "$SOC_ROOT"/scripts/*.py 2>/dev/null || true
 # the bundled iNode SSL-VPN client (vendor/) — its connect script + helpers
 chmod +x "$SOC_ROOT"/vendor/iNode-VPN-Client/svpn-connect.sh \
          "$SOC_ROOT"/vendor/iNode-VPN-Client/scripts/* 2>/dev/null || true
+# SEC: inode-svpn-helper (run as root by the VPN supervisor) refuses to load a
+# group/other-writable backend (root code-exec guard). The source repo's dev
+# umask leaves the clean-room backend group-writable; clear those bits so the
+# helper will load it on the Pi (the chown above only sets owner, not the mode).
+chmod -R go-w "$SOC_ROOT"/vendor/iNode-VPN-Client/backends 2>/dev/null || true
 
 log "Creating Python venv"
 if [ ! -x "$SOC_ROOT/.venv/bin/python" ]; then
