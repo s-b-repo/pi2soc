@@ -50,8 +50,32 @@ def main():
     for p in conf.panels:
         if p.mode == "tunnel" and p.tunnel:
             tn = p.tunnel
-            forwards.append(
-                f"127.0.0.1:{tn['local_port']}:{tn['remote_host']}:{tn['remote_port']}")
+            # Validate EACH field before assembling the forward — without
+            # this, a remote_host that contains a stray colon (operator
+            # puts 'host:port' in remote_host instead of using a separate
+            # remote_port) produced a malformed `-L 127.0.0.1:8443:host:
+            # 443:443` that ssh silently rejects and autossh retries
+            # forever. Fail LOUD at build time instead of silently.
+            try:
+                lp = int(tn["local_port"])
+                rp = int(tn["remote_port"])
+                if not (0 < lp < 65536):
+                    raise ValueError(f"local_port {lp} out of range")
+                if not (0 < rp < 65536):
+                    raise ValueError(f"remote_port {rp} out of range")
+                rh = str(tn["remote_host"]).strip()
+                if not rh or any(c.isspace() for c in rh) \
+                        or rh.startswith("-") or ":" in rh:
+                    raise ValueError(
+                        f"remote_host {rh!r} invalid (no whitespace, no "
+                        "leading '-', no embedded ':' — use a separate "
+                        "remote_port for the port)")
+            except (KeyError, TypeError, ValueError) as e:
+                sys.stderr.write(
+                    f"tunnel-args: skipping panel {p.id!r}: "
+                    f"malformed tunnel section ({e})\n")
+                continue
+            forwards.append(f"127.0.0.1:{lp}:{rh}:{rp}")
     forwards += [_validate_extra_forward(f)
                  for f in (t.get("extra_forwards", []) or [])]
 

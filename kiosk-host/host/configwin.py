@@ -867,13 +867,34 @@ class ConfigWindow(Gtk.Window):
         inv_frame = Gtk.Frame(label="  Vault items in use  ")
         inv_outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         inv_outer.set_border_width(8)
-        self._inv_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        inv_outer.pack_start(self._inv_list, False, False, 0)
+        # Refresh + Sync row at the TOP of the section — the buttons used
+        # to be at the BOTTOM, which scrolled off-screen as soon as the
+        # inventory grew past the tab height (user-reported: "Refresh
+        # from vault — you can't click it"). Top is always visible.
+        action_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         refresh_btn = Gtk.Button(label="Refresh from vault")
         refresh_btn.set_tooltip_text("Re-scan panels.yaml + vault folder "
                                      "'SOC Wall Auth' for items.")
         refresh_btn.connect("clicked", lambda *_: self._refresh_cred_inventory())
-        inv_outer.pack_start(refresh_btn, False, False, 0)
+        sync_btn = Gtk.Button(label="Sync vault (rbw sync)")
+        sync_btn.set_tooltip_text("Force rbw to fetch the latest from "
+                                  "Vaultwarden. Use when an item you "
+                                  "added in the web vault doesn't show up.")
+        sync_btn.connect("clicked", lambda *_: self._rbw_sync_now())
+        action_row.pack_start(refresh_btn, False, False, 0)
+        action_row.pack_start(sync_btn, False, False, 0)
+        inv_outer.pack_start(action_row, False, False, 0)
+        # The list is in a ScrolledWindow so even hundreds of vault items
+        # stay self-contained inside the inventory frame instead of
+        # pushing the rest of the tab off the bottom.
+        list_scroll = Gtk.ScrolledWindow()
+        list_scroll.set_policy(Gtk.PolicyType.NEVER,
+                                Gtk.PolicyType.AUTOMATIC)
+        list_scroll.set_min_content_height(200)
+        list_scroll.set_max_content_height(360)
+        self._inv_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        list_scroll.add(self._inv_list)
+        inv_outer.pack_start(list_scroll, True, True, 0)
         inv_frame.add(inv_outer)
         box.pack_start(inv_frame, False, False, 0)
         self._refresh_cred_inventory()
@@ -939,7 +960,60 @@ class ConfigWindow(Gtk.Window):
         self._cred_msg.get_style_context().add_class("soc-config-ok")
         self._cred_msg.set_xalign(0.0)
         box.pack_start(self._cred_msg, False, False, 0)
-        return box
+        # Wrap the whole tab in a ScrolledWindow so a long Save grid (one
+        # row per panel + every VPN + proxy + tunnel) plus the inventory
+        # plus the master-password field never push interactive widgets
+        # off the bottom of the tab (user-reported: Refresh button was
+        # unreachable). Vertical scroll only — horizontal stays clean.
+        outer = Gtk.ScrolledWindow()
+        outer.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        outer.add(box)
+        return outer
+
+    def _rbw_sync_now(self):
+        """Force rbw to fetch the latest from Vaultwarden + refresh the
+        inventory. Drops the in-process TTL cache. Threaded so the GUI
+        stays responsive."""
+        self._toast("syncing vault ...")
+
+        def work():
+            import subprocess
+            try:
+                r = subprocess.run(["rbw", "sync"], timeout=15,
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    text=True)
+                ok = (r.returncode == 0)
+                err = (r.stderr or r.stdout or "").strip()
+            except (OSError, subprocess.SubprocessError) as e:
+                ok, err = False, str(e)
+            v = getattr(self, "_vault", None)
+            if v is not None and hasattr(v, "invalidate"):
+                try:
+                    v.invalidate()                     # drop the TTL cache
+                except Exception:                      # noqa: BLE001
+                    pass
+            GLib.idle_add(self._rbw_sync_done, ok, err)
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _rbw_sync_done(self, ok: bool, err: str):
+        if ok:
+            self._toast("vault synced ✓")
+        else:
+            self._alert(f"Vault sync failed:\n\n{err or 'unknown error'}\n\n"
+                        "Common causes: Vaultwarden unreachable (check "
+                        "`systemctl status vaultwarden`), the vault is "
+                        "locked (check `rbw unlocked`), or rbw isn't "
+                        "configured for this user (re-run "
+                        "`sudo python3 setup.py first-run`).",
+                        error=True, title="Vault sync failed")
+        try:
+            self._refresh_cred_inventory()
+        except Exception:                              # noqa: BLE001
+            pass
+        return False
 
     def _collect_inventory(self) -> list:
         """Pure helper: every vault item name the wall touches, deduped,
