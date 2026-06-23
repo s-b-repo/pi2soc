@@ -176,6 +176,50 @@ class WallWindow:
         else:
             self.window.unfullscreen()
 
+    def show_top_bar_warning(self, text: str):
+        """Surface a banner above the toolbar — used for the file-hash
+        drift warning at boot. Idempotent: replaces an existing banner
+        if any. Click to dismiss for this session (warning re-paints on
+        next boot if the drift persists)."""
+        # Late-built helper: dismantle previous banner first.
+        prev = getattr(self, "_warn_bar", None)
+        if prev is not None:
+            try:
+                prev.destroy()
+            except Exception:                          # noqa: BLE001
+                pass
+            self._warn_bar = None
+        if not text:
+            return
+        bar = Gtk.EventBox()
+        bar.get_style_context().add_class("soc-warn-bar")
+        lbl = Gtk.Label(label=text)
+        lbl.set_xalign(0.0)
+        lbl.set_line_wrap(True)
+        lbl.set_margin_start(12); lbl.set_margin_end(12)
+        lbl.set_margin_top(6);   lbl.set_margin_bottom(6)
+        bar.add(lbl)
+        bar.set_tooltip_text("Click to dismiss for this session. The "
+                             "warning re-paints on next boot if drift "
+                             "persists.")
+
+        def _dismiss(*_):
+            try:
+                bar.destroy()
+            except Exception:                          # noqa: BLE001
+                pass
+            self._warn_bar = None
+            return True
+
+        bar.connect("button-press-event", _dismiss)
+        # Inject at the very top of the vbox (above the toolbar).
+        vbox = self.window.get_child()
+        if vbox is not None and hasattr(vbox, "pack_start"):
+            vbox.pack_start(bar, False, False, 0)
+            vbox.reorder_child(bar, 0)
+            bar.show_all()
+        self._warn_bar = bar
+
     def set_vpn_status(self, state: str, label: str, name: str = ""):
         """Update a pill. With `name` empty, updates the first pill (back-compat
         — what the old single-pill code calls). With `name` set, finds the pill

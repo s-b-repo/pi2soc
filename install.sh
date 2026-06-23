@@ -406,6 +406,27 @@ chmod +x "$SOC_ROOT"/vendor/iNode-VPN-Client/svpn-connect.sh \
 # helper will load it on the Pi (the chown above only sets owner, not the mode).
 chmod -R go-w "$SOC_ROOT"/vendor/iNode-VPN-Client/backends 2>/dev/null || true
 
+# Deploy-time manifest: record every shipped file's sha256 + the source
+# commit. The wall reads /etc/soc-display/manifest.json at boot and warns in
+# the top bar if anything has drifted (tampered install, ad-hoc edit on the
+# Pi). We hash SRC_DIR (the git checkout — it's byte-identical to SOC_ROOT
+# right after the tar above, AND it has the .git for `rev-parse HEAD`).
+# Best-effort: if python3 / git aren't available yet (unusual but possible
+# mid-install), skip and the wall just won't show the warning.
+log "Recording deploy manifest (file hashes + source commit)"
+if command -v python3 >/dev/null 2>&1; then
+  install -d -m 0755 /etc/soc-display
+  PYTHONPATH="$SOC_ROOT/kiosk-host" python3 -c "
+from host import manifest
+import sys
+try:
+    p = manifest.write_manifest('$SRC_DIR', dest='/etc/soc-display/manifest.json')
+    print(f'manifest: wrote {p}')
+except Exception as e:
+    sys.stderr.write(f'manifest: skipped ({e})\n')
+" || warn "could not write deploy manifest (drift detection disabled)"
+fi
+
 log "Creating Python venv"
 if [ ! -x "$SOC_ROOT/.venv/bin/python" ]; then
   python3 -m venv --system-site-packages "$SOC_ROOT/.venv" || \

@@ -287,6 +287,7 @@ class KioskHost:
         if self.wall is not None:
             self.wall.show()
             self._start_vpn_monitor()
+            self._check_deploy_drift()
         self._start_mem_watch()
 
     # ---- memory watchdog ---------------------------------------------------
@@ -523,6 +524,37 @@ class KioskHost:
                            stderr=subprocess.DEVNULL, check=True)
         except Exception as e:  # noqa: BLE001
             log(f"tray: reboot needs root ({e}) — run sudo systemctl reboot")
+
+    def _check_deploy_drift(self):
+        """Compare on-disk file hashes against the deploy-time manifest;
+        paint a top-bar warning if anything has drifted.
+        Best-effort + non-fatal: missing manifest, unreadable manifest, or
+        any other error is logged at INFO and skipped — the warning only
+        appears when we positively find drift."""
+        try:
+            from . import manifest as _mf
+        except Exception as e:                         # noqa: BLE001
+            log(f"manifest check skipped: import failed ({e})")
+            return
+        deploy_root = os.environ.get("SOC_DEPLOY_ROOT", "/opt/soc-display")
+        try:
+            drift = _mf.check_drift(deploy_root)
+        except FileNotFoundError:
+            log(f"manifest check skipped: no manifest at "
+                f"{_mf.MANIFEST_PATH} (re-run install.sh to enable)")
+            return
+        except (OSError, ValueError, KeyError) as e:
+            log(f"manifest check skipped: {e}")
+            return
+        msg = _mf.format_drift_summary(drift)
+        if msg and self.wall is not None:
+            self.wall.show_top_bar_warning(msg)
+            log(f"file drift detected: {len(drift['changed'])} changed, "
+                f"{len(drift['missing'])} missing, "
+                f"{len(drift['extras'])} extras (commit "
+                f"{(drift.get('commit') or 'unknown')[:12]})")
+        else:
+            log("manifest check ok — no drift")
 
     def _config_closed(self):
         self._config_win = None
